@@ -38,6 +38,8 @@ from nncf.torch.utils import is_dist_avail_and_initialized
 from nncf.torch.utils import is_main_process
 from nncf.torch.utils import maybe_convert_legacy_names_in_compress_state
 from nncf.torch.utils import training_mode_switcher
+from nncf.torch.nncf_module_replacement import replace_modules_by_nncf_modules
+from nncf.torch.quantization.weights_compression import insert_pre_compression_operations
 
 
 @api(canonical_alias="nncf.torch.create_compressed_model")
@@ -276,3 +278,24 @@ def create_compression_algorithm_builder_from_algo_names(
     else:
         builder = PTCompositeCompressionAlgorithmBuilder(config, should_init=should_init)
     return builder
+
+
+def create_weights_compressed_model(
+    model: Module,
+    config: NNCFConfig=None
+) -> Tuple[NNCFNetwork]:
+    """
+    The main function used to produce a model ready for compression fine-tuning from an original PyTorch
+    model and a configuration object.
+    dummy_forward_fn
+    :param model: The original model. Should have its parameters already loaded from a checkpoint or another
+        source.
+    :param config: A configuration object used to determine the exact compression modifications to be applied
+        to the model
+    :return: 
+    """
+
+    compressed_model, _ = replace_modules_by_nncf_modules(model)
+    insert_pre_compression_operations(model)
+
+    return compressed_model

@@ -218,3 +218,52 @@ def quantize_with_accuracy_control(
         )
 
     raise RuntimeError(f"Unsupported type of backend: {backend}")
+
+
+@api(canonical_alias="nncf.quantize")
+def weights_compression(
+    model: TModel,
+) -> TModel:
+    """
+    Applies post-training quantization to the provided model.
+
+    :param model: A model to be quantized.
+    :type  model: TModel
+    :param calibration_dataset: A representative dataset for the
+        calibration process.
+    :type  calibration_dataset: nncf.Dataset
+    :param preset: A preset that controls the quantization mode
+        (symmetric and asymmetric). It can take the following values:
+        - `performance`: Symmetric quantization of weights and activations.
+        - `mixed`: Symmetric quantization of weights and asymmetric
+          quantization of activations.
+    :type  preset: nncf.QuantizationPreset
+    :param target_device: A target device the specificity of which will be taken
+        into account while compressing in order to obtain the best performance
+        for this type of device.
+    :type  target_device: nncf.TargetDevice
+    :param subset_size: Size of a subset to calculate activations
+        statistics used for quantization.
+    :param fast_bias_correction: Setting this option to `False` enables a different
+        bias correction method which is more accurate, in general, and takes
+        more time but requires less memory.
+    :param model_type: Model type is needed to specify additional patterns
+        in the model. Supported only `transformer` now.
+    :type  model_type: Optional[nncf.ModelType]
+    :param ignored_scope: An ignored scope that defined the list of model control
+        flow graph nodes to be ignored during quantization.
+    :type  ignored_scope: Optional[nncf.IgnoredScope]
+    :param advanced_parameters: Advanced quantization parameters for
+        fine-tuning the quantization algorithm.
+    :return: The quantized model.
+    :rtype: TModel
+    """
+    backend = get_backend(model)
+    if backend == BackendType.TORCH:
+        from nncf.torch.quantization.quantize_model import weights_compression_impl
+
+        return weights_compression_impl(
+            model
+        )
+
+    raise RuntimeError(f"Unsupported type of backend: {backend}")

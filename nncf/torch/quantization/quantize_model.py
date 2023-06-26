@@ -31,6 +31,7 @@ from nncf.torch.dynamic_graph.io_handling import wrap_nncf_model_inputs_with_obj
 from nncf.torch.dynamic_graph.io_handling import wrap_nncf_model_outputs_with_objwalk
 from nncf.torch.initialization import PTInitializingDataLoader
 from nncf.torch.model_creation import create_compressed_model
+from nncf.torch.model_creation import create_weights_compressed_model
 from nncf.torch.nested_objects_traversal import objwalk
 from nncf.torch.utils import get_model_device
 from nncf.torch.utils import is_tensor
@@ -250,5 +251,16 @@ def quantize_impl(
     )
     compression_ctrl.prepare_for_export()
     compressed_model.nncf.disable_dynamic_graph_building()
+
+    return compressed_model
+
+
+def weights_compression_impl(
+    model: torch.nn.Module,
+) -> torch.nn.Module:
+    """
+    Implementation of the `weights_compression()` method for the PyTorch backend.
+    """
+    compressed_model = create_weights_compressed_model(model)
 
     return compressed_model
