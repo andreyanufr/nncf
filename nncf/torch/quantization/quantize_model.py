@@ -31,10 +31,11 @@ from nncf.torch.dynamic_graph.io_handling import wrap_nncf_model_inputs_with_obj
 from nncf.torch.dynamic_graph.io_handling import wrap_nncf_model_outputs_with_objwalk
 from nncf.torch.initialization import PTInitializingDataLoader
 from nncf.torch.model_creation import create_compressed_model
-from nncf.torch.model_creation import create_weights_compressed_model
 from nncf.torch.nested_objects_traversal import objwalk
 from nncf.torch.utils import get_model_device
 from nncf.torch.utils import is_tensor
+from nncf.torch.nncf_module_replacement import replace_modules_by_nncf_modules
+from nncf.torch.quantization.weights_compression import insert_pre_compression_operations
 
 DEFAULT_RANGE_TYPE = "mean_min_max"
 
@@ -257,10 +258,12 @@ def quantize_impl(
 
 def weights_compression_impl(
     model: torch.nn.Module,
+    compress_weights: bool=False
 ) -> torch.nn.Module:
     """
     Implementation of the `weights_compression()` method for the PyTorch backend.
     """
-    compressed_model = create_weights_compressed_model(model)
+    compressed_model, _ = replace_modules_by_nncf_modules(model)
+    insert_pre_compression_operations(model, compress_weights)
 
     return compressed_model

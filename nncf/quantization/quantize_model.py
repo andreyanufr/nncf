@@ -223,39 +223,18 @@ def quantize_with_accuracy_control(
 @api(canonical_alias="nncf.quantize")
 def weights_compression(
     model: TModel,
+    compress_weights: bool = False
 ) -> TModel:
     """
-    Applies post-training quantization to the provided model.
+    Applies weights compression with dequantization of fake quantize insertion.
 
-    :param model: A model to be quantized.
+    :param model: A model to be compressed.
     :type  model: TModel
-    :param calibration_dataset: A representative dataset for the
-        calibration process.
-    :type  calibration_dataset: nncf.Dataset
-    :param preset: A preset that controls the quantization mode
-        (symmetric and asymmetric). It can take the following values:
-        - `performance`: Symmetric quantization of weights and activations.
-        - `mixed`: Symmetric quantization of weights and asymmetric
-          quantization of activations.
-    :type  preset: nncf.QuantizationPreset
-    :param target_device: A target device the specificity of which will be taken
-        into account while compressing in order to obtain the best performance
-        for this type of device.
-    :type  target_device: nncf.TargetDevice
-    :param subset_size: Size of a subset to calculate activations
-        statistics used for quantization.
-    :param fast_bias_correction: Setting this option to `False` enables a different
-        bias correction method which is more accurate, in general, and takes
-        more time but requires less memory.
-    :param model_type: Model type is needed to specify additional patterns
-        in the model. Supported only `transformer` now.
-    :type  model_type: Optional[nncf.ModelType]
-    :param ignored_scope: An ignored scope that defined the list of model control
-        flow graph nodes to be ignored during quantization.
-    :type  ignored_scope: Optional[nncf.IgnoredScope]
-    :param advanced_parameters: Advanced quantization parameters for
-        fine-tuning the quantization algorithm.
-    :return: The quantized model.
+    :param compress_weights: Enables real compression of weights in Linear and Embedding layers.
+        If False inserts quantization operations,
+        else compress weights to int8 and inserts custom dequantization.
+    :return: The model with compressed weight and dequantization or model with original weights and fake quantization.
+        Not trainable.
     :rtype: TModel
     """
     backend = get_backend(model)
@@ -263,7 +242,7 @@ def weights_compression(
         from nncf.torch.quantization.quantize_model import weights_compression_impl
 
         return weights_compression_impl(
-            model
+            model, compress_weights
         )
 
     raise RuntimeError(f"Unsupported type of backend: {backend}")
