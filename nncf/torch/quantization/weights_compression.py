@@ -35,7 +35,7 @@ class WeightsDecompressor(nn.Module):
 
     def forward(self, layer, op_arg):
         w = layer.weight.type(dtype=self.scale.dtype)
-        layer.weight = (w - self.zero_point) * self.scale
+        layer.weight = w * self.scale
 
 
 def _insert_pre_compression_operations(
@@ -51,6 +51,7 @@ def _insert_pre_compression_operations(
      shared weights.
     :return: The non-trainable module with inserted operations.
     """
+    level_low = -level_high
     if compression_hist is None:
         compression_hist = {}
     for _, layer in module.named_children():
@@ -67,7 +68,7 @@ def _insert_pre_compression_operations(
         stat_dim = (target_dim + 1) % 2
         input_low = torch.min(layer.weight, dim=stat_dim).values.detach()
         input_high = torch.max(layer.weight, dim=stat_dim).values.detach()
-        scale, zero_point = get_scale_zp_from_input_low_input_high(0, level_high, input_low, input_high)
+        scale, zero_point = get_scale_zp_from_input_low_input_high(level_low, level_high, input_low, input_high)
 
         scale = scale.unsqueeze(stat_dim)
         zero_point = zero_point.unsqueeze(stat_dim)
@@ -93,7 +94,7 @@ def insert_pre_compression_operations(module: nn.Module, bits: int = 8) -> Optio
     """
     user_types = list(NNCF_WRAPPED_USER_MODULES_DICT.values())
     allowed_types = [NNCFEmbedding, NNCFLinear]
-    level_high = 2**bits - 1
+    level_high = 2**(bits - 1) - 1
 
     assert level_high < 256
 
