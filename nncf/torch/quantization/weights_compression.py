@@ -74,11 +74,11 @@ def _insert_pre_compression_operations(
         zero_point = zero_point.unsqueeze(stat_dim)
         key = layer.register_pre_forward_operation(WeightsDecompressor(zero_point, scale))
 
-        compressed_weight = layer.weight.data / scale + zero_point
+        compressed_weight = layer.weight.data / scale
         compressed_weight = torch.clamp(torch.round(compressed_weight), 0, level_high)
 
         layer.weight.requires_grad = False
-        layer.weight.data = compressed_weight.type(dtype=torch.uint8)
+        layer.weight.data = compressed_weight.type(dtype=torch.int8)
 
         compression_hist[layer.weight] = layer.get_pre_op(key)
 
