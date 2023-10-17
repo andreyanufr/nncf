@@ -70,4 +70,5 @@ class CompressWeightsMode(Enum):
     """
 
     INT8 = "int8"
+    INT4 = "int4"
     NF4 = "nf4"
