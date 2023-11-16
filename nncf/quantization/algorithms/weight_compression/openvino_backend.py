@@ -115,6 +115,21 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
                 if config.group_size != -1:
                     mul = opset.reshape(mul, output_shape=original_shape, special_zero=False)
                 last_output = mul.output(0)
+            elif config.mode == CompressWeightsMode.RF4:
+                original_shape = weight.shape
+                norm_weight, scale = _get_norm_weight_and_nf4_scale(weight, wp.reduction_axis, group_size)
+                norm_weight = _map_nf4_to_rf4(norm_weight)
+                scale = scale / 127.0
+                if False:
+                    norm_weight = norm_weight * scale
+                    mul = opset.constant(norm_weight, name=weight_name)
+                else:
+                    compressed_const = opset.constant(norm_weight, dtype=np.int8, name=weight_name)
+                    convert = opset.convert(compressed_const, original_weight_dtype)
+                    mul = opset.multiply(convert, scale.astype(original_weight_dtype), name=wp.fq_name)
+                    if config.group_size != -1:
+                        mul = opset.reshape(mul, output_shape=original_shape, special_zero=False)
+                last_output = mul.output(0)
             else:
                 original_shape = weight.shape
                 compressed_weights, scale, zero_point = _do_integer_quantization(weight, wp.reduction_axis, config)
@@ -308,6 +323,30 @@ def _get_norm_weight_and_nf4_scale(
     norm_weight = weight / scale
     return norm_weight, scale
 
+
+def _map_nf4_to_rf4(weight: np.ndarray) -> np.array:
+    map_int8_to_rf4 = {-127: [-127, -108],
+                       -88: [-107, -78],
+                       -67: [-77, -59],
+                       -50: [-58, -43],
+                       -36: [-42, -30],
+                       -23: [-29, -18],
+                       -12: [-17, -6],
+                       0: [-5, 5],
+                       10: [6, 15],
+                       20: [16, 25],
+                       31: [26, 37],
+                       43: [38, 49],
+                       56: [50, 63],
+                       71: [64, 81],
+                       92: [82, 109],
+                       127: [110, 127]}
+
+    weight = np.clip(weight * 127, -127, 127).astype(np.int8)
+    for k, v in map_int8_to_rf4.items():
+        weight[(weight >= v[0]) & (weight <= v[1])] = k
+
+    return weight
 
 def _proportion_str(num_weights_list: List[int], total_num_weights: int, total_num_params: int) -> str:
     percentage = sum(num_weights_list) / max(total_num_weights, 1) * 100

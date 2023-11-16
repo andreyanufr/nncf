@@ -79,3 +79,4 @@ class CompressWeightsMode(Enum):
     INT4_SYM = "int4_sym"
     INT4_ASYM = "int4_asym"
     NF4 = "nf4"
+    RF4 = "rf4"
