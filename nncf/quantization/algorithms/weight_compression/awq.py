@@ -265,14 +265,16 @@ class AWQ(Algorithm):
 
             # update activations for next usage
             a_scale_t = fns.transpose(a_scale)
-            for stat in self._activations[k]:
+            for i, stat in enumerate(self._activations[k]):
                 stat = stat * a_scale_t
+                self._activations[k][i] = stat
 
             for _, port_id in self._backend_entity.get_weight_names_and_port_ids(merge_node, graph):
                 merge_weight = self._backend_entity.get_weight(merge_node, port_id, model, graph)
                 merge_weight = merge_weight * a_scale
                 self._backend_entity.set_weight(merge_node, port_id, model, graph, merge_weight)
 
+        model = self.apply_scale_correction(model, graph)
         return model
 
     def apply_scale_correction(
@@ -305,8 +307,11 @@ class AWQ(Algorithm):
             _, weight_port_id = weight_data[0]
 
             split = int(0.7 * len(activations))
-            X = fns.stack([fns.mean(stat, axis=0) for stat in activations[:split]])
+            X = fns.stack([fns.mean(stat, axis=0) for stat in activations])
             X = fns.transpose(X) #[d_in, seq_len]
+            s = fns.max(fns.abs(X), axis=1)
+            X_cnt = X[:, split:]
+            X = X[:, :split]
 
             if X.shape[1] > self._subset_size:
                 lens = [stat.shape[0] for stat in activations[:split]]
@@ -316,10 +321,10 @@ class AWQ(Algorithm):
             X_cnt = fns.stack([fns.mean(stat, axis=0) for stat in activations[split:]])
             X_cnt = fns.transpose(X_cnt)#[d_in, seq_len]
 
-            if X_cnt.shape[1] > self._subset_size:
-                lens = [stat.shape[0] for stat in activations[split:]]
-                idxs = [i[0] for i in sorted(enumerate(lens), key=lambda x:-x[1])][:self._subset_size]
-                X_cnt = X_cnt[:, idxs]
+            # if X_cnt.shape[1] > self._subset_size:
+            #     lens = [stat.shape[0] for stat in activations[split:]]
+            #     idxs = [i[0] for i in sorted(enumerate(lens), key=lambda x:-x[1])][:self._subset_size]
+            #     X_cnt = X_cnt[:, idxs]
 
             weight = self._backend_entity.get_weight(
                 wp.node_with_weight, weight_port_id, model, graph
@@ -337,13 +342,10 @@ class AWQ(Algorithm):
 
             q_weights = do_dequantization(g_compressed_weighs, g_c_scale, g_c_zp, reduction_axis)
 
-            fp_out = fns.matmul(original_weight, X) # [d_out, seq_len]
             fp_out_cnt = fns.matmul(original_weight, X_cnt) # [d_out, seq_len]
-
             q_out = fns.matmul(q_weights, X_cnt)
             diff_before = fns.mean(fns.abs(fp_out_cnt - q_out))
-
-            s = fns.max(fns.abs(X), axis=1)
+            
             s = fns.unsqueeze(s, 0)
             s, _ = reshape_weight_for_grouped_quantization(s, reduction_axis, config.group_size)
 
@@ -368,10 +370,6 @@ class AWQ(Algorithm):
             best_diffs = None
             result_scale = None
             eps = fns.finfo(weight).eps
-            # fp_outs = []
-            # for si in range(X.shape[0]):
-            #     fp_out = fns.matmul(original_weight[:, si, :], X[si, :, :])
-            #     fp_outs.append(fp_out)
 
             fp_outs = fns.matmul(fns.transpose(original_weight, (1, 0, 2)), X)
             q_outs = fns.matmul(fns.transpose(q_weights, (1, 0, 2)), X)
@@ -379,48 +377,22 @@ class AWQ(Algorithm):
             min_max_scale_diffs = fns.transpose(min_max_scale_diffs, (1, 0))
             ideal_scale_diffs = fns.zeros_like(min_max_scale_diffs)
 
-            for algo_iters in range(5):
-                ideal_scale = fns.abs(scaled_weight) / (fns.abs(target) + 0.0000000000000001)
+            for _ in range(5):
+                ideal_scale = fns.abs(scaled_weight) / (fns.abs(target) + eps)
                 ideal_scale = fns.where(zero_mask, eps, ideal_scale)
                 
                 weighted_scale = ideal_scale * ww
 
                 near_to_ideal_scale = fns.sum(weighted_scale, axis=2, keepdims=True)
 
-                # scaled_weights = original_weight / near_to_ideal_scale + g_c_zp
-                # compressed_weights = fns.round(scaled_weights)
-                # compressed_weights = fns.clip(compressed_weights, level_low, level_high).astype(TensorDataType.uint8)
-                
-                # RETURN BACK
                 compressed_weights, _, _ = do_integer_quantization(original_weight, -1, cur_config, near_to_ideal_scale)
                 q_weights_ = do_dequantization(compressed_weights, near_to_ideal_scale, g_c_zp)
-
-                
-                # min_max_scale_diffs = []
-                # ideal_scale_diffs = []
 
                 q_outs = fns.matmul(fns.transpose(q_weights_, (1, 0, 2)), X)
                 ideal_scale_diffs = fns.mean((fp_outs - q_outs)**2, axis=-1)
                 ideal_scale_diffs = fns.transpose(ideal_scale_diffs, (1, 0))
-                 
-                # for si in range(X.shape[0]):
-                #     # [N/g, g, n_samples]
-                #     for o_dim in q_weights_.shape[0]:
-                #         tmp = np.dot(q_weights_.data[o_dim, si, :], X.data[si])
-                #         ideal_scale_diffs[o_dim, si] = 
-                #     # q_out_ = fns.matmul(q_weights_[:, si, :], X[si, :, :])
-                #     # tmp = q_outs[si, :, :]
-                #     # q_diff = fns.mean(fns.abs(tmp - q_out_))
-                #     # ideal_scale_diffs.append(fns.mean((fp_outs[si] - q_out_)**2, axis=1))
 
-                #     # if best_diffs is None:
-                #     #     q_out = fns.matmul(q_weights[:, si, :], X[si, :, :])
-                #     #     min_max_scale_diffs.append(fns.mean((fp_outs[si] - q_out)**2, axis=1))
-                    
-                
-                #ideal_scale_diffs = fns.stack(ideal_scale_diffs, axis=1)
                 if best_diffs is None:
-                    #min_max_scale_diffs = fns.stack(min_max_scale_diffs, axis=1)
                     best_diffs = min_max_scale_diffs
                 
                 mask = ideal_scale_diffs>best_diffs
@@ -435,9 +407,6 @@ class AWQ(Algorithm):
                     near_to_ideal_scale = fns.where(mask , result_scale, near_to_ideal_scale)
                 result_scale = near_to_ideal_scale
 
-                scaled_weights = original_weight / near_to_ideal_scale + g_c_zp
-                # compressed_weights = fns.round(scaled_weights)
-                # compressed_weights = fns.clip(compressed_weights, level_low, level_high).astype(TensorDataType.uint8)
                 compressed_weights, _, _ = do_integer_quantization(original_weight, -1, cur_config, near_to_ideal_scale)
                 target = compressed_weights.astype(dtype=g_c_scale.dtype) - g_c_zp
 
@@ -445,15 +414,9 @@ class AWQ(Algorithm):
             for scale_steps in range(10):
                 scale = 1.5 - 0.1 * scale_steps
                 scaled_scale = scale * g_c_scale
-
-                # scaled_weights = original_weight / scaled_scale + g_c_zp
-                # compressed_weights = fns.round(scaled_weights)
-                # compressed_weights = fns.clip(compressed_weights, level_low, level_high).astype(TensorDataType.uint8)
-                
-                # RETURN BACK                
+           
                 compressed_weights, _, _ = do_integer_quantization(original_weight, -1, cur_config, scaled_scale)
                 q_weights_ = do_dequantization(compressed_weights, near_to_ideal_scale, g_c_zp)
-                #q_weights_ = q_weights
 
                 target = compressed_weights.astype(dtype=g_c_scale.dtype) - g_c_zp
                 
@@ -481,7 +444,17 @@ class AWQ(Algorithm):
                     near_to_ideal_scale = fns.where(mask , result_scale, near_to_ideal_scale)
                 result_scale = near_to_ideal_scale
 
-            wp.precomputed_scale = result_scale
+            g_compressed_weighs, g_c_scale, g_c_zp = do_integer_quantization(
+                original_weight, -1, cur_config, result_scale
+            )
+            q_weights = do_dequantization(g_compressed_weighs, g_c_scale, g_c_zp, reduction_axis)
+            q_out = fns.matmul(q_weights, X_cnt)
+            diff_after = fns.mean(fns.abs(fp_out_cnt - q_out))
+
+            # prevent overfitting
+            print(k, diff_before, diff_after)
+            if diff_before > diff_after:
+                wp.precomputed_scale = result_scale
         return model
 
     def get_statistic_points(self, model: TModel, graph: NNCFGraph) -> StatisticPointsContainer:
