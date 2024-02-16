@@ -155,7 +155,7 @@ def do_integer_quantization(
         else:
             scale = fns.max(fns.abs(weight), axis=reduction_axes, keepdims=True)  # [a1, r//gs, 1, a2]
             scale = scale / level_high_sym
-        zero_point = fns.as_tensor_like(scale, [-level_low_sym])
+        zero_point = fns.as_tensor_like(scale, [-level_low_sym]).astype(TensorDataType.int32)
         eps = fns.finfo(scale).eps
         # NOTE: adding machine epsilon to avoid division by zero
         scale = fns.where(fns.abs(scale) < eps, eps, scale)
@@ -193,7 +193,9 @@ def get_integer_quantization_error(
     return val.item()
 
 
-def compress_weight(weight: Tensor, reduction_axes: ReductionAxes, config: WeightCompressionConfig, precomputed_scale: Tensor=None):
+def compress_weight(
+    weight: Tensor, reduction_axes: ReductionAxes, config: WeightCompressionConfig, precomputed_scale: Tensor = None
+):
     """
     Compress weight using compression configuration.
 
@@ -210,7 +212,9 @@ def compress_weight(weight: Tensor, reduction_axes: ReductionAxes, config: Weigh
     return CompressedWeight(compressed_weight, scale, zero_point)
 
 
-def do_dequantization(compressed_weights: Tensor, scale: Tensor, zero_point: Tensor, reduction_axis: int = -1) -> Tensor:
+def do_dequantization(
+    compressed_weights: Tensor, scale: Tensor, zero_point: Tensor, reduction_axis: int = -1
+) -> Tensor:
     """
     The method dequantizes the given weights to float point data type in accordance with the scale and
     zero_point data type.

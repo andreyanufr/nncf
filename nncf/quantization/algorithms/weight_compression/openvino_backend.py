@@ -148,7 +148,9 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
 
             weight = Tensor(get_const_value(const_node))
             original_shape = weight.shape
-            compressed_weight = compress_weight(weight, wc_params.reduction_axes, compression_config, wc_params.precomputed_scale)
+            compressed_weight = compress_weight(
+                weight, wc_params.reduction_axes, compression_config, wc_params.precomputed_scale
+            )
 
             compressed_const = opset.constant(
                 compressed_weight.tensor.data, dtype=compression_dtype, name=const_node_name
@@ -193,3 +195,76 @@ class OVAWQAlgoAlgoBackend(OVWeightCompressionAlgoBackend):
     @staticmethod
     def get_awq_patterns():
         return get_awq_patterns(om.OVMatMulMetatype, om.OVMultiplyMetatype)
+
+    @staticmethod
+    def get_compress_decompress_pipeline(
+        weight_compression_parameter: WeightCompressionParameters, w_shape, s_shape, z_p_shape
+    ):
+        config = weight_compression_parameter.compression_config
+        mode = config.mode
+        assert mode == CompressWeightsMode.INT4_SYM
+        num_bits = config.num_bits
+
+        level_low = 0
+        level_high = 2**num_bits - 1
+
+        input_node_w = opset.parameter(w_shape, name="w")
+        input_node_s = opset.parameter(s_shape, name="s")
+        input_node_zp = opset.parameter(z_p_shape, name="zp")
+
+        # compressed_weights = fns.round(weight / scale + zero_point.astype(weight.dtype))
+        # compressed_weights = fns.clip(compressed_weights, level_low, level_high).astype(TensorDataType.uint8)
+        # return compressed_weights, scale, zero_point
+
+        node_compression_div = opset.divide(input_node_w, input_node_s)
+        node_compression_add = opset.add(node_compression_div, input_node_zp)
+        node_compression_round = opset.round(node_compression_add)
+        node_compression_clamp = opset.clamp(node_compression_round, level_low, level_high)
+
+        result1 = opset.result(node_compression_clamp, name="compressed_weights")
+        result1.get_output_tensor(0).set_names(set(["compressed_weights"]))
+
+        # decompressed_weight = compressed_weights.astype(dtype=scale.dtype)
+        # decompressed_weight = (decompressed_weight - zero_point) * scale
+        node_decompression_add = opset.subtract(node_compression_clamp, input_node_zp)
+        node_decompression_mul = opset.multiply(node_decompression_add, input_node_s)
+        result2 = opset.result(node_decompression_mul, name="q_weights")
+        result2.get_output_tensor(0).set_names(set(["q_weights"]))
+
+        model = ov.Model([result1, result2], [input_node_w, input_node_s, input_node_zp])
+
+        compiled_model = ov.compile_model(model)
+
+        return compiled_model
+
+    @staticmethod
+    def get_compress_pipeline(weight_compression_parameter: WeightCompressionParameters, w_shape, s_shape, z_p_shape):
+        config = weight_compression_parameter.compression_config
+        mode = config.mode
+        assert mode == CompressWeightsMode.INT4_SYM
+        num_bits = config.num_bits
+
+        level_low = 0
+        level_high = 2**num_bits - 1
+
+        input_node_w = opset.parameter(w_shape, name="w")
+        input_node_s = opset.parameter(s_shape, name="s")
+        input_node_zp = opset.parameter(z_p_shape, name="zp")
+
+        # compressed_weights = fns.round(weight / scale + zero_point.astype(weight.dtype))
+        # compressed_weights = fns.clip(compressed_weights, level_low, level_high).astype(TensorDataType.uint8)
+        # return compressed_weights, scale, zero_point
+
+        node_compression_div = opset.divide(input_node_w, input_node_s)
+        node_compression_add = opset.add(node_compression_div, input_node_zp)
+        node_compression_round = opset.round(node_compression_add)
+        node_compression_clamp = opset.clamp(node_compression_round, level_low, level_high)
+
+        result1 = opset.result(node_compression_clamp, name="compressed_weights")
+        result1.get_output_tensor(0).set_names(set(["compressed_weights"]))
+
+        model = ov.Model([result1], [input_node_w, input_node_s, input_node_zp])
+
+        compiled_model = ov.compile_model(model)
+
+        return compiled_model
