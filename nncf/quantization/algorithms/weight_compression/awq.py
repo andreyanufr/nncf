@@ -182,13 +182,10 @@ class AWQ(Algorithm):
             stats = self._activations[k]
             X = fns.stack([fns.mean(stat, axis=0) for stat in stats])
             X = fns.transpose(X)
+            if X.shape[1] > self._subset_size:
+                X = X[:, : self._subset_size]
 
             s = fns.max(fns.abs(X), axis=1)
-
-            if X.shape[1] > self._subset_size:
-                lens = [stat.shape[0] for stat in stats]
-                idxs = [i[0] for i in sorted(enumerate(lens), key=lambda x: -x[1])][: self._subset_size]
-                X = X[:, idxs]
 
             top_k = max(int(s.shape[0] * self._percent_to_apply), 1)
             topk_idxs = fns.argsort(-s)[:top_k]
@@ -308,13 +305,13 @@ class AWQ(Algorithm):
             X_cnt = X[:, split:]
             X = X[:, :split]
 
-            if X.shape[1] > self._subset_size:
-                lens = [stat.shape[0] for stat in activations[:split]]
-                idxs = [i[0] for i in sorted(enumerate(lens), key=lambda x: -x[1])][: self._subset_size]
-                X = X[:, idxs]
+            # if X.shape[1] > self._subset_size:
+            #     lens = [stat.shape[0] for stat in activations[:split]]
+            #     idxs = [i[0] for i in sorted(enumerate(lens), key=lambda x: -x[1])][: self._subset_size]
+            #     X = X[:, idxs]
 
-            X_cnt = fns.stack([fns.mean(stat, axis=0) for stat in activations[split:]])
-            X_cnt = fns.transpose(X_cnt)  # [d_in, seq_len]
+            # X_cnt = fns.stack([fns.mean(stat, axis=0) for stat in activations[split:]])
+            # X_cnt = fns.transpose(X_cnt)  # [d_in, seq_len]
 
             # if X_cnt.shape[1] > self._subset_size:
             #     lens = [stat.shape[0] for stat in activations[split:]]
@@ -480,10 +477,10 @@ class AWQ(Algorithm):
             X_cnt = X[:, split:]
             X = X[:, :split]
 
-            if X.shape[1] > self._subset_size:
-                lens = [stat.shape[0] for stat in activations[:split]]
-                idxs = [i[0] for i in sorted(enumerate(lens), key=lambda x: -x[1])][: self._subset_size]
-                X = X[:, idxs]
+            # if X.shape[1] > self._subset_size:
+            #     lens = [stat.shape[0] for stat in activations[:split]]
+            #     idxs = [i[0] for i in sorted(enumerate(lens), key=lambda x: -x[1])][: self._subset_size]
+            #     X = X[:, idxs]
 
             weight = self._backend_entity.get_weight(wp.node_with_weight, weight_port_id, model, graph)
 
