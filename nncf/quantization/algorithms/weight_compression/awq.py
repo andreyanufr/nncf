@@ -59,8 +59,8 @@ class AWQ(Algorithm):
         activations: Optional[Dict[str, TTensor]] = None,
         subset_size: int = 32,
         percent_to_apply=0.002,
-        alpha_min=0.01,
-        alpha_max=1.0,
+        alpha_min=0.0,
+        alpha_max=2.0,
         steps=100,
     ):
         """
@@ -168,6 +168,7 @@ class AWQ(Algorithm):
         alpha_step = (self._alpha_max - self._alpha_min) / self._steps
 
         for k, awq_data_item in track(awq_data.items(), description="Applying AWQ"):
+            print("LAYER: ", k)
             wp = awq_data_item.weight_params
             target_node = awq_data_item.target_node
             merge_node = awq_data_item.merge_node
@@ -181,23 +182,27 @@ class AWQ(Algorithm):
 
             stats = self._activations[k]
             X = fns.stack([fns.mean(stat, axis=0) for stat in stats])
-            X = fns.transpose(X)
+            X_full = fns.transpose(X)
+            
+            s_group = fns.max(fns.abs(X), axis=0)
+
+            if X_full.shape[1] > self._subset_size:
+                lens = [stat.shape[0] for stat in stats]
+                idxs = [i[0] for i in sorted(enumerate(lens), key=lambda x: -x[1])][: self._subset_size]
+                X = X_full[:, idxs]
+            else:
+                X = X_full
 
             s = fns.max(fns.abs(X), axis=1)
 
-            if X.shape[1] > self._subset_size:
-                lens = [stat.shape[0] for stat in stats]
-                idxs = [i[0] for i in sorted(enumerate(lens), key=lambda x: -x[1])][: self._subset_size]
-                X = X[:, idxs]
-
-            top_k = max(int(s.shape[0] * self._percent_to_apply), 1)
-            topk_idxs = fns.argsort(-s)[:top_k]
+            top_k = max(int(s_group.shape[0] * self._percent_to_apply), 1)
+            topk_idxs = fns.argsort(-s_group)[:top_k]
 
             groups_to_correct = set()
             for idx in topk_idxs:
                 groups_to_correct.add(idx.data // config.group_size)
 
-            groups_to_correct = list(groups_to_correct)
+            groups_to_correct = sorted(list(groups_to_correct))
 
             weight = self._backend_entity.get_weight(
                 wp.node_with_weight, weight_port_id, model, graph
@@ -209,13 +214,32 @@ class AWQ(Algorithm):
                 weight = fns.transpose(weight)
                 reduction_axis = 1
 
-            shape_vector = fns.mean(X, axis=1)
-            scale = fns.ones_like(shape_vector)
-
             awq_config = deepcopy(config)
             awq_config.group_size = -1
 
+            if True:
+                n_groups = s.shape[0] // config.group_size
+                group_diffs = []
+                for gi in range(n_groups):
+                    offset = gi * config.group_size
+                    gweight = weight[:, offset : offset + config.group_size]
+                    gacts = X_full[offset : offset + config.group_size, :]
+                    fp32_out = fns.matmul(gweight, gacts)
+                    best_scale = None
+
+                    g_compressed_weighs, g_c_scale, g_c_zp = do_integer_quantization(gweight, reduction_axis, awq_config)
+                    g_decompressed_weighs = do_dequantization(g_compressed_weighs, g_c_scale, g_c_zp)
+                    cur_out = fns.matmul(g_decompressed_weighs, gacts)
+                    min_diff = fns.mean((cur_out - fp32_out)**2)/fns.mean(fp32_out**2)
+                    group_diffs.append(min_diff)
+                top_k = 15
+                topk_group_idxs =  sorted([i[0] for i in sorted(enumerate(group_diffs), key=lambda x: -x[1])][: top_k])
+                groups_to_correct = topk_group_idxs
+            shape_vector = fns.mean(X, axis=1)
+            scale = fns.ones_like(shape_vector)
+
             for gi in groups_to_correct:
+                print("\tGROUP: ", gi)
                 offset = gi * config.group_size
                 gscale = s[offset : offset + config.group_size]
 
@@ -227,8 +251,12 @@ class AWQ(Algorithm):
                 gacts = X[offset : offset + config.group_size, :]
 
                 fp32_out = fns.matmul(gweight, gacts)
-                min_diff = fns.max(fns.abs(fp32_out))
                 best_scale = None
+
+                g_compressed_weighs, g_c_scale, g_c_zp = do_integer_quantization(gweight, reduction_axis, awq_config)
+                g_decompressed_weighs = do_dequantization(g_compressed_weighs, g_c_scale, g_c_zp)
+                cur_out = fns.matmul(g_decompressed_weighs, gacts)
+                min_diff = fns.mean(fns.abs(cur_out - fp32_out))
 
                 alpha = self._alpha_min
                 for _ in range(self._steps):
@@ -245,6 +273,7 @@ class AWQ(Algorithm):
                     if cur_diff < min_diff:
                         min_diff = cur_diff
                         best_scale = cur_scale
+                        print("\t\tDiff: ", min_diff, alpha)
                     alpha += alpha_step
 
                 if best_scale is not None:
