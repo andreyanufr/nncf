@@ -179,6 +179,7 @@ OPERATIONS_WITH_WEIGHTS = [
 OPERATIONS_WITH_CONST_PORT_ID = [
     *OPERATIONS_WITH_WEIGHTS,
     ov_metatypes.OVAddMetatype,
+    ov_metatypes.OVMultiplyMetatype,
 ]
 
 

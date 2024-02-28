@@ -18,7 +18,7 @@ AWQ_PATTERNS = Registry("awq")
 
 
 @AWQ_PATTERNS.register("MatMul_Mul_MatMul")
-def create_matmul_mul_matmul(matmul_metatype, multiply_metatype) -> GraphPattern:
+def create_matmul_mul_matmul(matmul_metatype, multiply_metatype, add_metatype) -> GraphPattern:
     pattern = GraphPattern()
     linear_node_1 = pattern.add_node(**{GraphPattern.LABEL_ATTR: "LINEAR", GraphPattern.METATYPE_ATTR: matmul_metatype})
     mul_node = pattern.add_node(**{GraphPattern.LABEL_ATTR: "MULTIPLY", GraphPattern.METATYPE_ATTR: multiply_metatype})
@@ -29,9 +29,39 @@ def create_matmul_mul_matmul(matmul_metatype, multiply_metatype) -> GraphPattern
     return pattern
 
 
-def get_awq_patterns(matmul_metatype, multiply_metatype):
+@AWQ_PATTERNS.register("LayerNorm_3MatMul")
+def create_layer_norm_3matmul(matmul_metatype, multiply_metatype,add_metatype) -> GraphPattern:
+    pattern = GraphPattern()
+    mul_node = pattern.add_node(**{GraphPattern.LABEL_ATTR: "MULTIPLY", GraphPattern.METATYPE_ATTR: multiply_metatype})
+    add_node = pattern.add_node(**{GraphPattern.LABEL_ATTR: "ADD", GraphPattern.METATYPE_ATTR: add_metatype})
+    linear_node_1 = pattern.add_node(**{GraphPattern.LABEL_ATTR: "LINEAR", GraphPattern.METATYPE_ATTR: matmul_metatype})
+    linear_node_2 = pattern.add_node(**{GraphPattern.LABEL_ATTR: "LINEAR", GraphPattern.METATYPE_ATTR: matmul_metatype})
+    linear_node_3 = pattern.add_node(**{GraphPattern.LABEL_ATTR: "LINEAR", GraphPattern.METATYPE_ATTR: matmul_metatype})
+
+    pattern.add_edge(mul_node, add_node)
+    pattern.add_edge(add_node, linear_node_1)
+    pattern.add_edge(add_node, linear_node_2)
+    pattern.add_edge(add_node, linear_node_3)
+    return pattern
+
+
+@AWQ_PATTERNS.register("RMSNorm_3MatMul")
+def create_rms_norm_3matmul(matmul_metatype, multiply_metatype,add_metatype) -> GraphPattern:
+    pattern = GraphPattern()
+    mul_node = pattern.add_node(**{GraphPattern.LABEL_ATTR: "MULTIPLY", GraphPattern.METATYPE_ATTR: multiply_metatype})
+    linear_node_1 = pattern.add_node(**{GraphPattern.LABEL_ATTR: "LINEAR", GraphPattern.METATYPE_ATTR: matmul_metatype})
+    linear_node_2 = pattern.add_node(**{GraphPattern.LABEL_ATTR: "LINEAR", GraphPattern.METATYPE_ATTR: matmul_metatype})
+    linear_node_3 = pattern.add_node(**{GraphPattern.LABEL_ATTR: "LINEAR", GraphPattern.METATYPE_ATTR: matmul_metatype})
+
+    pattern.add_edge(mul_node, linear_node_1)
+    pattern.add_edge(mul_node, linear_node_2)
+    pattern.add_edge(mul_node, linear_node_3)
+    return pattern
+
+
+def get_awq_patterns(matmul_metatype, multiply_metatype, add_metatype):
     res = Registry("awq")
     for k, v in AWQ_PATTERNS.registry_dict.items():
-        res.registry_dict[k] = partial(v, matmul_metatype, multiply_metatype)
+        res.registry_dict[k] = partial(v, matmul_metatype, multiply_metatype, add_metatype)
 
     return res.registry_dict
