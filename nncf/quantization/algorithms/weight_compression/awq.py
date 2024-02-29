@@ -132,6 +132,7 @@ class AWQ(Algorithm):
         :param dataset: A representative dataset for the calibration process.
         :return: A resulting model.
         """
+        #return self.apply_scale_correction_optimized(model, graph)
         matches = []
 
         inference_nncf_graph = transform_to_inference_graph(deepcopy(graph), [], [], [])
@@ -176,6 +177,7 @@ class AWQ(Algorithm):
             
             for i in range(3):
                 nncf_node = graph.get_node_by_key(match[-1 - i])
+                #target_node_names.append(nncf_node.node_name)
                 for weight_op_friendly_name, _ in self._backend_entity.get_weight_names_and_port_ids(nncf_node, graph):
                     target_node_names.append(weight_op_friendly_name)
 
@@ -185,10 +187,12 @@ class AWQ(Algorithm):
                     merge_node_names.append(weight_op_friendly_name)
 
             weight_params = [self._all_weight_params[name_mapping[name]] for name in target_node_names]
-            num_bits = [wp.compression_config.num_bits for wp in weight_params]
+            weight_params = {wp.node_with_weight.node_name: wp for wp in weight_params}
+            
+            num_bits = [wp.compression_config.num_bits for k, wp in weight_params.items()]
             if 8 in num_bits:
                 continue
-            target_nodes = [self._nodes_to_compress[name_mapping[name]] for name in target_node_names]
+            target_nodes = [graph.get_node_by_key(match[-1 - i]) for i in range(3)]
             merge_nodes = [graph.get_node_by_key(match[i]) for i in range(len(match) - 3)]
 
             awq_layer_norm_data[target_nodes[0].node_name] = AWQCompressionInfo(weight_params, target_nodes, merge_nodes)
@@ -355,14 +359,18 @@ class AWQ(Algorithm):
             target_nodes = awq_data_item.target_node
             merge_nodes = awq_data_item.merge_node
 
-            weight_datas = [self._backend_entity.get_weight_names_and_port_ids(wp.node_with_weight, graph) for wp in wps]
-            #if len(weight_data) != 1:  # not supported by the algorithm
-            #    continue
-            #_, weight_port_id = weight_data[0]
-            weight_port_ids = [weight_data[0][1] for weight_data in weight_datas]
-            config = wps[0].compression_config
+            weight_datas = {
+                tn.node_name: self._backend_entity.get_weight_names_and_port_ids(tn, graph) for tn in target_nodes
+            }
+
+            weight_port_ids = {k: v[0][1] for k, v in weight_datas.items()}
+            config = wps[k].compression_config
 
             stats = self._activations[k]
+            for tn in target_nodes:
+                tmp_stats = self._activations[tn.node_name]
+                assert fns.allclose(tmp_stats[0], stats[0])
+
             X = fns.stack([fns.mean(stat, axis=0) for stat in stats])
             X_full = fns.transpose(X)
             
@@ -387,24 +395,24 @@ class AWQ(Algorithm):
 
             groups_to_correct = sorted(list(groups_to_correct))
 
-            weights = [self._backend_entity.get_weight(
-                wp.node_with_weight, weight_port_id, model, graph
-            )  for wp, weight_port_id in zip(wps, weight_port_ids)]# get_const_value(wp.weight_node)
-            for wp in wps:
+            weights = {tn.node_name: self._backend_entity.get_weight(
+                tn, weight_port_ids[tn.node_name], model, graph
+            )  for tn in target_nodes}# get_const_value(wp.weight_node)
+            for _, wp in wps.items():
                 assert isinstance(wp.reduction_axes, tuple) and len(wp.reduction_axes) == 1
-            reduction_axis = wps[0].reduction_axes[0]
+            reduction_axis = wps[k].reduction_axes[0]
             
-            diffs_before = []
-            fp_out_cnts = []
-            for i in range(3):
-                g_compressed_weighs, g_c_scale, g_c_zp = do_integer_quantization(weights[i], reduction_axis, config)
+            diffs_before = {}
+            fp_out_cnts = {}
+            for tn in target_nodes:
+                g_compressed_weighs, g_c_scale, g_c_zp = do_integer_quantization(weights[tn.node_name], reduction_axis, config)
                 g_c_zp = g_c_zp.astype(g_c_scale.dtype)
                 q_weights = do_dequantization(g_compressed_weighs, g_c_scale, g_c_zp, reduction_axis)
-                fp_out_cnt = fns.matmul(weights[i], X_full)  # [d_out, seq_len]
+                fp_out_cnt = fns.matmul(weights[tn.node_name], X_full)  # [d_out, seq_len]
                 q_out = fns.matmul(q_weights, X_full)
                 diff_before = fns.mean(fns.abs(fp_out_cnt - q_out))
-                diffs_before.append(diff_before)
-                fp_out_cnts.append(fp_out_cnt)
+                diffs_before[tn.node_name] = diff_before
+                fp_out_cnts[tn.node_name] = fp_out_cnt
 
 
             if reduction_axis == 0:
@@ -426,24 +434,24 @@ class AWQ(Algorithm):
                 a_max = 1e2
                 gscale = fns.clip(gscale, a_min=a_min, a_max=a_max)
 
-                gweights = [weight[:, offset : offset + config.group_size] for weight in weights]
+                gweights = {node_name: weight[:, offset : offset + config.group_size] for node_name, weight in weights.items()}
                 gacts = X[offset : offset + config.group_size, :]
 
-                fp32_outs = [fns.matmul(gweight, gacts) for gweight in gweights]
+                fp32_outs = {node_name : fns.matmul(gweight, gacts) for node_name, gweight in gweights.items()}
                 best_scale = None
-                min_diffs = []
+                min_diffs = {}
 
-                for i, gweight in enumerate(gweights):
+                for node_name, gweight in gweights.items():
                     g_compressed_weighs, g_c_scale, g_c_zp = do_integer_quantization(gweight, reduction_axis, awq_config)
                     g_decompressed_weighs = do_dequantization(g_compressed_weighs, g_c_scale, g_c_zp)
                     cur_out = fns.matmul(g_decompressed_weighs, gacts)
-                    min_diffs.append(fns.mean(fns.abs(cur_out - fp32_outs[i])))
+                    min_diffs[node_name] = fns.mean(fns.abs(cur_out - fp32_outs[node_name]))
                 #print("\t\tDiff before: ", min_diffs)
                 alpha = self._alpha_min
                 for _ in range(self._steps):
                     cur_scale = gscale**alpha
-                    cur_diffs = []
-                    for i, gweight in enumerate(gweights):
+                    cur_diffs = {}
+                    for node_name, gweight in gweights.items():
                         g_compressed_weighs, g_c_scale, g_c_zp = do_integer_quantization(
                             gweight * cur_scale, reduction_axis, awq_config
                         )
@@ -451,14 +459,14 @@ class AWQ(Algorithm):
                         sacts = gacts / fns.unsqueeze(cur_scale, 1)
 
                         cur_out = fns.matmul(g_decompressed_weighs, sacts)
-                        cur_diff = fns.mean(fns.abs(cur_out - fp32_outs[i]))
-                        cur_diffs.append(cur_diff)
+                        cur_diff = fns.mean(fns.abs(cur_out - fp32_outs[node_name]))
+                        cur_diffs[node_name] = cur_diff
                     better_cnt = 0
-                    for i in range(len(gweights)):
-                        if min_diffs[i] > cur_diffs[i]:
+                    for node_name in min_diffs.keys():
+                        if min_diffs[node_name] > cur_diffs[node_name]:
                             better_cnt += 1
                     if better_cnt == len(gweights):
-                        min_diffs = cur_diffs[:]
+                        min_diffs = dict(cur_diffs)
                         best_scale = cur_scale
                         
                     alpha += alpha_step
@@ -477,32 +485,51 @@ class AWQ(Algorithm):
                 a_scale_t = fns.transpose(fns.unsqueeze(1.0 / a_scale, 1))
                 a_scale = fns.unsqueeze(1.0 / a_scale, (0, 1))
 
-            check = 0
-            for weight, weight_port_id, wp in zip(weights, weight_port_ids, wps):            
+            for target_node in target_nodes:
+                node_name = target_node.node_name
+                wp = wps[node_name]
+                weight = weights[node_name]
+                weight_port_id = weight_port_ids[node_name]
                 scaled_weight = weight * w_scale
-                if check + 1:
+                self._backend_entity.set_weight(wp.node_with_weight, weight_port_id, model, graph, scaled_weight)
+                if True:
+                    cstats = self._activations[wp.node_with_weight.node_name]
+                    cX = fns.stack([fns.mean(stat * a_scale_t, axis=0) for stat in cstats])
+                    cX_full = fns.transpose(cX)
+
                     g_compressed_weighs, g_c_scale, g_c_zp = do_integer_quantization(scaled_weight, reduction_axis, config)
                     g_c_zp = g_c_zp.astype(g_c_scale.dtype)
                     q_weights = do_dequantization(g_compressed_weighs, g_c_scale, g_c_zp, reduction_axis)
 
-                    q_out = fns.matmul(q_weights, X_full * fns.transpose(a_scale_t))
-                    diff_after = fns.mean(fns.abs(fp_out_cnts[check] - q_out))
-                    print(wp.node_with_weight.node_name, "Diff before: ", diffs_before[check], "Diff after: ", diff_after)
-                    check += 1
+                    q_out = fns.matmul(q_weights, cX_full)
+                    diff_after = fns.mean(fns.abs(fp_out_cnts[node_name] - q_out))
+                    print(wp.node_with_weight.node_name, "Diff before: ", diffs_before[node_name], "Diff after: ", diff_after)
 
-                self._backend_entity.set_weight(wp.node_with_weight, weight_port_id, model, graph, scaled_weight)
-
-                # tmp = self._backend_entity.get_weight(wp.node_with_weight, weight_port_id, model, graph)
-                
-                # w_diff = fns.mean(fns.abs(scaled_weight - tmp))
 
             # update activations for next usage
-            for t_node in target_nodes:
-                k = t_node.node_name
-                scale_estimator_ignored_scope.append(k)
-                # for i, stat in enumerate(self._activations[k]):
+            for i, stat in enumerate(self._activations[k]):
+                stat = stat * a_scale_t
+                self._activations[k][i] = stat
+                    
+            for t_i, t_node in enumerate(target_nodes):
+                node_name = t_node.node_name
+                scale_estimator_ignored_scope.append(node_name)
+                # for i, stat in enumerate(self._activations[node_name]):
                 #     stat = stat * a_scale_t
-                #     self._activations[k][i] = stat
+                #     self._activations[node_name][i] = stat
+
+                cstats = self._activations[node_name]
+                cX = fns.stack([fns.mean(stat, axis=0) for stat in cstats])
+                cX_full = fns.transpose(cX)
+
+                tmp = self._backend_entity.get_weight(t_node, weight_port_id, model, graph)
+                g_compressed_weighs, g_c_scale, g_c_zp = do_integer_quantization(tmp, reduction_axis, config)
+                g_c_zp = g_c_zp.astype(g_c_scale.dtype)
+                q_weights = do_dequantization(g_compressed_weighs, g_c_scale, g_c_zp, reduction_axis)
+
+                q_out = fns.matmul(q_weights, cX_full)
+                diff_after = fns.mean(fns.abs(fp_out_cnts[node_name] - q_out))
+                print(node_name, "Diff before: ", diffs_before[node_name], "Diff after: ", diff_after)
 
             for merge_node in merge_nodes:
                 for _, port_id in self._backend_entity.get_weight_names_and_port_ids(merge_node, graph):
@@ -510,7 +537,7 @@ class AWQ(Algorithm):
                     merge_weight = merge_weight * a_scale
                     self._backend_entity.set_weight(merge_node, port_id, model, graph, merge_weight)
 
-        #model = self.apply_scale_correction_optimized(model, graph)
+        model = self.apply_scale_correction_optimized(model, graph)
         return model
 
     def apply_scale_correction(self, model: TModel, graph: NNCFGraph) -> TModel:
