@@ -22,6 +22,7 @@ from nncf.common.tensor_statistics.statistic_point import StatisticPointsContain
 from nncf.common.utils.backend import BackendType
 from nncf.common.utils.backend import get_backend
 from nncf.experimental.tensor import functions as fns
+from nncf.parameters import AWQMode
 from nncf.quantization.algorithms.algorithm import Algorithm
 from nncf.quantization.algorithms.weight_compression.config import WeightCompressionParameters
 from nncf.quantization.algorithms.weight_compression.weight_lowering import do_dequantization
@@ -62,6 +63,7 @@ class AWQ(Algorithm):
         alpha_min=0.0,
         alpha_max=1.0,
         steps=100,
+        awq=None,
     ):
         """
         :param model: Model for applying algorithm.
@@ -87,6 +89,7 @@ class AWQ(Algorithm):
         self._steps = steps
         self._backend_entity = None
         self._patterns = None
+        self._awq = awq
 
         self._set_backend_entity(model)
 
@@ -141,7 +144,10 @@ class AWQ(Algorithm):
             matches.extend(find_subgraphs_matching_pattern(nx_graph, pattern_graph(), strict=False))
 
         if len(matches) == 0:
-            return model
+            if self._awq & AWQMode.SCALE:
+                return self.apply_scale_correction_optimized(model, graph)
+            else:
+                return model
 
         target_node_names = []
         merge_node_names = []
@@ -149,60 +155,65 @@ class AWQ(Algorithm):
         awq_layer_norm_data = {}
         name_mapping = {wp.weight_name: idx for idx, wp in enumerate(self._all_weight_params)}
 
-        for match in matches:
-            if len(match) != 3:
-                continue
-            nncf_node = graph.get_node_by_key(match[-1])
-            for weight_op_friendly_name, _ in self._backend_entity.get_weight_names_and_port_ids(nncf_node, graph):
-                target_node_names.append(weight_op_friendly_name)
-
-            nncf_node = graph.get_node_by_key(match[0])
-            for weight_op_friendly_name, _ in self._backend_entity.get_weight_names_and_port_ids(nncf_node, graph):
-                merge_node_names.append(weight_op_friendly_name)
-
-            assert len(target_node_names) == len(merge_node_names)
-            weight_params = self._all_weight_params[name_mapping[target_node_names[-1]]]
-            if weight_params.compression_config.num_bits != 4:
-                continue
-            target_node = self._nodes_to_compress[name_mapping[target_node_names[-1]]]
-            merge_node = self._nodes_to_compress[name_mapping[merge_node_names[-1]]]
-
-            awq_data[target_node.node_name] = AWQCompressionInfo(weight_params, target_node, merge_node)
-
-        for match in matches:
-            if not len(match) in [4, 5]:
-                continue
-            target_node_names = []
-            merge_node_names = []
-            
-            for i in range(3):
-                nncf_node = graph.get_node_by_key(match[-1 - i])
-                #target_node_names.append(nncf_node.node_name)
+        if self._awq & AWQMode.FFN:
+            for match in matches:
+                if len(match) != 3:
+                    continue
+                nncf_node = graph.get_node_by_key(match[-1])
                 for weight_op_friendly_name, _ in self._backend_entity.get_weight_names_and_port_ids(nncf_node, graph):
                     target_node_names.append(weight_op_friendly_name)
 
-            for i in range(len(match) - 3):
-                nncf_node = graph.get_node_by_key(match[i])
+                nncf_node = graph.get_node_by_key(match[0])
                 for weight_op_friendly_name, _ in self._backend_entity.get_weight_names_and_port_ids(nncf_node, graph):
                     merge_node_names.append(weight_op_friendly_name)
 
-            weight_params = [self._all_weight_params[name_mapping[name]] for name in target_node_names]
-            weight_params = {wp.node_with_weight.node_name: wp for wp in weight_params}
-            
-            num_bits = [wp.compression_config.num_bits for k, wp in weight_params.items()]
-            if 8 in num_bits:
-                continue
-            target_nodes = [graph.get_node_by_key(match[-1 - i]) for i in range(3)]
-            merge_nodes = [graph.get_node_by_key(match[i]) for i in range(len(match) - 3)]
+                assert len(target_node_names) == len(merge_node_names)
+                weight_params = self._all_weight_params[name_mapping[target_node_names[-1]]]
+                if weight_params.compression_config.num_bits != 4:
+                    continue
+                target_node = self._nodes_to_compress[name_mapping[target_node_names[-1]]]
+                merge_node = self._nodes_to_compress[name_mapping[merge_node_names[-1]]]
 
-            awq_layer_norm_data[target_nodes[0].node_name] = AWQCompressionInfo(weight_params, target_nodes, merge_nodes)
+                awq_data[target_node.node_name] = AWQCompressionInfo(weight_params, target_node, merge_node)
+
+        if self._awq & AWQMode.ATTN:
+            for match in matches:
+                if not len(match) in [4, 5]:
+                    continue
+                target_node_names = []
+                merge_node_names = []
+                
+                for i in range(3):
+                    nncf_node = graph.get_node_by_key(match[-1 - i])
+                    #target_node_names.append(nncf_node.node_name)
+                    for weight_op_friendly_name, _ in self._backend_entity.get_weight_names_and_port_ids(nncf_node, graph):
+                        target_node_names.append(weight_op_friendly_name)
+
+                for i in range(len(match) - 3):
+                    nncf_node = graph.get_node_by_key(match[i])
+                    for weight_op_friendly_name, _ in self._backend_entity.get_weight_names_and_port_ids(nncf_node, graph):
+                        merge_node_names.append(weight_op_friendly_name)
+
+                weight_params = [self._all_weight_params[name_mapping[name]] for name in target_node_names]
+                weight_params = {wp.node_with_weight.node_name: wp for wp in weight_params}
+                
+                num_bits = [wp.compression_config.num_bits for k, wp in weight_params.items()]
+                if 8 in num_bits:
+                    continue
+                target_nodes = [graph.get_node_by_key(match[-1 - i]) for i in range(3)]
+                merge_nodes = [graph.get_node_by_key(match[i]) for i in range(len(match) - 3)]
+
+                awq_layer_norm_data[target_nodes[0].node_name] = AWQCompressionInfo(weight_params, target_nodes, merge_nodes)
 
         alpha_step = (self._alpha_max - self._alpha_min) / self._steps
 
         scale_estimator_ignored_scope = []
         max_alpha = 0.0
-        for k, awq_data_item in track(awq_data.items(), description="Applying AWQ"):
-            print("LAYER: ", k)
+
+        keys = sorted(awq_data.keys())
+        for k in track(keys, description="Applying AWQ"):
+            awq_data_item = awq_data[k]
+            #print("LAYER: ", k)
             wp = awq_data_item.weight_params
             target_node = awq_data_item.target_node
             merge_node = awq_data_item.merge_node
@@ -228,7 +239,12 @@ class AWQ(Algorithm):
             else:
                 X = X_full
 
-            s = fns.max(fns.abs(X), axis=1)
+            s = fns.max(fns.abs(X_full), axis=1)
+            
+            # from matplotlib import pyplot as plt
+            # plt.plot(s.data.data)
+            # plt.plot(s_old.data)
+            # plt.show()
 
             top_k = max(int(s_group.shape[0] * self._percent_to_apply), 1)
             topk_idxs = fns.argsort(-s_group)[:top_k]
@@ -340,7 +356,7 @@ class AWQ(Algorithm):
 
             q_out = fns.matmul(q_weights, X_full * a_scale)
             diff_after = fns.mean(fns.abs(fp_out_cnt - q_out))
-            print(wp.node_with_weight.node_name, "Diff before: ", diff_before, "Diff after: ", diff_after)
+            print(wp.node_with_weight.node_name, diff_before, diff_after)
 
             # update activations for next usage
             a_scale_t = fns.transpose(a_scale)
@@ -354,9 +370,11 @@ class AWQ(Algorithm):
                 merge_weight = merge_weight * a_scale
                 self._backend_entity.set_weight(merge_node, port_id, model, graph, merge_weight)
 
-        print("Mat alpha: ", max_alpha)
+        print("Max alpha: ", max_alpha)
         max_alpha = 0.0
-        for k, awq_data_item in track(awq_layer_norm_data.items(), description="Applying AWQ for LN"):
+        keys = sorted(awq_layer_norm_data.keys())
+        for k in track(keys, description="Applying AWQ for LN"):
+            awq_data_item = awq_layer_norm_data[k]
             print("LAYER: ", k)
             wps = awq_data_item.weight_params
             target_nodes = awq_data_item.target_node
@@ -387,7 +405,7 @@ class AWQ(Algorithm):
             else:
                 X = X_full
 
-            s = fns.max(fns.abs(X), axis=1)
+            s = fns.max(fns.abs(X_full), axis=1)
 
             top_k = max(int(s_group.shape[0] * self._percent_to_apply), 1)
             topk_idxs = fns.argsort(-s_group)[:top_k]
@@ -540,8 +558,10 @@ class AWQ(Algorithm):
                     merge_weight = self._backend_entity.get_weight(merge_node, port_id, model, graph)
                     merge_weight = merge_weight * a_scale
                     self._backend_entity.set_weight(merge_node, port_id, model, graph, merge_weight)
+        print("Max alpha: ", max_alpha)
 
-        model = self.apply_scale_correction_optimized(model, graph)
+        if self._awq & AWQMode.SCALE:
+            model = self.apply_scale_correction_optimized(model, graph)
         return model
 
     def apply_scale_correction(self, model: TModel, graph: NNCFGraph) -> TModel:

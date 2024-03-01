@@ -31,6 +31,7 @@ from nncf.parameters import DropType
 from nncf.parameters import ModelType
 from nncf.parameters import QuantizationMode
 from nncf.parameters import SensitivityMetric
+from nncf.parameters import AWQMode
 from nncf.parameters import TargetDevice
 from nncf.quantization.advanced_parameters import AdvancedAccuracyRestorerParameters
 from nncf.quantization.advanced_parameters import AdvancedQuantizationParameters
@@ -402,7 +403,7 @@ def compress_weights_impl(
     ignored_scope: IgnoredScope,
     all_layers: bool,
     sensitivity_metric: SensitivityMetric,
-    awq: bool,
+    awq: AWQMode,
     subset_size: int,
 ) -> ov.Model:
     """

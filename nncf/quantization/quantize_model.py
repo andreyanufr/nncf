@@ -24,6 +24,7 @@ from nncf.parameters import DropType
 from nncf.parameters import ModelType
 from nncf.parameters import QuantizationMode
 from nncf.parameters import SensitivityMetric
+from nncf.parameters import AWQMode
 from nncf.parameters import TargetDevice
 from nncf.quantization.advanced_parameters import AdvancedAccuracyRestorerParameters
 from nncf.quantization.advanced_parameters import AdvancedQuantizationParameters
@@ -278,7 +279,7 @@ def compress_weights(
     sensitivity_metric: Optional[SensitivityMetric] = None,
     *,
     subset_size: Optional[int] = 128,
-    awq: Optional[bool] = None,
+    awq: Optional[AWQMode] = None,
 ) -> TModel:
     """
     Compress model weights.

@@ -10,6 +10,7 @@
 # limitations under the License.
 
 from enum import Enum
+from enum import IntEnum
 
 from nncf.common.utils.api_marker import api
 
@@ -128,3 +129,15 @@ class QuantizationMode(Enum):
 
     FP8_E4M3 = "fp8_e4m3"
     FP8_E5M2 = "fp8_e5m2"
+
+
+
+@api(canonical_alias="nncf.AWQMode")
+class AWQMode(IntEnum):
+    """
+    """
+    NONE  = 0
+    FFN   = 1
+    ATTN  = 2
+    SCALE = 4
+    ALL   = 7

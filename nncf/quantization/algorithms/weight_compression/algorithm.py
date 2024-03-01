@@ -340,7 +340,7 @@ class WeightCompression(Algorithm):
 
         if self._awq and activations is not None and self._mode != CompressWeightsMode.NF4:
             awq_algo = AWQ(
-                model, self._backend_entity.name_to_node_mapping, all_weight_params, nodes_to_compress, activations
+                model, self._backend_entity.name_to_node_mapping, all_weight_params, nodes_to_compress, activations, awq=self._awq
             )
             awq_algo.apply(model, graph)
 
