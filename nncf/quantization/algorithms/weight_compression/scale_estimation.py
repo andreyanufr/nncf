@@ -149,10 +149,30 @@ class ScaleEstimation(Algorithm):
                 weight = fns.transpose(weight)
                 reduction_axis = 1
 
+            topk_idxs = fns.argsort(-s)
+            groups_to_correct = set()
+            n_groups = weight.shape[1] // config.group_size
+            max_groups = int(0.5 * n_groups)
+            for idx in topk_idxs:
+                groups_to_correct.add(idx.data // config.group_size)
+                if len(groups_to_correct) >= max_groups:
+                    break
+            groups_to_correct = sorted(list(groups_to_correct))
+            group_idxs = []
+            for gi in groups_to_correct:
+                group_idxs.extend([i for i in range(gi * config.group_size, (gi + 1) * config.group_size)])
+
             original_weight = fns.zeros_like(weight) + weight
 
             g_compressed_weighs, g_c_scale, g_c_zp = do_integer_quantization(original_weight, reduction_axis, config)
             g_c_zp = g_c_zp.astype(g_c_scale.dtype)
+
+            original_weight = original_weight[:, group_idxs]
+            X_cnt = X_cnt[group_idxs, :]
+            X = X[group_idxs, :]
+            full_scale = g_c_scale
+            g_c_scale = g_c_scale[:, groups_to_correct, :]
+            g_compressed_weighs = g_compressed_weighs[:, groups_to_correct, :]
 
             q_weights = do_dequantization(g_compressed_weighs, g_c_scale, g_c_zp, reduction_axis)
 
@@ -162,6 +182,7 @@ class ScaleEstimation(Algorithm):
 
             s = fns.unsqueeze(s, 0)
             s, _ = reshape_weight_for_grouped_quantization(s, reduction_axis, config.group_size)
+            s = s[:, groups_to_correct, :]
 
             original_weight, _ = reshape_weight_for_grouped_quantization(
                 original_weight, reduction_axis, config.group_size
@@ -172,7 +193,7 @@ class ScaleEstimation(Algorithm):
             target = g_compressed_weighs.astype(dtype=g_c_scale.dtype) - g_c_zp
             zero_mask = g_compressed_weighs == g_c_zp
 
-            importance = fns.where(zero_mask, 0.0, importance)  # ???????
+            importance = fns.where(zero_mask, eps, importance)  # ???????
 
             denum = fns.sum(importance, axis=2, keepdims=True)
             importance = importance / (denum + eps)
@@ -198,7 +219,7 @@ class ScaleEstimation(Algorithm):
             zero_scale = 0.001
             zero_mask = zero_scale * zero_mask.astype(original_weight.dtype)
 
-            for _ in range(self._initial_steps):
+            for i in range(self._initial_steps):
                 ideal_scale = fns.abs(original_weight) / (fns.abs(target) + zero_mask)
                 weighted_scale = ideal_scale * importance
 
@@ -226,11 +247,13 @@ class ScaleEstimation(Algorithm):
                     near_to_ideal_scale = mask * result_scale + (1.0 - mask) * near_to_ideal_scale
                 result_scale = near_to_ideal_scale
 
-                out = compress_model([original_weight.data, near_to_ideal_scale.data, g_c_zp.data])
-                compressed_weights = fns.zeros_like(original_weight) + out["compressed_weights"]
-                target = compressed_weights - g_c_zp
-                zero_mask = compressed_weights == g_c_zp
-                zero_mask = zero_scale * zero_mask.astype(original_weight.dtype)
+                # avoid extra computation
+                if i < self._initial_steps - 1:
+                    out = compress_model([original_weight.data, near_to_ideal_scale.data, g_c_zp.data])
+                    compressed_weights = fns.zeros_like(original_weight) + out["compressed_weights"]
+                    target = compressed_weights - g_c_zp
+                    zero_mask = compressed_weights == g_c_zp
+                    zero_mask = zero_scale * zero_mask.astype(original_weight.dtype)
 
             for scale_steps in range(self._scale_steps):
                 scale = 1.0 - 0.05 * scale_steps
@@ -269,13 +292,16 @@ class ScaleEstimation(Algorithm):
             g_compressed_weighs, g_c_scale, g_c_zp = do_integer_quantization(
                 original_weight, -1, cur_config, result_scale
             )
-            q_weights = do_dequantization(g_compressed_weighs, g_c_scale, g_c_zp, reduction_axis)
+            q_weights = do_dequantization(g_compressed_weighs, result_scale, g_c_zp, reduction_axis)
             q_out = fns.matmul(q_weights, X_cnt)
             diff_after = fns.mean(fns.abs(fp_out_cnt - q_out))
 
             # prevent overfitting
+            print(k, diff_before, diff_after)
             if diff_before > diff_after:
-                wp.precomputed_scale = result_scale
+                for i, gi in enumerate(groups_to_correct):
+                    full_scale.data[:, gi, :] = result_scale.data[:, i, :]
+                wp.precomputed_scale = full_scale
         return model
 
     def get_statistic_points(self, model: TModel, graph: NNCFGraph) -> StatisticPointsContainer:
