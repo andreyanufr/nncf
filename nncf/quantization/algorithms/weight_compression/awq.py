@@ -21,6 +21,7 @@ from nncf.common.logging.track_progress import track
 from nncf.common.tensor_statistics.statistic_point import StatisticPointsContainer
 from nncf.common.utils.backend import BackendType
 from nncf.common.utils.backend import get_backend
+from nncf.experimental.tensor import TensorDataType
 from nncf.experimental.tensor import functions as fns
 from nncf.quantization.algorithms.algorithm import Algorithm
 from nncf.quantization.algorithms.weight_compression.config import WeightCompressionParameters
@@ -194,9 +195,7 @@ class AWQ(Algorithm):
 
             groups_to_correct = list(groups_to_correct)
 
-            weight = self._backend_entity.get_weight(
-                wp.node_with_weight, weight_port_id, model, graph
-            )  # get_const_value(wp.weight_node)
+            weight = self._backend_entity.get_weight(wp.node_with_weight, weight_port_id, model, graph)
             assert isinstance(wp.reduction_axes, tuple) and len(wp.reduction_axes) == 1
             reduction_axis = wp.reduction_axes[0]
 
@@ -218,7 +217,7 @@ class AWQ(Algorithm):
                 a_max = 1e2
                 gscale = fns.clip(gscale, a_min=a_min, a_max=a_max)
 
-                gweight = weight[:, offset : offset + config.group_size]
+                gweight = weight[:, offset : offset + config.group_size].astype(TensorDataType.float32)
                 gacts = X[offset : offset + config.group_size, :]
 
                 fp32_out = fns.matmul(gweight, gacts)
