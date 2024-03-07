@@ -228,7 +228,7 @@ def do_dequantization(
     :return: dequantized/decompressed weights.
     """
     decompressed_weight = compressed_weights.astype(dtype=scale.dtype)
-    decompressed_weight = (decompressed_weight - zero_point) * scale
+    decompressed_weight = (decompressed_weight - zero_point.astype(dtype=scale.dtype)) * scale
 
     if reduction_axis > -1:
         shape = list(decompressed_weight.shape)  # [a1, r, a2] - "r" refers to number of channels along reduction axis
