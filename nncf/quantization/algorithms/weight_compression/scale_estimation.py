@@ -19,6 +19,7 @@ from nncf.common.logging.track_progress import track
 from nncf.common.tensor_statistics.statistic_point import StatisticPointsContainer
 from nncf.common.utils.backend import BackendType
 from nncf.common.utils.backend import get_backend
+from nncf.experimental.tensor import TensorDataType
 from nncf.experimental.tensor import functions as fns
 from nncf.quantization.algorithms.algorithm import Algorithm
 from nncf.quantization.algorithms.weight_compression.config import WeightCompressionParameters
@@ -110,7 +111,7 @@ class ScaleEstimation(Algorithm):
         :return: A resulting model.
         """
         name_mapping = {wp.node_with_weight.node_name: idx for idx, wp in enumerate(self._all_weight_params)}
-        
+
         compress_decompress_cashe = {}
 
         for k, stats in track(self._activations.items(), description="Applying Scale Estimation"):
@@ -137,14 +138,15 @@ class ScaleEstimation(Algorithm):
                 idxs = [i[0] for i in sorted(enumerate(lens), key=lambda x: -x[1])][::step]
                 X = X_full[:, idxs]
                 idxs = [i[0] for i in sorted(enumerate(lens), key=lambda x: -x[1])][1::step]
-                #X_cnt = X_full[:, idxs]
+                # X_cnt = X_full[:, idxs]
             else:
                 X = X_full
-                #X_cnt = X_full
+                # X_cnt = X_full
 
             s = fns.max(fns.abs(X_full), axis=1)
 
             weight = self._backend_entity.get_weight(wp.node_with_weight, weight_port_id, model, graph)
+            weight = weight.astype(TensorDataType.float32)
             eps = fns.finfo(weight).eps
 
             if reduction_axis == 0:
@@ -190,10 +192,15 @@ class ScaleEstimation(Algorithm):
             min_max_scale_diffs = fns.transpose(min_max_scale_diffs, (1, 0))
             ideal_scale_diffs = fns.zeros_like(min_max_scale_diffs)
 
-            k = (wp.compression_config.mode, wp.compression_config.num_bits) + q_weights.shape + g_c_scale.shape + g_c_zp.shape
+            k = (
+                (wp.compression_config.mode, wp.compression_config.num_bits)
+                + q_weights.shape
+                + g_c_scale.shape
+                + g_c_zp.shape
+            )
             if k in compress_decompress_cashe:
-                compress_decompress_model = compress_decompress_cashe[k]['compress_decompress_model']
-                compress_model = compress_decompress_cashe[k]['compress_model']
+                compress_decompress_model = compress_decompress_cashe[k]["compress_decompress_model"]
+                compress_model = compress_decompress_cashe[k]["compress_model"]
             else:
                 compress_decompress_model = self._backend_entity.get_compress_decompress_pipeline(
                     wp, q_weights.shape, g_c_scale.shape, g_c_zp.shape
@@ -201,8 +208,10 @@ class ScaleEstimation(Algorithm):
                 compress_model = self._backend_entity.get_compress_pipeline(
                     wp, q_weights.shape, g_c_scale.shape, g_c_zp.shape
                 )
-                compress_decompress_cashe[k] = {'compress_decompress_model': compress_decompress_model,
-                                                'compress_model': compress_model}
+                compress_decompress_cashe[k] = {
+                    "compress_decompress_model": compress_decompress_model,
+                    "compress_model": compress_model,
+                }
 
             zero_scale = 0.001
             zero_mask = zero_scale * zero_mask.astype(original_weight.dtype)
@@ -263,7 +272,7 @@ class ScaleEstimation(Algorithm):
                 q_outs = fns.matmul(fns.transpose(q_weights_, (1, 0, 2)), X)
                 ideal_scale_diffs = fns.mean((fp_outs - q_outs) ** 2, axis=-1)
                 ideal_scale_diffs = fns.transpose(ideal_scale_diffs, (1, 0))
-                
+
                 if best_diffs is None:
                     best_diffs = min_max_scale_diffs
 
@@ -287,7 +296,7 @@ class ScaleEstimation(Algorithm):
             # diff_after = fns.mean(fns.abs(fp_out_cnt - q_out))
 
             # prevent overfitting
-            #if diff_before > diff_after:
+            # if diff_before > diff_after:
             wp.precomputed_scale = result_scale
         return model
 
