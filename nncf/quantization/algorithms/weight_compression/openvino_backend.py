@@ -32,6 +32,7 @@ from nncf.quantization.algorithms.weight_compression.awq_patterns import get_awq
 from nncf.quantization.algorithms.weight_compression.backend import WeightCompressionAlgoBackend
 from nncf.quantization.algorithms.weight_compression.config import WeightCompressionParameters
 from nncf.quantization.algorithms.weight_compression.weight_lowering import compress_weight
+from nncf.quantization.algorithms.weight_compression.weight_lowering import do_dequantization
 
 
 class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
@@ -119,6 +120,11 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
             target_input.replace_source_output(new_output)
 
         del const_node
+
+    def insert_lora_residual(self, model: ov.Model, graph: NNCFGraph, wc_params: WeightCompressionParameters, weight, compressed_weight_data):
+        q_weights = do_dequantization(compressed_weight_data.tensor, compressed_weight_data.tensor, compressed_weight_data.tensor)
+        residual = weight - q_weights
+        
 
     def transform_model(
         self, model: ov.Model, graph: NNCFGraph, weight_compression_parameters: Iterable[WeightCompressionParameters]
