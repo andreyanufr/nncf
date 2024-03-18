@@ -121,14 +121,135 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
 
         del const_node
 
-    def insert_lora_residual(self, model: ov.Model, graph: NNCFGraph, wc_params: WeightCompressionParameters, weight, compressed_weight_data):
-        q_weights = do_dequantization(compressed_weight_data.tensor, compressed_weight_data.tensor, compressed_weight_data.tensor)
-        residual = weight - q_weights
+    def irls(self, A, b, p=1, guess=None):
+        from numpy import abs, diag, dot, zeros
+        from numpy.linalg import lstsq, inv, norm
+        """Solve least squares problem min ||x||_p s.t. Ax= b."""
+        x, p, e= zeros((A.shape[1], 1)), p/ 2.- 1, 1.
+        if guess is not None:
+            xp = guess
+        else:
+            xp= lstsq(A, b)[0]
+        for k in range(100):
+            if e< 1e-6:
+                break
+            Q= dot(diag(1./ (xp** 2+ e)** p), A.T)
+            x= dot(dot(Q, inv(dot(A, Q))), b)
+            x[abs(x)< 1e-1]= 0
+            if norm(x- xp)< 1e-2* e** .5:
+                e*= 1e-1
+            xp= x
+        return k, x.round()
+
+    def insert_lora_residual(self, model: ov.Model, graph: NNCFGraph, wc_params: WeightCompressionParameters, weight, compressed_weight, rank=64):
+        import numpy.linalg as linalg
+        import numpy as np
+        import scipy.optimize as optimize
+        q_weights = do_dequantization(compressed_weight.tensor, compressed_weight.scale,
+                                      compressed_weight.zero_point, wc_params.reduction_axes[0])
+        # q_w + USV = w => USV = w - q_w
+        residual = (weight - q_weights).data.astype(np.float32)
+        if wc_params.reduction_axes == 0:
+            residual = np.transpose(residual)
+        
+        if wc_params.stat is not None:
+            s = wc_params.stat.data
+            if wc_params.compression_config.group_size > 0:
+                gs = wc_params.compression_config.group_size
+                n_gs = s.shape[0] // gs
+                for i in range(n_gs):
+                    offset = i * gs
+                    denum = np.sum(s[offset:offset + gs])
+                    s[offset:offset + gs] = s[offset:offset + gs] / denum
+                    denum = np.max(s[offset:offset + gs])
+                    s[offset:offset + gs] = s[offset:offset + gs] / denum
+                s = np.expand_dims(s, 0)
+                residual = residual * s
+            
+            # low_k = max(int(2 * s.shape[0] // 3), 1)
+            # lowk_idxs = np.argsort(s.data)[:low_k]
+            # for idx in lowk_idxs:
+            #     residual[:, idx] = 0.0
+
+        svd = linalg.svd(residual, compute_uv=True, full_matrices=False)
+        U = svd[0]
+        S = svd[1]
+        V = svd[2]
+
+        Ur = U[:, :rank]
+        Sr = np.diag(S[:rank])
+        Vr = V[:rank, :]
+
+        US = Ur @ Sr
+        new_residual = US @ Vr
+        #new_residual = np.dot(U @ np.diag(S), V)
+        
+        cur_rank = rank
+        # max_rank = min(weight.shape)
+        # while np.mean(np.abs(residual - new_residual)) > 0.7 * np.mean(np.abs(residual)) and cur_rank < max_rank - 1:
+        #     cur_rank += 2
+        #     Ur = U[:, :cur_rank]
+        #     Sr = S[:cur_rank]
+        #     Vr = V[:cur_rank, :]
+
+        #     US = Ur * Sr
+        #     new_residual = np.dot(US, Vr)
+        V = Vr
+        print(wc_params.node_with_weight.node_name)
+        print("Before: ", np.mean(np.abs(residual)), " After: ", np.mean(np.abs(residual - new_residual)), cur_rank)
+        
+        # Vr = V.copy() #np.zeros_like(V)
+        
+        # def fun(x, A, res):
+        #     return (A @ x - res)**2
+        
+        # for i in range(residual.shape[1]):
+        #     # _, tmp = self.irls(US, residual[:, i], guess=V[:, i])
+        #     # Vr[:, i] = tmp[:]
+        #     if i in lowk_idxs:
+        #         continue
+        #     res = optimize.least_squares(fun, V[:, i], args=(US, residual[:, i]))
+        #     Vr[:, i] = res.x[:]
+        # new_residual = np.dot(US, Vr)
+        # V = Vr
+        # print("After rectification: ", np.mean(np.abs(residual - new_residual)))
+        
+        input_node = self.name_to_node_mapping[wc_params.node_with_weight.node_name].input_value(0)
+        mm_node = self.name_to_node_mapping[wc_params.node_with_weight.node_name]
+        
+        V_W = opset.constant(
+            V
+        )
+        V_MM = opset.matmul(input_node, V_W, transpose_a=False, transpose_b=True)
+        
+        US_W = opset.constant(
+            US
+        )
+        US_MM = opset.matmul(V_MM, US_W, transpose_a=False, transpose_b=True)
+
+        node_output_port = mm_node.output(0)
+        node_output_source_ports = node_output_port.get_target_inputs()
+        
+        add = opset.add(mm_node, US_MM)
+
+        for node_output_source_port in node_output_source_ports:
+            node_output_source_port.replace_source_output(add.output(0))
+        
+        # port_id = 0
+        # target_node_output = node.input_value(port_id)
+        # sz = target_node_output.partial_shape.get_dimension(2).max_length
+    
+        # US_W = opset.constant(
+        #     US
+        # )
+        # converted_const = opset.matmul(US_W)
+                
         
 
     def transform_model(
         self, model: ov.Model, graph: NNCFGraph, weight_compression_parameters: Iterable[WeightCompressionParameters]
     ) -> ov.Model:
+        added = False
         for wc_params in weight_compression_parameters:
             compression_config = wc_params.compression_config
             if compression_config.mode == CompressWeightsMode.NF4:
@@ -184,6 +305,10 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
             mul_output = mul.output(0)
             for target_input in const_node.output(0).get_target_inputs():
                 target_input.replace_source_output(mul_output)
+            
+            if wc_params.compression_config.num_bits == 4 and not added:
+                self.insert_lora_residual(model, graph, wc_params, weight, compressed_weight)
+                #added = True
 
         # reset name_to_node_mapping
         self.name_to_node_mapping = None

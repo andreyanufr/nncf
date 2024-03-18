@@ -151,7 +151,7 @@ def do_integer_quantization(
         level_low_sym = -(2 ** (num_bits - 1))
         level_high_sym = 2 ** (num_bits - 1) - 1
         scale = scale / level_high_sym
-        zero_point = fns.as_tensor_like(scale, [-level_low_sym])
+        zero_point = fns.as_tensor_like(scale, [-level_low_sym]).astype(TensorDataType.int32)
         eps = fns.finfo(scale).eps
         # NOTE: adding machine epsilon to avoid division by zero
         scale = fns.where(fns.abs(scale) < eps, eps, scale)
@@ -206,7 +206,9 @@ def compress_weight(weight: Tensor, reduction_axes: ReductionAxes, config: Weigh
     return CompressedWeight(compressed_weight, scale, zero_point)
 
 
-def do_dequantization(compressed_weights: Tensor, scale: Tensor, zero_point: Tensor) -> Tensor:
+def do_dequantization(
+    compressed_weights: Tensor, scale: Tensor, zero_point: Tensor, reduction_axis: int = -1
+) -> Tensor:
     """
     The method dequantizes the given weights to float point data type in accordance with the scale and
     zero_point data type.
@@ -214,8 +216,18 @@ def do_dequantization(compressed_weights: Tensor, scale: Tensor, zero_point: Ten
     :param compressed_weights: compressed weights.
     :param scale: scale in compression/quantization.
     :param zero_point: zero point in compression/quantization.
+    :param reduction_axis: axis for return back for group compression.
     :return: dequantized/decompressed weights.
     """
     decompressed_weight = compressed_weights.astype(dtype=scale.dtype)
     decompressed_weight = (decompressed_weight - zero_point) * scale
+
+    if reduction_axis > -1:
+        shape = list(decompressed_weight.shape)  # [a1, r, a2] - "r" refers to number of channels along reduction axis
+        shape[reduction_axis] = shape[reduction_axis] * shape[reduction_axis + 1]
+        shape[reduction_axis + 1] = 1
+        reshaped_weight = decompressed_weight.reshape(shape)
+        reshaped_weight = fns.squeeze(reshaped_weight)
+        decompressed_weight = reshaped_weight
+
     return decompressed_weight

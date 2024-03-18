@@ -282,7 +282,7 @@ class WeightCompression(Algorithm):
         nodes_to_compress = self._get_nodes_to_compress(graph)
 
         activations = {}
-        if dataset is not None and self._sensitivity_metric != SensitivityMetric.WEIGHT_QUANTIZATION_ERROR:
+        if dataset is not None:# and self._sensitivity_metric != SensitivityMetric.WEIGHT_QUANTIZATION_ERROR:
             activations = self._get_activations(dataset, self._subset_size, nodes_to_compress, graph, model)
 
         transformed_model = self.do_compression(model, graph, nodes_to_compress, activations)
@@ -343,6 +343,18 @@ class WeightCompression(Algorithm):
                 model, self._backend_entity.name_to_node_mapping, all_weight_params, nodes_to_compress, activations
             )
             awq_algo.apply(model, graph)
+
+        from nncf.experimental.tensor import functions as fns
+        for wp in all_weight_params:
+            k = wp.node_with_weight.node_name 
+            if wp.node_with_weight.node_name in activations:
+                stats = activations[k]
+                X = fns.stack([fns.mean(stat, axis=0) for stat in stats])
+                X = fns.transpose(X)
+                if X.shape[1] > self._subset_size:
+                    X = X[:, : self._subset_size]
+                s = fns.max(fns.abs(X), axis=1)
+                wp.stat = s
 
         # Compress model using weight compression parameters
         transformed_model = self._backend_entity.transform_model(
