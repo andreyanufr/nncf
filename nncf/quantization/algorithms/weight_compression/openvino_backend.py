@@ -141,14 +141,17 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
             xp= x
         return k, x.round()
 
-    def insert_lora_residual(self, model: ov.Model, graph: NNCFGraph, wc_params: WeightCompressionParameters, weight, compressed_weight, rank=64):
+    def insert_lora_residual(self, model: ov.Model, graph: NNCFGraph, wc_params: WeightCompressionParameters, weight, compressed_weight, rank=16):
         import numpy.linalg as linalg
+        import scipy.linalg as slinalg
         import numpy as np
         import scipy.optimize as optimize
         q_weights = do_dequantization(compressed_weight.tensor, compressed_weight.scale,
                                       compressed_weight.zero_point, wc_params.reduction_axes[0])
         # q_w + USV = w => USV = w - q_w
         residual = (weight - q_weights).data.astype(np.float32)
+        w_residual = residual.copy()
+        
         if wc_params.reduction_axes == 0:
             residual = np.transpose(residual)
         
@@ -180,39 +183,39 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         Sr = np.diag(S[:rank])
         Vr = V[:rank, :]
 
-        US = Ur @ Sr
-        new_residual = US @ Vr
-        #new_residual = np.dot(U @ np.diag(S), V)
-        
-        cur_rank = rank
-        # max_rank = min(weight.shape)
-        # while np.mean(np.abs(residual - new_residual)) > 0.7 * np.mean(np.abs(residual)) and cur_rank < max_rank - 1:
-        #     cur_rank += 2
-        #     Ur = U[:, :cur_rank]
-        #     Sr = S[:cur_rank]
-        #     Vr = V[:cur_rank, :]
+        #US = Ur @ Sr
+        Vr = Sr @ Vr
+        US = Ur
 
-        #     US = Ur * Sr
-        #     new_residual = np.dot(US, Vr)
-        V = Vr
         print(wc_params.node_with_weight.node_name)
-        print("Before: ", np.mean(np.abs(residual)), " After: ", np.mean(np.abs(residual - new_residual)), cur_rank)
-        
-        # Vr = V.copy() #np.zeros_like(V)
-        
-        # def fun(x, A, res):
-        #     return (A @ x - res)**2
-        
-        # for i in range(residual.shape[1]):
-        #     # _, tmp = self.irls(US, residual[:, i], guess=V[:, i])
-        #     # Vr[:, i] = tmp[:]
-        #     if i in lowk_idxs:
-        #         continue
-        #     res = optimize.least_squares(fun, V[:, i], args=(US, residual[:, i]))
-        #     Vr[:, i] = res.x[:]
-        # new_residual = np.dot(US, Vr)
-        # V = Vr
-        # print("After rectification: ", np.mean(np.abs(residual - new_residual)))
+        if wc_params.X is not None: # rectification by data
+            X = wc_params.X.data
+            dY = w_residual @ X
+            
+            for i in range(5):
+                VX = Vr @ X
+                sol = slinalg.lstsq(np.transpose(VX), np.transpose(dY))
+                
+                diff_before = np.mean(np.abs(weight.data @ X - q_weights.data @ X))
+                diff_after_svd = np.mean(np.abs(weight.data @ X - q_weights.data @ X - (US @ Vr) @ X))
+                
+                US = np.transpose(sol[0])
+                
+                diff_after_svd_rectification = np.mean(np.abs(weight.data @ X - q_weights.data @ X - (US @ Vr) @ X))
+                print(f"{i} Rectification 1: ", diff_before, diff_after_svd, diff_after_svd_rectification)
+                
+                USI = linalg.pinv(US)
+                dYU = USI @ dY
+                
+                sol = slinalg.lstsq(np.transpose(X), np.transpose(dYU))
+                Vr = np.transpose(sol[0])
+                
+                diff_after_svd_rectification = np.mean(np.abs(weight.data @ X - q_weights.data @ X - (US @ Vr) @ X))
+                print(f"{i} Rectification 2: ", diff_before, diff_after_svd, diff_after_svd_rectification)
+
+        new_residual = US @ Vr
+        V = Vr
+        print("Before: ", np.mean(np.abs(residual)), " After: ", np.mean(np.abs(residual - new_residual)), rank)
         
         input_node = self.name_to_node_mapping[wc_params.node_with_weight.node_name].input_value(0)
         mm_node = self.name_to_node_mapping[wc_params.node_with_weight.node_name]

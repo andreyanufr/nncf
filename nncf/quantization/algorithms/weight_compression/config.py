@@ -60,6 +60,7 @@ class WeightCompressionParameters:
     reduction_axes: Tuple[int, ...]
     compression_config = WeightCompressionConfig()
     stat = None
+    X = None
 
     def __post_init__(self):
         # Explicitly cast num_weights to avoid overflow on finding total number of weights.
