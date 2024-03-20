@@ -190,11 +190,12 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         US = Ur
 
         print(wc_params.node_with_weight.node_name)
+        n_iters = 10
         if wc_params.X is not None: # rectification by data
             X = wc_params.X.data
             dY = w_residual @ X
-            
-            for i in range(5):
+    
+            for i in range(n_iters):
                 VX = Vr @ X
                 sol = slinalg.lstsq(np.transpose(VX), np.transpose(dY))
                 
@@ -204,7 +205,8 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
                 US = np.transpose(sol[0])
                 
                 diff_after_svd_rectification = np.mean(np.abs(weight.data @ X - q_weights.data @ X - (US @ Vr) @ X))
-                print(f"{i} Rectification 1: ", diff_before, diff_after_svd, diff_after_svd_rectification)
+                if n_iters - i < 3:
+                    print(f"{i} Rectification 1: ", diff_before, diff_after_svd, diff_after_svd_rectification)
                 
                 USI = linalg.pinv(US)
                 dYU = USI @ dY
@@ -213,7 +215,8 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
                 Vr = np.transpose(sol[0])
                 
                 diff_after_svd_rectification = np.mean(np.abs(weight.data @ X - q_weights.data @ X - (US @ Vr) @ X))
-                print(f"{i} Rectification 2: ", diff_before, diff_after_svd, diff_after_svd_rectification)
+                if n_iters - i < 3:
+                    print(f"{i} Rectification 2: ", diff_before, diff_after_svd, diff_after_svd_rectification)
 
         new_residual = US @ Vr
         V = Vr
