@@ -141,7 +141,9 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
             xp= x
         return k, x.round()
 
-    def insert_lora_residual(self, model: ov.Model, graph: NNCFGraph, wc_params: WeightCompressionParameters, weight, compressed_weight, rank=16):
+    def insert_lora_residual(self, model: ov.Model, graph: NNCFGraph,
+                             wc_params: WeightCompressionParameters, weight,
+                             compressed_weight, rank=32):
         import numpy.linalg as linalg
         import scipy.linalg as slinalg
         import numpy as np
@@ -155,7 +157,7 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         if wc_params.reduction_axes == 0:
             residual = np.transpose(residual)
         
-        if wc_params.stat is not None:
+        if wc_params.stat is not None:# and False:
             s = wc_params.stat.data
             if wc_params.compression_config.group_size > 0:
                 gs = wc_params.compression_config.group_size

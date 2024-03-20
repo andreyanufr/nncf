@@ -349,10 +349,14 @@ class WeightCompression(Algorithm):
             k = wp.node_with_weight.node_name 
             if wp.node_with_weight.node_name in activations:
                 stats = activations[k]
-                X = fns.stack([fns.mean(stat[:32, :], axis=0) for stat in stats])
+                vals = [fns.mean(stat[:32, :], axis=0) for stat in stats]
+                vals.extend([fns.mean(stat[-32:, :], axis=0) for stat in stats])
+                X = fns.stack(vals)
+                #Xl = fns.stack([fns.mean(stat[-32:, :], axis=0) for stat in stats])
+                #X = fns.stack([X, Xl], axis=0)
                 X = fns.transpose(X)
-                if X.shape[1] > self._subset_size:
-                    X = X[:, : self._subset_size]
+                # if X.shape[1] > self._subset_size:
+                #     X = X[:, : self._subset_size]
                 s = fns.max(fns.abs(X), axis=1)
                 wp.stat = s
                 wp.X = X
