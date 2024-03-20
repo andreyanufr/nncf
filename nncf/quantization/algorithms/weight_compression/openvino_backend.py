@@ -143,7 +143,8 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
 
     def insert_lora_residual(self, model: ov.Model, graph: NNCFGraph,
                              wc_params: WeightCompressionParameters, weight,
-                             compressed_weight, rank=32):
+                             compressed_weight, rank=8):
+        #return
         import numpy.linalg as linalg
         import scipy.linalg as slinalg
         import numpy as np
@@ -190,7 +191,7 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         US = Ur
 
         print(wc_params.node_with_weight.node_name)
-        n_iters = 10
+        n_iters = 5
         if wc_params.X is not None: # rectification by data
             X = wc_params.X.data
             dY = w_residual @ X
