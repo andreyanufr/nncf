@@ -144,6 +144,13 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
     def insert_lora_residual(self, model: ov.Model, graph: NNCFGraph,
                              wc_params: WeightCompressionParameters, weight,
                              compressed_weight, rank=8):
+        names = ['down_proj', 'o_proj', 'up_proj']
+        skip = True
+        for name in names:
+            if name in wc_params.node_with_weight.node_name:
+                skip = False
+        if skip:
+            return
         #return
         import numpy.linalg as linalg
         import scipy.linalg as slinalg
@@ -191,14 +198,23 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         US = Ur
 
         print(wc_params.node_with_weight.node_name)
-        n_iters = 5
+        n_iters = 3
         if wc_params.X is not None: # rectification by data
             X = wc_params.X.data
             dY = w_residual @ X
+            
+            # US @ Vr = res
+            # US @ Vr @ X = dY
+            # US @ |VR VR @ X| = |res dY|
     
             for i in range(n_iters):
                 VX = Vr @ X
-                sol = slinalg.lstsq(np.transpose(VX), np.transpose(dY))
+                if False:
+                    sol = slinalg.lstsq(np.transpose(VX), np.transpose(dY))
+                else:
+                    VrVX = np.concatenate((Vr, VX), axis=1)
+                    dYR = np.concatenate((w_residual, dY), axis=1)
+                    sol = slinalg.lstsq(np.transpose(VrVX), np.transpose(dYR))
                 
                 diff_before = np.mean(np.abs(weight.data @ X - q_weights.data @ X))
                 diff_after_svd = np.mean(np.abs(weight.data @ X - q_weights.data @ X - (US @ Vr) @ X))

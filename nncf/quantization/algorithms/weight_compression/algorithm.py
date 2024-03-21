@@ -349,9 +349,9 @@ class WeightCompression(Algorithm):
             k = wp.node_with_weight.node_name 
             if wp.node_with_weight.node_name in activations:
                 stats = activations[k]
-                if False:
-                    vals = [fns.mean(stat[:32, :], axis=0) for stat in stats]
-                    vals.extend([fns.mean(stat[-32:, :], axis=0) for stat in stats])
+                if True:
+                    vals = [fns.mean(stat, axis=0) for stat in stats]
+                    #vals.extend([fns.mean(stat[-32:, :], axis=0) for stat in stats])
                 else:
                     vals = []
                     import numpy as np
@@ -364,8 +364,10 @@ class WeightCompression(Algorithm):
                         scaled_stat = scaler.transform(stat.data)
                         scaled_stat = pca.fit_transform(scaled_stat)
                         scaled_stat = pca.inverse_transform(scaled_stat)
-                        stat = scaler.inverse_transform(scaled_stat)
-                        vals.append(Tensor(np.mean(stat, axis=0)))
+                        stat = scaler.inverse_transform(pca.components_)
+                        #vals.append(Tensor(np.mean(stat, axis=0)))
+                        for i in range(4):
+                            vals.append(Tensor(stat[i, :]))
                 
                 X = fns.stack(vals)
                 #Xl = fns.stack([fns.mean(stat[-32:, :], axis=0) for stat in stats])
