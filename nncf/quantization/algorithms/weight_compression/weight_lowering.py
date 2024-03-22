@@ -101,7 +101,7 @@ def calculate_normalized_weight_and_nf4_scale(
 
 
 def do_integer_quantization(
-    weight: Tensor, reduction_axes: ReductionAxes, config: WeightCompressionConfig
+    weight: Tensor, reduction_axes: ReductionAxes, config: WeightCompressionConfig, precomputed_scale: Tensor = None
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """
     The method quantizes the given weights to integer data type in accordance with the compression config.
@@ -122,6 +122,7 @@ def do_integer_quantization(
     :param weight: Weight array to compress.
     :param reduction_axes: Axes, along which to reduce (collect) different statistics (e.g. min, max).
     :param config: Information on how to compress (quantize) a specific weight.
+    :param precomputed_scale: Precomputed scale for better performance.
     :return: The compressed weights tensor of uint8 type, scale tensor of float32 type and
         zero point tensor of int32 type that was used for its quantization.
     """
@@ -147,10 +148,14 @@ def do_integer_quantization(
             min_values, max_values, level_low, level_high, narrow_range=False
         )
     else:
-        scale = fns.max(fns.abs(weight), axis=reduction_axes, keepdims=True)  # [a1, r//gs, 1, a2]
         level_low_sym = -(2 ** (num_bits - 1))
         level_high_sym = 2 ** (num_bits - 1) - 1
-        scale = scale / level_high_sym
+
+        if precomputed_scale is not None:
+            scale = precomputed_scale
+        else:
+            scale = fns.max(fns.abs(weight), axis=reduction_axes, keepdims=True)  # [a1, r//gs, 1, a2]
+            scale = scale / level_high_sym
         zero_point = fns.as_tensor_like(scale, [-level_low_sym]).astype(TensorDataType.int32)
         eps = fns.finfo(scale).eps
         # NOTE: adding machine epsilon to avoid division by zero
@@ -189,20 +194,23 @@ def get_integer_quantization_error(
     return val.item()
 
 
-def compress_weight(weight: Tensor, reduction_axes: ReductionAxes, config: WeightCompressionConfig):
+def compress_weight(
+    weight: Tensor, reduction_axes: ReductionAxes, config: WeightCompressionConfig, precomputed_scale: Tensor = None
+):
     """
     Compress weight using compression configuration.
 
     :param weight: The weight to compress.
     :param reduction_axes: Axes, along which to reduce (collect) different statistics (e.g. min, max).
     :param config: Compression configuration.
+    :param precomputed_scale: Precomputed scale for better performance.
     :return: The compressed weight and decompression parameters as instance of CompressedWeight
     """
     if config.mode == CompressWeightsMode.NF4:
         compressed_weight, scale = calculate_normalized_weight_and_nf4_scale(weight, reduction_axes, config.group_size)
         return CompressedWeight(compressed_weight, scale)
 
-    compressed_weight, scale, zero_point = do_integer_quantization(weight, reduction_axes, config)
+    compressed_weight, scale, zero_point = do_integer_quantization(weight, reduction_axes, config, precomputed_scale)
     return CompressedWeight(compressed_weight, scale, zero_point)
 
 
