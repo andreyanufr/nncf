@@ -115,13 +115,13 @@ class ScaleEstimation(Algorithm):
         compress_decompress_cashe = {}
 
         for k, stats in track(self._activations.items(), description="Applying Scale Estimation"):
-            names = ['down_proj', 'up_proj', 'gate_proj']
-            skip = False
-            for name in names:
-                if name in k:
-                    skip = True
-            if skip:
-                continue
+            # names = ['down_proj', 'up_proj', 'gate_proj']
+            # skip = False
+            # for name in names:
+            #     if name in k:
+            #         skip = True
+            # if skip:
+            #     continue
                 
             if k not in name_mapping:
                 continue
