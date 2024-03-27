@@ -185,6 +185,7 @@ class ScaleEstimation(Algorithm):
             q_outs = fns.matmul(fns.transpose(q_weights, (1, 0, 2)), X)
             min_max_scale_diffs = fns.mean((fp_outs - q_outs) ** 2, axis=-1)
             min_max_scale_diffs = fns.transpose(min_max_scale_diffs, (1, 0))
+            min_max_scale_diffs += fns.mean((q_weights - original_weight) ** 2, axis=-1)
             ideal_scale_diffs = fns.zeros_like(min_max_scale_diffs)
 
             key = (
@@ -218,6 +219,7 @@ class ScaleEstimation(Algorithm):
 
                 ideal_scale_diffs = fns.mean((fp_outs - q_outs) ** 2, axis=-1)
                 ideal_scale_diffs = fns.transpose(ideal_scale_diffs, (1, 0))
+                ideal_scale_diffs += fns.mean((q_weights_ - original_weight) ** 2, axis=-1)
 
                 if best_diffs is None:
                     best_diffs = min_max_scale_diffs
@@ -262,6 +264,7 @@ class ScaleEstimation(Algorithm):
                 q_outs = fns.matmul(fns.transpose(q_weights_, (1, 0, 2)), X)
                 ideal_scale_diffs = fns.mean((fp_outs - q_outs) ** 2, axis=-1)
                 ideal_scale_diffs = fns.transpose(ideal_scale_diffs, (1, 0))
+                ideal_scale_diffs += fns.mean((q_weights_ - original_weight) ** 2, axis=-1)
 
                 mask = (ideal_scale_diffs > best_diffs).astype(best_diffs.dtype)
 
@@ -274,7 +277,9 @@ class ScaleEstimation(Algorithm):
                 else:
                     near_to_ideal_scale = mask * result_scale + (1.0 - mask) * near_to_ideal_scale
                 result_scale = near_to_ideal_scale
-            wp.precomputed_scale = result_scale
+
+            wp.precomputed_scale = fns.where(result_scale > 5 * scale, scale, result_scale)
+
         return model
 
     def get_statistic_points(self, model: TModel, graph: NNCFGraph) -> StatisticPointsContainer:
