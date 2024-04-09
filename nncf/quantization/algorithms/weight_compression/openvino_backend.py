@@ -131,6 +131,7 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
                 CompressWeightsMode.INT8,
                 CompressWeightsMode.INT4_ASYM,
                 CompressWeightsMode.INT4_SYM,
+                CompressWeightsMode.FP4_E3M0
             ]:
                 if compression_config.mode in [CompressWeightsMode.INT4_ASYM, CompressWeightsMode.INT4_SYM]:
                     compression_dtype = ov.Type.u4

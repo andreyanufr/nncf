@@ -100,6 +100,33 @@ def calculate_normalized_weight_and_nf4_scale(
     return norm_weight, scale
 
 
+def to_fp4_e3mo(weight: Tensor):
+    from math import ceil, log
+    import numpy as np
+    sign = np.sign(weight.data)
+    closest = lambda x: 2**int(ceil(log(x) / log(2))) if x >= 0.5 else 0.0
+    
+    v_closest = np.vectorize(closest)
+    upper = v_closest(np.abs(weight.data))
+    lower = upper // 2
+    mask = upper - weight.data < weight.data - lower
+    res = upper * mask + (1 - mask) * lower
+    return res * sign
+
+def to_fp4_e3mo_np(weight: Tensor):
+    import numpy as np
+    sign = np.sign(weight.data)
+    x = np.abs(weight.data)
+    zero_mask = (x < 1.0).astype(float)
+    log_2 = 0.6931471805599453
+    upper = 2 ** np.ceil((np.log(x + zero_mask)) / log_2).astype(np.int32)
+    #upper[np.where(zero_mask > 0)] = 0.0
+    lower = upper // 2
+    mask = upper - x < x - lower
+    res = upper * mask + (1 - mask) * lower
+    res = np.clip(res, a_min=0, a_max=64)
+    return res * sign
+
 def do_integer_quantization(
     weight: Tensor, reduction_axes: ReductionAxes, config: WeightCompressionConfig
 ) -> Tuple[Tensor, Tensor, Tensor]:
@@ -146,6 +173,18 @@ def do_integer_quantization(
         scale, zero_point = calculate_scale_zero_point(
             min_values, max_values, level_low, level_high, narrow_range=False
         )
+    elif mode is CompressWeightsMode.FP4_E3M0:
+        level_low_sym = -64
+        level_high_sym = 64
+        scale = fns.max(fns.abs(weight), axis=reduction_axes, keepdims=True) / level_high_sym
+        scale_weights = weight / scale
+        zero_point = fns.as_tensor_like(scale, [-level_low_sym])
+        fp4_w = (fns.zeros_like(weight) + to_fp4_e3mo_np(scale_weights)) + zero_point
+        
+        tmp = (fns.zeros_like(weight) + fp4_w - zero_point) * scale
+        diff = fns.mean(fns.abs(weight - tmp)) / fns.mean(fns.abs(weight))
+        print(diff)  
+        return fp4_w, scale, zero_point
     else:
         scale = fns.max(fns.abs(weight), axis=reduction_axes, keepdims=True)  # [a1, r//gs, 1, a2]
         level_low_sym = -(2 ** (num_bits - 1))
@@ -158,6 +197,10 @@ def do_integer_quantization(
 
     compressed_weights = fns.round(weight / scale + zero_point.astype(weight.dtype))
     compressed_weights = fns.clip(compressed_weights, level_low, level_high).astype(TensorDataType.uint8)
+    tmp = (compressed_weights - zero_point) * scale
+    diff = fns.mean(fns.abs(weight - tmp)) / fns.mean(fns.abs(weight))
+    print(diff) 
+        
     return compressed_weights, scale, zero_point
 
 
@@ -201,6 +244,10 @@ def compress_weight(weight: Tensor, reduction_axes: ReductionAxes, config: Weigh
     if config.mode == CompressWeightsMode.NF4:
         compressed_weight, scale = calculate_normalized_weight_and_nf4_scale(weight, reduction_axes, config.group_size)
         return CompressedWeight(compressed_weight, scale)
+
+    # if config.mode == CompressWeightsMode.FP4_E3M0:
+    #     compressed_weight, scale = calculate_normalized_weight_and_nf4_scale(weight, reduction_axes, config.group_size)
+    #     return CompressedWeight(compressed_weight, scale)
 
     compressed_weight, scale, zero_point = do_integer_quantization(weight, reduction_axes, config)
     return CompressedWeight(compressed_weight, scale, zero_point)
