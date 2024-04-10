@@ -183,8 +183,35 @@ def do_integer_quantization(
         
         tmp = (fns.zeros_like(weight) + fp4_w - zero_point) * scale
         diff = fns.mean(fns.abs(weight - tmp)) / fns.mean(fns.abs(weight))
-        print(diff)  
-        return fp4_w, scale, zero_point
+        print("Before: ", diff)
+        initial_diff = fns.mean(fns.abs(weight - tmp), axis=-1) / fns.mean(fns.abs(weight), axis=-1)
+        #best_diff = initial_diff
+        result_scale = scale
+
+        for i in range(-5, 20):
+            factor = 1 - i * 0.025
+            scaled_scale = scale * factor
+
+            scale_weights = weight / scaled_scale
+            zero_point = fns.as_tensor_like(scale, [-level_low_sym])
+            fp4_w = (fns.zeros_like(weight) + to_fp4_e3mo_np(scale_weights)) + zero_point
+            
+            tmp = (fns.zeros_like(weight) + fp4_w - zero_point) * scaled_scale
+            curr_diff = fns.mean(fns.abs(weight - tmp), axis=-1) / fns.mean(fns.abs(weight), axis=-1)
+            mask = curr_diff < initial_diff
+            initial_diff = initial_diff * (1 - mask) + mask * curr_diff
+            
+            mask = fns.unsqueeze(mask, -1)
+            result_scale = result_scale * (1 - mask) + scaled_scale * mask
+            
+            
+        scale_weights = weight / result_scale
+        fp4_w = (fns.zeros_like(weight) + to_fp4_e3mo_np(scale_weights)) + zero_point
+        tmp = (fns.zeros_like(weight) + fp4_w - zero_point) * result_scale
+        diff = fns.mean(fns.abs(weight - tmp)) / fns.mean(fns.abs(weight))
+        print("After: ", diff)
+          
+        return fp4_w, result_scale, zero_point
     else:
         scale = fns.max(fns.abs(weight), axis=reduction_axes, keepdims=True)  # [a1, r//gs, 1, a2]
         level_low_sym = -(2 ** (num_bits - 1))
