@@ -10,7 +10,7 @@
 # limitations under the License.
 
 from copy import deepcopy
-from typing import Any, Dict, List, Optional, TypeVar
+from typing import Any, Dict, List, Optional, TypeVar, Callable
 
 from nncf import Dataset
 from nncf.common.graph.graph import NNCFGraph
@@ -95,6 +95,112 @@ class ScaleEstimation:
             raise RuntimeError(
                 "Cannot return backend-specific AWQ entity because {} is not supported!".format(model_backend.value)
             )
+
+
+    def initial_rectification(
+        self,
+        original_weight: TTensor,
+        scale: TTensor,
+        zp: TTensor,
+        target: TTensor,
+        importance: TTensor,
+        fp_outs: TTensor,
+        best_diffs: TTensor,
+        X: TTensor,
+        result_scale: TTensor,
+        compress_model: Callable,
+        compress_decompress_model: Callable,
+        zero_scale: float
+    ):
+        # iterative rectification of initial scale
+        for i in range(self._initial_steps):
+            ideal_scale = fns.abs(original_weight) / (fns.abs(target) + zero_mask)
+            weighted_scale = ideal_scale * importance
+
+            near_to_ideal_scale = fns.sum(weighted_scale, axis=2, keepdims=True)
+
+            out = compress_decompress_model(original_weight.data, near_to_ideal_scale.data, zp.data)
+            q_weights_ = fns.zeros_like(original_weight) + out
+            q_outs = fns.matmul(fns.transpose(q_weights_, (1, 0, 2)), X)
+
+            ideal_scale_diffs = fns.mean((fp_outs - q_outs) ** 2, axis=-1)
+            ideal_scale_diffs = fns.transpose(ideal_scale_diffs, (1, 0))
+            if self._weight_penalty > 0.0:
+                ideal_scale_diffs += self._weight_penalty * fns.mean((q_weights_ - original_weight) ** 2, axis=-1)
+
+            mask = (ideal_scale_diffs > best_diffs).astype(best_diffs.dtype)
+
+            best_diffs = mask * best_diffs + (1.0 - mask) * ideal_scale_diffs
+
+            mask = fns.unsqueeze(mask, axis=2)
+
+            if result_scale is None:
+                near_to_ideal_scale = mask * scale + (1.0 - mask) * near_to_ideal_scale
+            else:
+                near_to_ideal_scale = mask * result_scale + (1.0 - mask) * near_to_ideal_scale
+            result_scale = near_to_ideal_scale
+
+            if i < self._initial_steps - 1:
+                out = compress_model(original_weight.data, near_to_ideal_scale.data, zp.data)
+                compressed_weights = fns.zeros_like(original_weight) + out
+                target = compressed_weights - zp
+                zero_mask = compressed_weights == zp
+                zero_mask = zero_scale * zero_mask.astype(original_weight.dtype)
+        return result_scale
+
+
+    def grid_search_rectification(
+        self,
+        original_weight: TTensor,
+        scale: TTensor,
+        zp: TTensor,
+        target: TTensor,
+        importance: TTensor,
+        fp_outs: TTensor,
+        best_diffs: TTensor,
+        X: TTensor,
+        result_scale: TTensor,
+        compress_model: Callable,
+        compress_decompress_model: Callable,
+        zero_scale: float
+    ):
+        for scale_steps in range(self._scale_steps):
+            factor = 1.0 - 0.05 * scale_steps
+            scaled_scale = factor * scale
+
+            out = compress_model(original_weight.data, scaled_scale.data, zp.data)
+            compressed_weights = fns.zeros_like(original_weight) + out
+
+            target = compressed_weights - zp
+            zero_mask = compressed_weights == zp
+            zero_mask = zero_scale * zero_mask.astype(original_weight.dtype)
+
+            ideal_scale = fns.abs(original_weight) / (fns.abs(target) + zero_mask)
+            weighted_scale = ideal_scale * importance
+            near_to_ideal_scale = fns.sum(weighted_scale, axis=2, keepdims=True)
+
+            out = compress_decompress_model(original_weight.data, near_to_ideal_scale.data, zp.data)
+            q_weights_ = fns.zeros_like(original_weight) + out
+
+            q_outs = fns.matmul(fns.transpose(q_weights_, (1, 0, 2)), X)
+            ideal_scale_diffs = fns.mean((fp_outs - q_outs) ** 2, axis=-1)
+            ideal_scale_diffs = fns.transpose(ideal_scale_diffs, (1, 0))
+            if self._weight_penalty > 0.0:
+                ideal_scale_diffs += self._weight_penalty * fns.mean((q_weights_ - original_weight) ** 2, axis=-1)
+
+            mask = (ideal_scale_diffs > best_diffs).astype(best_diffs.dtype)
+
+            best_diffs = mask * best_diffs + (1.0 - mask) * ideal_scale_diffs
+
+            mask = fns.unsqueeze(mask, axis=2)
+
+            if result_scale is None:
+                near_to_ideal_scale = mask * scale + (1.0 - mask) * near_to_ideal_scale
+            else:
+                near_to_ideal_scale = mask * result_scale + (1.0 - mask) * near_to_ideal_scale
+            result_scale = near_to_ideal_scale
+        return result_scale
+
 
     def apply(
         self,
@@ -190,17 +296,16 @@ class ScaleEstimation:
 
             X, _ = reshape_weight_for_grouped_quantization(X, 0, config.group_size)
             q_weights, _ = reshape_weight_for_grouped_quantization(q_weights, reduction_axis, config.group_size)
-            best_diffs = None
             result_scale = None
 
             fp_outs = fns.matmul(fns.transpose(original_weight, (1, 0, 2)), X)
             q_outs = fns.matmul(fns.transpose(q_weights, (1, 0, 2)), X)
 
             # metric for minimization with shape [C_OUT, N_GROUPS], N_GROUPS = C_IN / GROUP_SIZE
-            min_max_scale_diffs = fns.mean((fp_outs - q_outs) ** 2, axis=-1)
-            min_max_scale_diffs = fns.transpose(min_max_scale_diffs, (1, 0))
+            best_diffs = fns.mean((fp_outs - q_outs) ** 2, axis=-1)
+            best_diffs = fns.transpose(best_diffs, (1, 0))
             if self._weight_penalty > 0.0:
-                min_max_scale_diffs += self._weight_penalty * fns.mean((q_weights - original_weight) ** 2, axis=-1)
+                best_diffs += self._weight_penalty * fns.mean((q_weights - original_weight) ** 2, axis=-1)
 
             key = (
                 (wp.compression_config.mode, wp.compression_config.num_bits) + q_weights.shape + scale.shape + zp.shape
@@ -222,79 +327,34 @@ class ScaleEstimation:
             zero_mask = zero_scale * zero_mask.astype(original_weight.dtype)
 
             # iterative rectification of initial scale
-            for i in range(self._initial_steps):
-                ideal_scale = fns.abs(original_weight) / (fns.abs(target) + zero_mask)
-                weighted_scale = ideal_scale * importance
-
-                near_to_ideal_scale = fns.sum(weighted_scale, axis=2, keepdims=True)
-
-                out = compress_decompress_model(original_weight.data, near_to_ideal_scale.data, zp.data)
-                q_weights_ = fns.zeros_like(original_weight) + out
-                q_outs = fns.matmul(fns.transpose(q_weights_, (1, 0, 2)), X)
-
-                ideal_scale_diffs = fns.mean((fp_outs - q_outs) ** 2, axis=-1)
-                ideal_scale_diffs = fns.transpose(ideal_scale_diffs, (1, 0))
-                if self._weight_penalty > 0.0:
-                    ideal_scale_diffs += self._weight_penalty * fns.mean((q_weights_ - original_weight) ** 2, axis=-1)
-
-                if best_diffs is None:
-                    best_diffs = min_max_scale_diffs
-
-                mask = (ideal_scale_diffs > best_diffs).astype(best_diffs.dtype)
-
-                best_diffs = mask * best_diffs + (1.0 - mask) * ideal_scale_diffs
-
-                mask = fns.unsqueeze(mask, axis=2)
-
-                if result_scale is None:
-                    near_to_ideal_scale = mask * scale + (1.0 - mask) * near_to_ideal_scale
-                else:
-                    near_to_ideal_scale = mask * result_scale + (1.0 - mask) * near_to_ideal_scale
-                result_scale = near_to_ideal_scale
-
-                if i < self._initial_steps - 1:
-                    out = compress_model(original_weight.data, near_to_ideal_scale.data, zp.data)
-                    compressed_weights = fns.zeros_like(original_weight) + out
-                    target = compressed_weights - zp
-                    zero_mask = compressed_weights == zp
-                    zero_mask = zero_scale * zero_mask.astype(original_weight.dtype)
+            result_scale = self.initial_rectification(original_weight,
+                                                      scale,
+                                                      zp,
+                                                      target,
+                                                      importance,
+                                                      fp_outs,
+                                                      best_diffs,
+                                                      X,
+                                                      result_scale,
+                                                      compress_model,
+                                                      compress_decompress_model,
+                                                      zero_scale
+                                                      )
 
             # iterative rectification of scale based on grid search
-            for scale_steps in range(self._scale_steps):
-                factor = 1.0 - 0.05 * scale_steps
-                scaled_scale = factor * scale
-
-                out = compress_model(original_weight.data, scaled_scale.data, zp.data)
-                compressed_weights = fns.zeros_like(original_weight) + out
-
-                target = compressed_weights - zp
-                zero_mask = compressed_weights == zp
-                zero_mask = zero_scale * zero_mask.astype(original_weight.dtype)
-
-                ideal_scale = fns.abs(original_weight) / (fns.abs(target) + zero_mask)
-                weighted_scale = ideal_scale * importance
-                near_to_ideal_scale = fns.sum(weighted_scale, axis=2, keepdims=True)
-
-                out = compress_decompress_model(original_weight.data, near_to_ideal_scale.data, zp.data)
-                q_weights_ = fns.zeros_like(original_weight) + out
-
-                q_outs = fns.matmul(fns.transpose(q_weights_, (1, 0, 2)), X)
-                ideal_scale_diffs = fns.mean((fp_outs - q_outs) ** 2, axis=-1)
-                ideal_scale_diffs = fns.transpose(ideal_scale_diffs, (1, 0))
-                if self._weight_penalty > 0.0:
-                    ideal_scale_diffs += self._weight_penalty * fns.mean((q_weights_ - original_weight) ** 2, axis=-1)
-
-                mask = (ideal_scale_diffs > best_diffs).astype(best_diffs.dtype)
-
-                best_diffs = mask * best_diffs + (1.0 - mask) * ideal_scale_diffs
-
-                mask = fns.unsqueeze(mask, axis=2)
-
-                if result_scale is None:
-                    near_to_ideal_scale = mask * scale + (1.0 - mask) * near_to_ideal_scale
-                else:
-                    near_to_ideal_scale = mask * result_scale + (1.0 - mask) * near_to_ideal_scale
-                result_scale = near_to_ideal_scale
+            result_scale = self.grid_search_rectification(original_weight,
+                                            scale,
+                                            zp,
+                                            target,
+                                            importance,
+                                            fp_outs,
+                                            best_diffs,
+                                            X,
+                                            result_scale,
+                                            compress_model,
+                                            compress_decompress_model,
+                                            zero_scale
+                                            )
 
             res[k] = result_scale
 
