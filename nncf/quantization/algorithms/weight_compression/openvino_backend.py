@@ -208,11 +208,13 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         if wc_params.X is not None: # rectification by data
             X = wc_params.X.data
             dY = w_residual @ X
-            
+            #dY = residual @ X
+
             # US @ Vr = res
             # US @ Vr @ X = dY
             # US @ |VR VR @ X| = |res dY|
-    
+
+            diff_before = np.mean(np.abs(weight.data @ X - q_weights.data @ X))
             for i in range(n_iters):
                 VX = Vr @ X
                 if True:
@@ -222,7 +224,6 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
                     dYR = np.concatenate((w_residual, dY), axis=1)
                     sol = slinalg.lstsq(np.transpose(VrVX), np.transpose(dYR))
                 
-                diff_before = np.mean(np.abs(weight.data @ X - q_weights.data @ X))
                 diff_after_svd = np.mean(np.abs(weight.data @ X - q_weights.data @ X - (US @ Vr) @ X))
                 
                 US = np.transpose(sol[0])
