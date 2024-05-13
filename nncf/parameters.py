@@ -119,6 +119,7 @@ class SensitivityMetric(StrEnum):
     MEAN_ACTIVATION_VARIANCE = "mean_activation_variance"
     MAX_ACTIVATION_VARIANCE = "max_activation_variance"
     MEAN_ACTIVATION_MAGNITUDE = "mean_activation_magnitude"
+    MATMUL_RELATIVE = "matmul_relative"
 
 
 @api(canonical_alias="nncf.QuantizationMode")

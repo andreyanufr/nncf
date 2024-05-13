@@ -203,6 +203,7 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         Vr = Sr @ Vr
         US = Ur
 
+        compression_config = WeightCompressionConfig()
         print(wc_params.node_with_weight.node_name)
         n_iters = 3
         if wc_params.X is not None: # rectification by data
@@ -214,37 +215,66 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
             # US @ Vr @ X = dY
             # US @ |VR VR @ X| = |res dY|
 
-            diff_before = np.mean(np.abs(weight.data @ X - q_weights.data @ X))
+            WxX = weight.data @ X
+            QWxX = q_weights.data @ X
+            WxX_QWxX = WxX - QWxX
+            diff_before = np.mean(np.abs(WxX_QWxX))
             for i in range(n_iters):
+                # if int8_lora:
+                #     #compression_config = WeightCompressionConfig()
+                #     Vr = Tensor(Vr)
+                #     compressed_V = compress_weight(
+                #         Vr,
+                #         wc_params.reduction_axes,
+                #         compression_config,
+                #     )
+                #     Vr = do_dequantization(compressed_V.tensor, compressed_V.scale,
+                #                 compressed_V.zero_point)
+                #     Vr = Vr.data
+
                 VX = Vr @ X
                 if True:
-                    sol = slinalg.lstsq(np.transpose(VX), np.transpose(dY))
+                    sol = slinalg.lstsq(np.transpose(VX), np.transpose(dY), lapack_driver='gelsy')
                 else:
                     VrVX = np.concatenate((Vr, VX), axis=1)
                     dYR = np.concatenate((w_residual, dY), axis=1)
                     sol = slinalg.lstsq(np.transpose(VrVX), np.transpose(dYR))
                 
-                diff_after_svd = np.mean(np.abs(weight.data @ X - q_weights.data @ X - (US @ Vr) @ X))
+                diff_after_svd = np.mean(np.abs(WxX_QWxX - (US @ Vr) @ X))
                 
                 US = np.transpose(sol[0])
-                
-                diff_after_svd_rectification = np.mean(np.abs(weight.data @ X - q_weights.data @ X - (US @ Vr) @ X))
+
+                diff_after_svd_rectification = np.mean(np.abs(WxX_QWxX - (US @ Vr) @ X))
                 if n_iters - i < 3:
                     print(f"{i} Rectification 1: ", diff_before, diff_after_svd, diff_after_svd_rectification)
                 
+                # if int8_lora:
+                #     #compression_config = WeightCompressionConfig()
+                #     US = Tensor(US)
+                #     compressed_US = compress_weight(
+                #         US,
+                #         wc_params.reduction_axes,
+                #         compression_config,
+                #     )
+                #     US = do_dequantization(compressed_US.tensor, compressed_US.scale,
+                #                 compressed_US.zero_point)
+                #     US = US.data
+                    
                 USI = linalg.pinv(US)
                 dYU = USI @ dY
                 
-                sol = slinalg.lstsq(np.transpose(X), np.transpose(dYU))
+                sol = slinalg.lstsq(np.transpose(X), np.transpose(dYU), lapack_driver='gelsy')
                 Vr = np.transpose(sol[0])
                 
-                diff_after_svd_rectification = np.mean(np.abs(weight.data @ X - q_weights.data @ X - (US @ Vr) @ X))
+                diff_after_svd_rectification = np.mean(np.abs(WxX_QWxX - (US @ Vr) @ X))
                 if n_iters - i < 3:
                     print(f"{i} Rectification 2: ", diff_before, diff_after_svd, diff_after_svd_rectification)
 
         new_residual = US @ Vr
         V = Vr
         print("Before: ", np.mean(np.abs(residual)), " After: ", np.mean(np.abs(residual - new_residual)), rank)
+        denum = np.mean(np.abs(WxX))
+        print("Relative: ", wc_params.node_with_weight.node_name, diff_before / denum, diff_after_svd_rectification / denum)
         
         input_node = self.name_to_node_mapping[wc_params.node_with_weight.node_name].input_value(0)
         mm_node = self.name_to_node_mapping[wc_params.node_with_weight.node_name]
@@ -253,9 +283,8 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         const_node_name = const_attributes["name"]
         const_node = self.name_to_node_mapping[const_node_name]
         const_dtype = const_node.output(0).get_element_type()
-        
+
         if int8_lora:
-            compression_config = WeightCompressionConfig()
             V = Tensor(V)
             compressed_V = compress_weight(
                 V,
@@ -306,6 +335,12 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
     ) -> ov.Model:
         for wc_params in weight_compression_parameters:
             compression_config = wc_params.compression_config
+            # if compression_config.mode in [
+            #     CompressWeightsMode.INT8_ASYM,
+            #     CompressWeightsMode.INT8_SYM,
+            #     CompressWeightsMode.INT8,
+            # ]:
+            #     continue
             if compression_config.mode == CompressWeightsMode.NF4:
                 compression_dtype = ov.Type.nf4
             elif compression_config.mode in [

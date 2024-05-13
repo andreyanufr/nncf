@@ -136,6 +136,8 @@ class DataBasedCriterion(DataFreeCriterion):
         Since there's no data-aware estimation of sensitivity in these layers, they receive the lowest sensitivity.
         It allows assigning Gather operation 4-bit in the first place.
         """
+        if hasattr(self, '_calc_common_sinsitivity'):
+            return self._calc_common_sinsitivity(weight_param, self._activations[weight_param.node_with_weight.node_name])
         if weight_param.node_with_weight.metatype in self._backend_entity.embedding_metatypes:
             return THE_LOWEST_SENSITIVITY
         weight_score = self._calc_weight_sensitivity(weight_param)
@@ -179,6 +181,50 @@ class HAWQCriterion(DataBasedCriterion):
         decompressed_weight = (compressed_weights - zero_point).astype(weight.dtype) * scale
         decompressed_weight = decompressed_weight.reshape(orig_shape)
         return fns.linalg.norm(decompressed_weight - weight, ord="fro").item()
+
+
+@MIXED_PRECISION_CRITERIA.register(SensitivityMetric.MATMUL_RELATIVE)
+class MatMulRelative(DataBasedCriterion):
+    """
+    A baseline mixed precision criterion that is based on quantization noise of weights only.
+    """
+
+    @staticmethod
+    def _calc_activation_sensitivity(activations: List[Tensor]) -> float:
+        return 1.0
+
+    def _calc_weight_sensitivity(self, weight_param: WeightCompressionParameters) -> float:
+        return 1.0
+
+    def _get_weights(self, weight_param: WeightCompressionParameters) -> (Tensor, Tensor):
+        weight = self._backend_entity.get_weight(
+            weight_param.node_with_weight, weight_param.weight_port_id, self._model, self._graph
+        )
+        backup_config = weight_param.compression_config
+        reduction_axes = weight_param.reduction_axes
+
+        orig_shape = weight.shape
+
+        if weight.dtype != TensorDataType.float32:
+            weight = weight.astype(TensorDataType.float32)
+
+        compressed_weights, scale, zero_point = do_integer_quantization(weight, reduction_axes, backup_config)
+        decompressed_weight = (compressed_weights - zero_point).astype(weight.dtype) * scale
+        decompressed_weight = decompressed_weight.reshape(orig_shape)
+        return weight, decompressed_weight
+
+    def _calc_common_sinsitivity(self,  weight_param: WeightCompressionParameters, activations: List[Tensor]) -> float:
+        w, qw = self._get_weights(weight_param)
+        
+        X = fns.stack([fns.mean(act, axis=0) for act in activations])
+        X = fns.transpose(X)
+        
+        WX = fns.matmul(w, X)
+        QWX = fns.matmul(qw, X)
+        DWX = fns.mean(fns.abs(WX - QWX))
+        denum = 1.0#fns.mean(fns.abs(WX))
+        return DWX / denum
+
 
 
 @MIXED_PRECISION_CRITERIA.register(SensitivityMetric.MEAN_ACTIVATION_VARIANCE)

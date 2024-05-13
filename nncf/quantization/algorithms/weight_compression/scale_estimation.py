@@ -61,6 +61,7 @@ class ScaleEstimation:
         :param weight_penalty: coefficient for penalty between fp and compressed weights. If -1 then doesn't apply.
         """
         super().__init__()
+        print("################ subset_size: ", subset_size)
         self.name_to_node_mapping = name_to_node_mapping
         self._all_weight_params = all_weight_params
         self._nodes_to_compress = nodes_to_compress

@@ -239,6 +239,13 @@ def tiny_llama_transform_func(item, tokenizer, ov_model):  # <YOUR_TRANSFORMATIO
     return res
 
 
+def chat_template_fn(query: str):
+    messages = [
+        {"role": "user", "content": query},
+    ]
+    return messages
+
+
 def main():
     model_id = "TinyLlama/TinyLlama-1.1B-step-50K-105b"  # <YOUR_MODEL_ID>
     ov_config = {"PERFORMANCE_HINT": "LATENCY", "NUM_STREAMS": "1", "CACHE_DIR": ""}
@@ -257,7 +264,8 @@ def main():
     transform_func = partial(tiny_llama_transform_func, tokenizer=tokenizer, ov_model=model.model)
 
     start = datetime.datetime.now()
-    evaluator = Evaluator(model, tokenizer=tokenizer, metrics=("similarity",))
+    evaluator = Evaluator(model, tokenizer=tokenizer, metrics=("similarity",), chat_template_fn=chat_template_fn)
+    evaluator.dump_gt('TinyLlama-1.1B-step-50K-105b_chat.csv')
     nncf_dataset = get_nncf_dataset(dataset, transform_func)
     awq, ratio, group_size = find_parameters(evaluator, model, nncf_dataset)
     end = datetime.datetime.now()
