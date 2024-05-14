@@ -137,29 +137,38 @@ class AWQ(Algorithm):
         for _, pattern_graph in self._patterns.items():
             matches.extend(find_subgraphs_matching_pattern(nx_graph, pattern_graph(), strict=False))
 
-        if len(matches) == 0:
-            return model
-
-        target_node_names = []
-        merge_node_names = []
         awq_data = {}
         name_mapping = {wp.weight_name: idx for idx, wp in enumerate(self._all_weight_params)}
 
         for match in matches:
             nncf_node = graph.get_node_by_key(match[-1])
+            if not self._backend_entity.is_node_with_weights(nncf_node, graph):
+                continue
+
+            target_node_names = []
             for weight_op_friendly_name, _ in self._backend_entity.get_weight_names_and_port_ids(nncf_node, graph):
                 target_node_names.append(weight_op_friendly_name)
 
-            nncf_node = graph.get_node_by_key(match[0])
-            for weight_op_friendly_name, _ in self._backend_entity.get_weight_names_and_port_ids(nncf_node, graph):
-                merge_node_names.append(weight_op_friendly_name)
-
-            assert len(target_node_names) == len(merge_node_names)
             weight_params = self._all_weight_params[name_mapping[target_node_names[-1]]]
+
             if weight_params.compression_config.num_bits != 4:
                 continue
             target_node = self._nodes_to_compress[name_mapping[target_node_names[-1]]]
-            merge_node = self._nodes_to_compress[name_mapping[merge_node_names[-1]]]
+
+            # avoid matching different patterns for the same node
+            if target_node.node_name in awq_data:
+                continue
+
+            nncf_node = graph.get_node_by_key(match[0])
+
+            if self._backend_entity.is_node_with_weights(nncf_node, graph):  # pattern MatMul->Multiply->MatMul
+                merge_node_names = []
+                for weight_op_friendly_name, _ in self._backend_entity.get_weight_names_and_port_ids(nncf_node, graph):
+                    merge_node_names.append(weight_op_friendly_name)
+                assert len(target_node_names) == len(merge_node_names)
+                merge_node = self._nodes_to_compress[name_mapping[merge_node_names[-1]]]
+            else:  # pattern Act->MatMul or Act->Multiply->MatMul
+                merge_node = nncf_node
 
             awq_data[target_node.node_name] = AWQCompressionInfo(weight_params, target_node, merge_node)
 
@@ -192,9 +201,13 @@ class AWQ(Algorithm):
             top_k = max(int(s.shape[0] * self._percent_to_apply), 1)
             topk_idxs = fns.argsort(-s)[:top_k]
 
+            group_size = config.group_size
+            if group_size == -1:
+                group_size = s.shape[0]
+
             groups_to_correct = set()
             for idx in topk_idxs:
-                groups_to_correct.add(idx.data // config.group_size)
+                groups_to_correct.add(idx.data // group_size)
 
             groups_to_correct = list(groups_to_correct)
 
@@ -215,15 +228,15 @@ class AWQ(Algorithm):
             awq_config.group_size = -1
 
             for gi in groups_to_correct:
-                offset = gi * config.group_size
-                gscale = s[offset : offset + config.group_size]
+                offset = gi * group_size
+                gscale = s[offset : offset + group_size]
 
                 a_min = fns.quantile(gscale, 0.1)
                 a_max = 1e2
                 gscale = fns.clip(gscale, a_min=a_min, a_max=a_max)
 
-                gweight = weight[:, offset : offset + config.group_size]
-                gacts = X[offset : offset + config.group_size, :]
+                gweight = weight[:, offset : offset + group_size]
+                gacts = X[offset : offset + group_size, :]
 
                 fp32_out = fns.matmul(gweight, gacts)
                 min_diff = fns.max(fns.abs(fp32_out))
@@ -247,7 +260,7 @@ class AWQ(Algorithm):
                     alpha += alpha_step
 
                 if best_scale is not None:
-                    scale.data[offset : offset + config.group_size] = best_scale.data
+                    scale.data[offset : offset + group_size] = best_scale.data
 
             a_scale = scale
             w_scale = scale
@@ -261,10 +274,21 @@ class AWQ(Algorithm):
             scaled_weight = weight * w_scale
             self._backend_entity.set_weight(wp.node_with_weight, weight_port_id, model, graph, scaled_weight)
 
-            for _, port_id in self._backend_entity.get_weight_names_and_port_ids(merge_node, graph):
-                merge_weight = self._backend_entity.get_weight(merge_node, port_id, model, graph)
-                merge_weight = merge_weight * a_scale
-                self._backend_entity.set_weight(merge_node, port_id, model, graph, merge_weight)
+            if merge_node.node_type == "MatMul":  # for MatMul->Multiply->MatMul pattern scale merged to first MatMul
+                for _, port_id in self._backend_entity.get_weight_names_and_port_ids(merge_node, graph):
+                    merge_weight = self._backend_entity.get_weight(merge_node, port_id, model, graph)
+                    merge_weight = merge_weight * a_scale
+                    self._backend_entity.set_weight(merge_node, port_id, model, graph, merge_weight)
+                a_scale = fns.transpose(a_scale)
+            else:  # for Act->Multiply->MatMul and Act->MatMul patterns scale inserted after Act as extra node
+                a_scale = fns.transpose(a_scale)
+                nonlinear_node = self.name_to_node_mapping[merge_node.node_name]
+                self._backend_entity.insert_scale_after_node(nonlinear_node, a_scale.data, merge_node.node_name)
+
+            # update activations for next usage
+            for i, stat in enumerate(self._activations[k]):
+                stat = stat * a_scale
+                self._activations[k][i] = stat
 
             # update activations for next usage
             a_scale_t = fns.transpose(a_scale)
