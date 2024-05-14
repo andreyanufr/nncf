@@ -219,6 +219,8 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
             QWxX = q_weights.data @ X
             WxX_QWxX = WxX - QWxX
             diff_before = np.mean(np.abs(WxX_QWxX))
+            
+            noise_level = 0.0#0.001
             for i in range(n_iters):
                 # if int8_lora:
                 #     #compression_config = WeightCompressionConfig()
@@ -234,7 +236,7 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
 
                 VX = Vr @ X
                 if True:
-                    sol = slinalg.lstsq(np.transpose(VX), np.transpose(dY), lapack_driver='gelsy')
+                    sol = slinalg.lstsq(np.transpose(VX), np.transpose(dY + noise_level * np.random.randn(*dY.shape)), lapack_driver='gelsy')
                 else:
                     VrVX = np.concatenate((Vr, VX), axis=1)
                     dYR = np.concatenate((w_residual, dY), axis=1)
@@ -244,8 +246,8 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
                 
                 US = np.transpose(sol[0])
 
-                diff_after_svd_rectification = np.mean(np.abs(WxX_QWxX - (US @ Vr) @ X))
-                if n_iters - i < 3:
+                if n_iters - i < 2:
+                    diff_after_svd_rectification = np.mean(np.abs(WxX_QWxX - (US @ Vr) @ X))
                     print(f"{i} Rectification 1: ", diff_before, diff_after_svd, diff_after_svd_rectification)
                 
                 # if int8_lora:
@@ -259,15 +261,15 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
                 #     US = do_dequantization(compressed_US.tensor, compressed_US.scale,
                 #                 compressed_US.zero_point)
                 #     US = US.data
-                    
+
                 USI = linalg.pinv(US)
-                dYU = USI @ dY
+                dYU = USI @ (dY + noise_level * np.random.randn(*dY.shape))
                 
                 sol = slinalg.lstsq(np.transpose(X), np.transpose(dYU), lapack_driver='gelsy')
                 Vr = np.transpose(sol[0])
                 
-                diff_after_svd_rectification = np.mean(np.abs(WxX_QWxX - (US @ Vr) @ X))
-                if n_iters - i < 3:
+                if n_iters - i < 2:
+                    diff_after_svd_rectification = np.mean(np.abs(WxX_QWxX - (US @ Vr) @ X))
                     print(f"{i} Rectification 2: ", diff_before, diff_after_svd, diff_after_svd_rectification)
 
         new_residual = US @ Vr
