@@ -205,7 +205,7 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
 
         compression_config = WeightCompressionConfig()
         print(wc_params.node_with_weight.node_name)
-        n_iters = 5
+        n_iters = 3
         if wc_params.X is not None: # rectification by data
             X = wc_params.X.data
             dY = w_residual @ X
@@ -221,7 +221,7 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
             diff_before = np.mean(np.abs(WxX_QWxX))
             
             noise_level = 0.0 #00001
-            w_regulation = True
+            w_regulation = False
             for i in range(n_iters):
                 # if int8_lora:
                 #     #compression_config = WeightCompressionConfig()

@@ -392,6 +392,13 @@ class WeightCompression(Algorithm):
                 X = fns.transpose(X)
                 s = fns.max(fns.abs(X), axis=1)
                 wp.stat = s
+                
+                if True:
+                    vals = [fns.mean(stat, axis=0) for stat in stats]
+                    vals.extend([fns.mean(fns.abs(stat), axis=0) for stat in stats])
+                    X = fns.stack(vals)
+                    X = fns.transpose(X)
+
                 wp.X = X
 
         # Compress model using weight compression parameters
