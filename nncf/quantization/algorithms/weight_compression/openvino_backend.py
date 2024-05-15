@@ -205,7 +205,7 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
 
         compression_config = WeightCompressionConfig()
         print(wc_params.node_with_weight.node_name)
-        n_iters = 3
+        n_iters = 5
         if wc_params.X is not None: # rectification by data
             X = wc_params.X.data
             dY = w_residual @ X
@@ -220,7 +220,8 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
             WxX_QWxX = WxX - QWxX
             diff_before = np.mean(np.abs(WxX_QWxX))
             
-            noise_level = 0.0#0.001
+            noise_level = 0.0 #00001
+            w_regulation = True
             for i in range(n_iters):
                 # if int8_lora:
                 #     #compression_config = WeightCompressionConfig()
@@ -235,12 +236,12 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
                 #     Vr = Vr.data
 
                 VX = Vr @ X
-                if True:
+                if not w_regulation:
                     sol = slinalg.lstsq(np.transpose(VX), np.transpose(dY + noise_level * np.random.randn(*dY.shape)), lapack_driver='gelsy')
                 else:
                     VrVX = np.concatenate((Vr, VX), axis=1)
-                    dYR = np.concatenate((w_residual, dY), axis=1)
-                    sol = slinalg.lstsq(np.transpose(VrVX), np.transpose(dYR))
+                    dYR = np.concatenate((residual, dY), axis=1)
+                    sol = slinalg.lstsq(np.transpose(VrVX), np.transpose(dYR), lapack_driver='gelsy')
                 
                 diff_after_svd = np.mean(np.abs(WxX_QWxX - (US @ Vr) @ X))
                 
@@ -263,9 +264,17 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
                 #     US = US.data
 
                 USI = linalg.pinv(US)
-                dYU = USI @ (dY + noise_level * np.random.randn(*dY.shape))
                 
-                sol = slinalg.lstsq(np.transpose(X), np.transpose(dYU), lapack_driver='gelsy')
+                if not w_regulation:
+                    dYU = USI @ dY
+                    sol = slinalg.lstsq(np.transpose(X), np.transpose(dYU), lapack_driver='gelsy')
+                else:
+                    I = np.eye(Vr.shape[1])
+                    IX = np.concatenate((I, X), axis=1)
+                    dYR = np.concatenate((USI @ residual, USI @ dY), axis=1)
+                    sol = slinalg.lstsq(np.transpose(IX), np.transpose(dYR), lapack_driver='gelsy')
+                
+                
                 Vr = np.transpose(sol[0])
                 
                 if n_iters - i < 2:
