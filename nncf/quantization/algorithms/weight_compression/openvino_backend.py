@@ -156,7 +156,7 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
 
     def insert_lora_residual(self, model: ov.Model, graph: NNCFGraph,
                              wc_params: WeightCompressionParameters, weight,
-                             compressed_weight, rank=8,
+                             compressed_weight, rank=32,
                              int8_lora=True):
         import numpy.linalg as linalg
         import scipy.linalg as slinalg
@@ -206,6 +206,7 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         compression_config = WeightCompressionConfig()
         print(wc_params.node_with_weight.node_name)
         n_iters = 3
+        w_regulation = True
         if wc_params.X is not None: # rectification by data
             X = wc_params.X.data
             dY = w_residual @ X
@@ -219,9 +220,10 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
             QWxX = q_weights.data @ X
             WxX_QWxX = WxX - QWxX
             diff_before = np.mean(np.abs(WxX_QWxX))
+            #tmp = np.mean(np.abs(dY))
             
             noise_level = 0.0 #00001
-            w_regulation = False
+            bias = None
             for i in range(n_iters):
                 # if int8_lora:
                 #     #compression_config = WeightCompressionConfig()
@@ -237,10 +239,29 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
 
                 VX = Vr @ X
                 if not w_regulation:
-                    sol = slinalg.lstsq(np.transpose(VX), np.transpose(dY + noise_level * np.random.randn(*dY.shape)), lapack_driver='gelsy')
+                    if n_iters - i == 1 and False:
+                        # I = np.ones([1, VX.shape[1]])
+                        # VX = np.concatenate((VX, I), axis=0)
+                        # #VX = np.concatenate((VX, I), axis=1)
+                        # sol = slinalg.lstsq(np.transpose(VX), np.transpose(dY), lapack_driver='gelsy')
+                        
+                        # US = np.transpose(sol[0])
+                        # bias = US[:, -1]
+                        # bias = np.expand_dims(bias, 1)
+                        # US = US[:, :-1]
+                        sol = slinalg.lstsq(np.transpose(VX), np.transpose(dY), lapack_driver='gelsy')
+                        US = np.transpose(sol[0])
+                        bias = np.mean(WxX_QWxX - (US @ Vr) @ X, axis=1)
+                        bias = np.expand_dims(bias, 1)
+                        diff_after_svd = np.mean(np.abs(WxX_QWxX - (US @ Vr) @ X))
+                        diff_after_svd_rectification = np.mean(np.abs(WxX_QWxX - (US @ Vr) @ X - bias))
+                        print(f"{i} Rectification 1: ", diff_before, diff_after_svd, diff_after_svd_rectification)
+                        break
+                    else:
+                        sol = slinalg.lstsq(np.transpose(VX), np.transpose(dY), lapack_driver='gelsy')
                 else:
                     VrVX = np.concatenate((Vr, VX), axis=1)
-                    dYR = np.concatenate((residual, dY), axis=1)
+                    dYR = np.concatenate((w_residual, dY), axis=1)
                     sol = slinalg.lstsq(np.transpose(VrVX), np.transpose(dYR), lapack_driver='gelsy')
                 
                 diff_after_svd = np.mean(np.abs(WxX_QWxX - (US @ Vr) @ X))
@@ -271,13 +292,13 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
                 else:
                     I = np.eye(Vr.shape[1])
                     IX = np.concatenate((I, X), axis=1)
-                    dYR = np.concatenate((USI @ residual, USI @ dY), axis=1)
+                    dYR = np.concatenate((USI @ w_residual, USI @ dY), axis=1)
                     sol = slinalg.lstsq(np.transpose(IX), np.transpose(dYR), lapack_driver='gelsy')
                 
                 
                 Vr = np.transpose(sol[0])
                 
-                if n_iters - i < 2:
+                if n_iters - i < 3:
                     diff_after_svd_rectification = np.mean(np.abs(WxX_QWxX - (US @ Vr) @ X))
                     print(f"{i} Rectification 2: ", diff_before, diff_after_svd, diff_after_svd_rectification)
 
@@ -326,6 +347,14 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
                 US
             )
             US_MM = opset.matmul(V_MM, US_W, transpose_a=False, transpose_b=True)
+        
+        if not bias is None:
+            bias = bias.astype(np.float32)
+            bias = np.transpose(bias)
+            b = opset.constant(
+                bias
+            )
+            US_MM = opset.add(US_MM, b)
 
         node_output_port = mm_node.output(0)
         node_output_source_ports = node_output_port.get_target_inputs()
