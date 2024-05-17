@@ -156,7 +156,7 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
 
     def insert_lora_residual(self, model: ov.Model, graph: NNCFGraph,
                              wc_params: WeightCompressionParameters, weight,
-                             compressed_weight, rank=32,
+                             compressed_weight, rank=256,
                              int8_lora=True):
         import numpy.linalg as linalg
         import scipy.linalg as slinalg
