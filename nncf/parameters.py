@@ -92,6 +92,7 @@ class CompressWeightsMode(StrEnum):
     INT4_ASYM = "int4_asym"
     NF4 = "nf4"
     INT8 = "int8"  # Deprecated mode
+    MXFP4 = "mxfp4"
 
 
 @api(canonical_alias="nncf.SensitivityMetric")

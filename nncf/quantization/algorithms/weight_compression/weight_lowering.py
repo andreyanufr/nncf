@@ -99,6 +99,40 @@ def calculate_normalized_weight_and_nf4_scale(
     norm_weight = weight / scale
     return norm_weight, scale
 
+def calculate_normalized_weight_and_mxfp4_scale(
+    weight: Tensor, reduction_axes: ReductionAxes, group_size: int = -1
+) -> Tuple[Tensor, Tensor]:
+    """
+    Calculates scale for mxfp4 quantization and normalizes weights by the scale.
+    Weights are reshaped in case of positive value of group size.
+
+    :param weight: Weight array to compress.
+    :param reduction_axes: Axes, along which to reduce (collect) different statistics (e.g. min, max).
+    :param group_size: Number of weights (e.g. 128) in the channel dimension that share quantization parameters (scale).
+        The value -1 means no grouping. Defaults to -1.
+    :return: Normalized weight tensor of float32 type and mxfp4 scale tensor of float32 type.
+    """
+    assert group_size == 32
+    max_mxfp4 = 6.0
+    if weight.dtype != TensorDataType.float32:
+        weight = weight.astype(TensorDataType.float32)
+
+    weight = weight / max_mxfp4
+    weight, reduction_axes = reshape_weight_for_grouped_quantization(weight, reduction_axes, group_size)
+    scale = fns.max(fns.abs(weight), axis=reduction_axes, keepdims=True)  # [a1, r//gs, 1, a2]
+    
+    import numpy as np
+    scale_log = fns.zeros_like(scale) + np.log2(scale.data)
+    scale_log = fns.clip(scale_log, -127, 127)
+    scale_log = fns.round(scale_log)
+    scale = fns.zeros_like(scale) + 2**scale_log.data
+
+    eps = fns.finfo(weight).eps
+    # NOTE: adding machine epsilon to avoid division by zero
+    scale = fns.where(fns.abs(scale) < eps, eps, scale)
+    norm_weight = weight * max_mxfp4 / scale
+    return norm_weight, scale
+
 
 def do_integer_quantization(
     weight: Tensor, reduction_axes: ReductionAxes, config: WeightCompressionConfig, precomputed_scale: Tensor = None
@@ -208,6 +242,9 @@ def compress_weight(
     """
     if config.mode == CompressWeightsMode.NF4:
         compressed_weight, scale = calculate_normalized_weight_and_nf4_scale(weight, reduction_axes, config.group_size)
+        return CompressedWeight(compressed_weight, scale)
+    if config.mode == CompressWeightsMode.MXFP4:
+        compressed_weight, scale = calculate_normalized_weight_and_mxfp4_scale(weight, reduction_axes, config.group_size)
         return CompressedWeight(compressed_weight, scale)
     compressed_weight, scale, zero_point = do_integer_quantization(weight, reduction_axes, config, precomputed_scale)
 
