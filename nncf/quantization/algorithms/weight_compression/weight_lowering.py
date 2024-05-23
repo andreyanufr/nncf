@@ -11,6 +11,7 @@
 
 from dataclasses import dataclass
 from typing import Optional, Tuple
+import numpy as np
 
 import nncf
 from nncf.experimental.tensor import Tensor
@@ -22,6 +23,29 @@ from nncf.quantization.fake_quantize import calculate_scale_zero_point
 
 ReductionAxes = Tuple[int, ...]
 
+
+def to_mxfp4(x):
+    idxs = np.zeros(x.shape, dtype=np.int8)
+    idxs[np.where(x > 5)]             = 0b0111 # 6
+    idxs[(x >= 3.5) & (x <= 5)]       = 0b0110 # 4
+    idxs[(x > 2.5) & (x < 3.5)]       = 0b0101 # 3
+    idxs[(x >= 1.75) & (x <= 2.5)]    = 0b0100 # 2
+    idxs[(x > 1.25) & (x < 1.75)]     = 0b0011 # 1.5
+    idxs[(x >= 0.75) & (x <= 1.25)]   = 0b0010; # 1
+    idxs[(x > 0.25) & (x < 0.75)]     = 0b0001; # 0.5
+    idxs[(x >= 0.0) & (x <= 0.25)]    = 0b0000
+    idxs[np.where(x < -5)]            = 0b1111; # -6
+    idxs[(x <= -3.5) & (x >= -5)]     = 0b1110; # -4
+    idxs[(x < -2.5) & (x > -3.5)]     = 0b1101; # -3
+    idxs[(x <= -1.75) & (x >= -2.5)]  = 0b1100; # -2
+    idxs[(x < -1.25) & (x > -1.75)]   = 0b1011; # -1.5
+    idxs[(x <= -0.75) & (x >= -1.25)] = 0b1010; # -1
+    idxs[(x < -0.25) & (x > -0.75)]   = 0b1001; # -0.5
+    idxs[(x < 0.0) & (x >= -0.25)]    = 0b1000
+    
+    look_up = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
+    qx = look_up[idxs]
+    return idxs, qx
 
 @dataclass
 class CompressedWeight:
@@ -99,6 +123,7 @@ def calculate_normalized_weight_and_nf4_scale(
     norm_weight = weight / scale
     return norm_weight, scale
 
+    
 def calculate_normalized_weight_and_mxfp4_scale(
     weight: Tensor, reduction_axes: ReductionAxes, group_size: int = -1
 ) -> Tuple[Tensor, Tensor]:
@@ -117,20 +142,47 @@ def calculate_normalized_weight_and_mxfp4_scale(
     if weight.dtype != TensorDataType.float32:
         weight = weight.astype(TensorDataType.float32)
 
-    weight = weight / max_mxfp4
     weight, reduction_axes = reshape_weight_for_grouped_quantization(weight, reduction_axes, group_size)
     scale = fns.max(fns.abs(weight), axis=reduction_axes, keepdims=True)  # [a1, r//gs, 1, a2]
-    
-    import numpy as np
-    scale_log = fns.zeros_like(scale) + np.log2(scale.data)
+    scale = scale / max_mxfp4
+
+    scale_log = fns.zeros_like(scale) + np.ceil(np.log2(scale.data))
+    assert not fns.any(scale_log > 127).data.item()
+    assert not fns.any(scale_log < -127).data.item()
     scale_log = fns.clip(scale_log, -127, 127)
-    scale_log = fns.round(scale_log)
-    scale = fns.zeros_like(scale) + 2**scale_log.data
+    
+    scale_log_h = fns.round(scale_log)
+    scale_log_l = scale_log_h - 1
+
+    scale_h = fns.zeros_like(scale) + 2**scale_log_h.data
+    scale_l = fns.zeros_like(scale) + 2**scale_log_l.data
+
+    norm_weight_h = weight / scale_h # [c_out, c_in//gs, gs]
+    norm_weight_l = weight / scale_l # [c_out, c_in//gs, gs]
+
+    idxs_h, mxfp4_h = to_mxfp4(norm_weight_h.data)
+    idxs_l, mxfp4_l = to_mxfp4(norm_weight_l.data)
+
+    mxfp4_h = mxfp4_h * scale_h.data
+    mxfp4_l = mxfp4_l * scale_l.data
+
+    diff_h = fns.mean((weight - mxfp4_h)**2, axis=-1)
+    diff_l = fns.mean((weight - mxfp4_l)**2, axis=-1)
+
+    scale = fns.where(fns.unsqueeze(diff_l < diff_h, -1), scale_l, scale_h)
+    
+
+    # scale_log = fns.zeros_like(scale) + np.log2(scale.data)
+    # assert not fns.any(scale_log > 127).data.item()
+    # assert not fns.any(scale_log < -127).data.item()
+    # scale_log = fns.clip(scale_log, -127, 127)
+    # scale_log = fns.round(scale_log)
+    # scale = fns.zeros_like(scale) + 2**scale_log.data
 
     eps = fns.finfo(weight).eps
     # NOTE: adding machine epsilon to avoid division by zero
     scale = fns.where(fns.abs(scale) < eps, eps, scale)
-    norm_weight = weight * max_mxfp4 / scale
+    norm_weight = weight / scale
     return norm_weight, scale
 
 

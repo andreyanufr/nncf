@@ -32,7 +32,7 @@ from nncf.quantization.algorithms.weight_compression.awq_patterns import get_awq
 from nncf.quantization.algorithms.weight_compression.backend import WeightCompressionAlgoBackend
 from nncf.quantization.algorithms.weight_compression.config import WeightCompressionParameters
 from nncf.quantization.algorithms.weight_compression.weight_lowering import compress_weight
-
+from nncf.quantization.algorithms.weight_compression.weight_lowering import to_mxfp4
 
 class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
     def __init__(self, model: ov.Model, name_to_node_mapping: Dict = None):
@@ -131,7 +131,7 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         for wc_params in weight_compression_parameters:
             compression_config = wc_params.compression_config
             if compression_config.mode == CompressWeightsMode.MXFP4:
-                compression_dtype = ov.Type.nf4
+                compression_dtype = ov.Type.f32
             elif compression_config.mode in [
                 CompressWeightsMode.INT8_ASYM,
                 CompressWeightsMode.INT8_SYM,
@@ -159,10 +159,16 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
                 compression_config,
                 precomputed_scales[wc_params.node_with_weight.node_name],
             )
-
-            compressed_const = opset.constant(
-                compressed_weight.tensor.data, dtype=compression_dtype, name=const_node_name
-            )
+            import numpy as np
+            if compression_config.mode == CompressWeightsMode.MXFP4:
+                idx, qw = to_mxfp4(compressed_weight.tensor.data)
+                compressed_const = opset.constant(
+                    qw, dtype=compression_dtype, name=const_node_name
+                )
+            else:
+                compressed_const = opset.constant(
+                    compressed_weight.tensor.data, dtype=compression_dtype, name=const_node_name
+                )
             converted_const = opset.convert(compressed_const, ov.Type.f16)
             if compressed_weight.zero_point is not None:
                 zero_point_const = opset.constant(
