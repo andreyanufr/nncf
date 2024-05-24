@@ -25,6 +25,7 @@ from nncf.quantization.algorithms.weight_compression.config import WeightCompres
 from nncf.quantization.algorithms.weight_compression.weight_lowering import do_dequantization
 from nncf.quantization.algorithms.weight_compression.weight_lowering import do_integer_quantization
 from nncf.quantization.algorithms.weight_compression.weight_lowering import reshape_weight_for_grouped_quantization
+from nncf.quantization.algorithms.weight_compression.weight_lowering import calculate_normalized_weight_and_mxfp4_scale, to_mxfp4
 
 TModel = TypeVar("TModel")
 TTensor = TypeVar("TTensor")
@@ -297,5 +298,144 @@ class ScaleEstimation:
                 result_scale = near_to_ideal_scale
 
             res[k] = result_scale
+
+        return res
+
+    def apply_for_mxfp4(
+        self,
+        model: TModel,
+        graph: NNCFGraph,
+        statistic_points: Optional[StatisticPointsContainer] = None,
+        dataset: Optional[Dataset] = None,
+    ) -> Dict[str, TTensor]:
+        """
+        Estimates better scale for the mxfp4 nodes in the model.
+        Minimizes per-group difference between floating point MatMul and
+        MatMul with compressed weights.
+        The algorithm computes weighted scale for the group of weights in MatMul, which
+        shared the same scale.
+
+        :param model: Model for applying algorithm.
+        :param graph: Model graph.
+        :param statistic_points: Statistic points with collected statistics values.
+        :param dataset: A representative dataset for the calibration process.
+        :return: Dict with pairs (node name, estimated scale).
+        """
+
+        compress_decompress_cashe = {}
+        res = dict()
+        n_iters = 0
+
+        for wp in track(self._all_weight_params, description="Applying Scale Estimation MXFP4"):
+            k = wp.node_with_weight.node_name
+            config = wp.compression_config
+            n_iters += 1
+
+            if config.num_bits != 4 or k not in self._activations or n_iters > 3:
+                res[k] = None
+                continue
+
+            stats = self._activations[k]
+            reduction_axis = wp.reduction_axes[0]
+
+            cur_config = deepcopy(config)
+            cur_config.group_size = -1
+
+            weight_data = self._backend_entity.get_weight_names_and_port_ids(wp.node_with_weight, graph)
+            if len(weight_data) != 1:  # not supported by the algorithm
+                continue
+            _, weight_port_id = weight_data[0]
+
+            X = fns.stack([fns.mean(stat, axis=0) for stat in stats])
+            X_full = fns.transpose(X)
+
+            # prevent high memory and time consumption
+            if X_full.shape[1] > self._subset_size:
+                lens = [stat.shape[0] for stat in stats]
+                step = X_full.shape[1] // self._subset_size
+                idxs = [i[0] for i in sorted(enumerate(lens), key=lambda x: -x[1])][::step]
+                X = X_full[:, idxs]
+            else:
+                X = X_full
+
+            s = fns.max(fns.abs(X_full), axis=1)
+
+            weight = self._backend_entity.get_weight(wp.node_with_weight, weight_port_id, model, graph)
+            weight = weight.astype(TensorDataType.float32)
+            eps = fns.finfo(weight).eps
+
+            if reduction_axis == 0:
+                weight = fns.transpose(weight)
+                reduction_axis = 1
+
+            original_weight = fns.zeros_like(weight) + weight
+
+            norm_weights, scale = calculate_normalized_weight_and_mxfp4_scale(original_weight, reduction_axis, config.group_size)
+            w_scale = fns.ones_like(scale)
+            near_to_ideal_scale = fns.ones_like(scale)
+            _, compressed_weights = to_mxfp4(norm_weights.data)
+            q_weights = compressed_weights * scale.data
+
+            s = fns.unsqueeze(s, 0)
+            s, _ = reshape_weight_for_grouped_quantization(s, reduction_axis, config.group_size)
+
+            original_weight, _ = reshape_weight_for_grouped_quantization(
+                original_weight, reduction_axis, config.group_size
+            )
+            q_weights = fns.zeros_like(original_weight) + q_weights
+
+            # all weight in group has importance based on corresponding input activations
+            importance = fns.ones_like(original_weight)
+            importance = importance * s
+
+            # normalize importances for every group of weights to make sum of them equal to 1.0
+            denum = fns.sum(importance, axis=2, keepdims=True)
+            importance = importance / (denum + eps)
+
+            X, _ = reshape_weight_for_grouped_quantization(X, 0, config.group_size)
+            #q_weights, _ = reshape_weight_for_grouped_quantization(q_weights, reduction_axis, config.group_size)
+            result_scale = None
+
+            fp_outs = fns.matmul(fns.transpose(original_weight, (1, 0, 2)), X)
+            q_outs = fns.matmul(fns.transpose(q_weights, (1, 0, 2)), X)
+
+            # metric for minimization with shape [C_OUT, N_GROUPS], N_GROUPS = C_IN / GROUP_SIZE
+            min_max_scale_diffs = fns.mean((fp_outs - q_outs) ** 2, axis=-1)
+            min_max_scale_diffs = fns.transpose(min_max_scale_diffs, (1, 0))
+            if self._weight_penalty > 0.0:
+                min_max_scale_diffs += self._weight_penalty * fns.mean((q_weights - original_weight) ** 2, axis=-1)
+            best_diffs = min_max_scale_diffs
+            # zero_scale = 0.001
+            # zero_mask = zero_scale * zero_mask.astype(original_weight.dtype)
+
+
+            # iterative rectification of scale based on grid search
+            for scale_steps in range(self._scale_steps):
+                factor = 1.0 - 0.05 * scale_steps
+                scaled_scale = factor * w_scale
+
+                _, compressed_weights = to_mxfp4((norm_weights * scaled_scale).data)
+                q_weights_ = compressed_weights * scale.data
+                q_weights_ = fns.zeros_like(original_weight) + q_weights_
+
+                q_outs = fns.matmul(fns.transpose(q_weights_, (1, 0, 2)), X)
+                ideal_scale_diffs = fns.mean((fp_outs - q_outs) ** 2, axis=-1)
+                ideal_scale_diffs = fns.transpose(ideal_scale_diffs, (1, 0))
+                if self._weight_penalty > 0.0:
+                    ideal_scale_diffs += self._weight_penalty * fns.mean((q_weights_ - original_weight) ** 2, axis=-1)
+
+                mask = (ideal_scale_diffs > best_diffs).astype(best_diffs.dtype)
+
+                best_diffs = mask * best_diffs + (1.0 - mask) * ideal_scale_diffs
+
+                mask = fns.unsqueeze(mask, axis=2)
+
+                if result_scale is None:
+                    near_to_ideal_scale = mask * scaled_scale + (1.0 - mask) * near_to_ideal_scale
+                else:
+                    near_to_ideal_scale = mask * result_scale + (1.0 - mask) * scaled_scale
+                result_scale = near_to_ideal_scale
+
+            res[k] = (result_scale, scale)
 
         return res

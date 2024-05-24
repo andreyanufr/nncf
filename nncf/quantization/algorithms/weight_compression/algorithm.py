@@ -378,7 +378,10 @@ class WeightCompression(Algorithm):
                 scale_estimation_params.scale_steps,
                 scale_estimation_params.weight_penalty,
             )
-            precomputed_scales = scale_algo.apply(model, graph)
+            if self._mode != CompressWeightsMode.MXFP4:
+                precomputed_scales = scale_algo.apply(model, graph)
+            else:
+                precomputed_scales = scale_algo.apply_for_mxfp4(model, graph)
 
         # Compress model using weight compression parameters
         transformed_model = self._backend_entity.transform_model(
