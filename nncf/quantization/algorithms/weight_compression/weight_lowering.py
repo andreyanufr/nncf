@@ -350,6 +350,45 @@ def do_integer_quantization(
     return compressed_weights, scale, zero_point
 
 
+def get_scale_and_zp(
+    weight: Tensor, reduction_axes: ReductionAxes, config: WeightCompressionConfig
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """
+    The method quantizes the given weights to integer data type in accordance with the compression config.
+    The config defines a quantization mode:
+        INT8_SYM mode refers to unsigned int8 symmetric weight compression with a fixed zero point equals to 128 -
+            quantization to [0, 255] range.
+        INT8_ASYM mode refers to unsigned int8 asymmetric weight compression with a typical non-fixed zero-point -
+            quantization to [0, 255] range.
+        INT4_ASYM mode refers to unsigned int4 asymmetric weight compression with a typical non-fixed zero-point -
+            quantization to [0, 15] range.
+        INT4_SYM mode refers to unsigned int4 symmetric weight compression with a fixed zero point equals to 8 -
+            quantization to [0, 15] range.
+        NF4 mode requires a dedicated procedure and it is not supported in this method.
+    One of the parameter of compression config is a group size. Quantization is per-channel, if group size equals to -1,
+    otherwise it's per-group, i.e. group size number of weights in the channel dimension share quantization parameters
+    (scales).
+
+    :param weight: Weight array to compress.
+    :param reduction_axes: Axes, along which to reduce (collect) different statistics (e.g. min, max).
+    :param config: Information on how to compress (quantize) a specific weight.
+    :return: The compressed weights tensor of uint8 type, scale tensor of float32 type and
+        zero point tensor of int32 type that was used for its quantization.
+    """
+    assert config.is_integer(), "The function supports integer quantization only"
+    group_size = config.group_size
+
+    if weight.dtype != TensorDataType.float32:
+        weight = weight.astype(TensorDataType.float32)
+
+    if group_size != -1:
+        # weights are reshaped from [a1, r, a2] to [a1, r//gs, gs, a2]
+        weight, reduction_axes = reshape_weight_for_grouped_quantization(weight, reduction_axes, group_size)
+
+    scale, zero_point = calculate_integer_quantization_params(weight, reduction_axes, config)
+    return scale, zero_point
+
+
 def get_integer_quantization_error(
     weight: Tensor, reduction_axes: ReductionAxes, config: WeightCompressionConfig
 ) -> float:

@@ -28,6 +28,7 @@ from nncf.quantization.algorithms.algorithm import Algorithm
 from nncf.quantization.algorithms.weight_compression.config import WeightCompressionParameters
 from nncf.quantization.algorithms.weight_compression.weight_lowering import do_dequantization
 from nncf.quantization.algorithms.weight_compression.weight_lowering import do_integer_quantization
+from nncf.quantization.algorithms.weight_compression.weight_lowering import get_scale_and_zp
 from nncf.quantization.passes import transform_to_inference_graph
 from nncf.tensor import functions as fns
 
@@ -182,6 +183,7 @@ class AWQ(Algorithm):
             awq_data[target_node.node_name] = AWQCompressionInfo(weight_params, target_node, merge_node)
 
         alpha_step = (self._alpha_max - self._alpha_min) / self._steps
+        models_cache = dict()
 
         for k, awq_data_item in track(awq_data.items(), description="Applying AWQ"):
             wp = awq_data_item.weight_params
@@ -254,17 +256,37 @@ class AWQ(Algorithm):
                 best_scale = None
 
                 alpha = self._alpha_min
+                awq_pipeline = None
                 for _ in range(self._steps):
                     cur_scale = gscale**alpha
+                    cur_w = gweight * cur_scale
 
-                    g_compressed_weighs, g_c_scale, g_c_zp = do_integer_quantization(
-                        gweight * cur_scale, reduction_axis, awq_config
-                    )
-                    g_decompressed_weighs = do_dequantization(g_compressed_weighs, g_c_scale, g_c_zp)
-                    sacts = gacts / fns.unsqueeze(cur_scale, 1)
+                    g_c_scale, g_c_zp = get_scale_and_zp(cur_w, reduction_axis, awq_config)
+                    zp_shape = None if g_c_zp is None else g_c_zp.shape
+                    if awq_pipeline is None:
+                        model_k = (awq_config.mode, awq_config.num_bits, gweight.shape, g_c_scale.shape, zp_shape)
+                        if model_k in models_cache:
+                            awq_pipeline = models_cache[model_k]
+                        else:
+                            awq_pipeline = self._backend_entity.get_awq_pipeline(awq_config, gweight.shape, g_c_scale.shape, zp_shape,\
+                                                                             cur_scale.shape, gacts.shape, fp32_out.shape)
+                            models_cache[model_k] = awq_pipeline
 
-                    cur_out = fns.matmul(g_decompressed_weighs, sacts)
-                    cur_diff = fns.mean(fns.abs(cur_out - fp32_out))
+                    if True:
+                        g_compressed_weighs_, g_c_scale_, g_c_zp_ = do_integer_quantization(
+                            gweight * cur_scale, reduction_axis, awq_config
+                        )
+                        g_decompressed_weighs = do_dequantization(g_compressed_weighs_, g_c_scale_, g_c_zp_)
+                        sacts = gacts / fns.unsqueeze(cur_scale, 1)
+
+                        cur_out = fns.matmul(g_decompressed_weighs, sacts)
+                        cur_diff_ = fns.mean(fns.abs(cur_out - fp32_out))
+
+                    if g_c_zp is None:
+                        cur_diff = awq_pipeline([cur_w.data, g_c_scale.data, cur_scale.data, gacts.data, fp32_out.data])
+                    else:
+                        cur_diff = awq_pipeline([cur_w.data, g_c_scale.data, g_c_zp.data,
+                                                 cur_scale.data, gacts.data, fp32_out.data])
                     if cur_diff < min_diff:
                         min_diff = cur_diff
                         best_scale = cur_scale
