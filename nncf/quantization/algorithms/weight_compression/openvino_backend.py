@@ -33,7 +33,8 @@ from nncf.parameters import CompressWeightsMode
 from nncf.quantization.algorithms.weight_compression.awq_patterns import get_awq_patterns
 from nncf.quantization.algorithms.weight_compression.backend import AWQAlgoBackend
 from nncf.quantization.algorithms.weight_compression.backend import WeightCompressionAlgoBackend
-from nncf.quantization.algorithms.weight_compression.config import WeightCompressionParameters, WeightCompressionConfig
+from nncf.quantization.algorithms.weight_compression.config import WeightCompressionConfig
+from nncf.quantization.algorithms.weight_compression.config import WeightCompressionParameters
 from nncf.quantization.algorithms.weight_compression.weight_lowering import compress_weight
 from nncf.tensor import Tensor
 from nncf.tensor.definitions import TensorDataType
@@ -258,7 +259,7 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         assert mode in [CompressWeightsMode.INT4_SYM, CompressWeightsMode.INT4_ASYM]
         num_bits = config.num_bits
 
-        asym_quant = mode in [CompressWeightsMode.INT8_ASYM, CompressWeightsMode.INT4_ASYM]
+        asym_quant = mode in [CompressWeightsMode.INT4_ASYM]
         level_low = 0 if asym_quant else -(2 ** (num_bits - 1))
         level_high = 2**num_bits - 1 if asym_quant else 2 ** (num_bits - 1) - 1
 
