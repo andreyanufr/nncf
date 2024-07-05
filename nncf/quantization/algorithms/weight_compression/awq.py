@@ -26,8 +26,6 @@ from nncf.common.utils.backend import BackendType
 from nncf.common.utils.backend import get_backend
 from nncf.quantization.algorithms.algorithm import Algorithm
 from nncf.quantization.algorithms.weight_compression.config import WeightCompressionParameters
-from nncf.quantization.algorithms.weight_compression.weight_lowering import do_dequantization
-from nncf.quantization.algorithms.weight_compression.weight_lowering import do_integer_quantization
 from nncf.quantization.algorithms.weight_compression.weight_lowering import get_scale_and_zp
 from nncf.quantization.passes import transform_to_inference_graph
 from nncf.tensor import functions as fns
@@ -268,15 +266,23 @@ class AWQ(Algorithm):
                         if model_k in models_cache:
                             awq_pipeline = models_cache[model_k]
                         else:
-                            awq_pipeline = self._backend_entity.get_awq_pipeline(awq_config, gweight.shape, g_c_scale.shape, zp_shape,\
-                                                                             cur_scale.shape, gacts.shape, fp32_out.shape)
+                            awq_pipeline = self._backend_entity.get_awq_pipeline(
+                                awq_config,
+                                gweight.shape,
+                                g_c_scale.shape,
+                                zp_shape,
+                                cur_scale.shape,
+                                gacts.shape,
+                                fp32_out.shape,
+                            )
                             models_cache[model_k] = awq_pipeline
 
                     if g_c_zp is None:
                         cur_diff = awq_pipeline([cur_w.data, g_c_scale.data, cur_scale.data, gacts.data, fp32_out.data])
                     else:
-                        cur_diff = awq_pipeline([cur_w.data, g_c_scale.data, g_c_zp.data,
-                                                 cur_scale.data, gacts.data, fp32_out.data])
+                        cur_diff = awq_pipeline(
+                            [cur_w.data, g_c_scale.data, g_c_zp.data, cur_scale.data, gacts.data, fp32_out.data]
+                        )
                     if cur_diff < min_diff:
                         min_diff = cur_diff
                         best_scale = cur_scale

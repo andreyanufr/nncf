@@ -252,9 +252,7 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         return lambda parameters: compiled_model(parameters)[0]
 
     @staticmethod
-    def get_compress_pipeline(
-        config: WeightCompressionConfig, w_shape, s_shape, z_p_shape=None, return_nodes=False
-    ):
+    def get_compress_pipeline(config: WeightCompressionConfig, w_shape, s_shape, z_p_shape=None, return_nodes=False):
         mode = config.mode
         assert mode in [CompressWeightsMode.INT4_SYM, CompressWeightsMode.INT4_ASYM]
         num_bits = config.num_bits
@@ -284,19 +282,14 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         return lambda parameters: compiled_model(parameters)[0]
 
     @staticmethod
-    def get_awq_pipeline(
-        config: WeightCompressionConfig, w_shape, s_shape, z_p_shape, sx_shape, x_shape, y_shape
-    ):
-        (
-            parameters,
-            qw
-        ) = OVWeightCompressionAlgoBackend.get_compress_decompress_pipeline(
+    def get_awq_pipeline(config: WeightCompressionConfig, w_shape, s_shape, z_p_shape, sx_shape, x_shape, y_shape):
+        (parameters, qw) = OVWeightCompressionAlgoBackend.get_compress_decompress_pipeline(
             config, w_shape, s_shape, z_p_shape, True
         )
 
         x = opset.parameter(x_shape, name="x")
         y = opset.parameter(y_shape, name="y")
-        
+
         sx = opset.parameter(sx_shape, name="sx")
         s_div = opset.reshape(sx, (sx.shape[0], 1), False)
         xs = x / s_div
@@ -315,6 +308,7 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         compiled_model = ov.compile_model(model)
 
         return lambda parameters: compiled_model(parameters)[0]
+
 
 class OVAWQAlgoAlgoBackend(AWQAlgoBackend, OVWeightCompressionAlgoBackend):
     @staticmethod
