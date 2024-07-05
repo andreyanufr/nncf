@@ -272,16 +272,6 @@ class AWQ(Algorithm):
                                                                              cur_scale.shape, gacts.shape, fp32_out.shape)
                             models_cache[model_k] = awq_pipeline
 
-                    if True:
-                        g_compressed_weighs_, g_c_scale_, g_c_zp_ = do_integer_quantization(
-                            gweight * cur_scale, reduction_axis, awq_config
-                        )
-                        g_decompressed_weighs = do_dequantization(g_compressed_weighs_, g_c_scale_, g_c_zp_)
-                        sacts = gacts / fns.unsqueeze(cur_scale, 1)
-
-                        cur_out = fns.matmul(g_decompressed_weighs, sacts)
-                        cur_diff_ = fns.mean(fns.abs(cur_out - fp32_out))
-
                     if g_c_zp is None:
                         cur_diff = awq_pipeline([cur_w.data, g_c_scale.data, cur_scale.data, gacts.data, fp32_out.data])
                     else:

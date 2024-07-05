@@ -243,7 +243,7 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
             result = clamp * s
 
         if return_nodes:
-            return parameters, result, clamp
+            return parameters, result
 
         model = ov.Model([result], parameters)
 
@@ -289,8 +289,7 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
     ):
         (
             parameters,
-            qw,
-            clamp
+            qw
         ) = OVWeightCompressionAlgoBackend.get_compress_decompress_pipeline(
             config, w_shape, s_shape, z_p_shape, True
         )
@@ -311,7 +310,7 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         parameters.append(x)
         parameters.append(y)
 
-        model = ov.Model([clamp], parameters)
+        model = ov.Model([result], parameters)
 
         compiled_model = ov.compile_model(model)
 
