@@ -196,9 +196,24 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
                     converted_const, converted_zero_point, name=f"{const_node_name}/zero_point/subtract"
                 )
 
-            scale_const = opset.constant(
-                compressed_weight.scale.data, dtype=scale_dtype, name=f"{const_node_name}/scale"
-            )
+            if isinstance(compressed_weight.scale, tuple):
+                scale_scale_const = opset.constant(
+                    compressed_weight.scale[0].data, dtype=ov.Type.f16, name=f"{const_node_name}/scale_scale"
+                )
+                scale_const = opset.constant(
+                    compressed_weight.scale[1].data, dtype=ov.Type.f16, name=f"{const_node_name}/scale_lp"
+                )
+                
+                scale_const = opset.multiply(
+                    scale_const,
+                    scale_scale_const,
+                    name=f"{const_node_name}/scale",
+                )
+            else:
+                scale_const = opset.constant(
+                    compressed_weight.scale.data, dtype=ov.Type.f16, name=f"{const_node_name}/scale"
+                )
+
             if scale_dtype != ov.Type.f16:
                 scale_const = opset.convert(scale_const, ov.Type.f16)
 

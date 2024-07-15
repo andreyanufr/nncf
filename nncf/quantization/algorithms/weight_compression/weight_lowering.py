@@ -145,14 +145,23 @@ def calculate_e2m1_scale(weight: Tensor, reduction_axes: ReductionAxes, max_val=
     :param to_e8m0: Defines convert scale to e8m0 or not.
     :return: Scale tensor of float32 type for e2m1 quantization.
     """
-    scale = calculate_nf4_scale(weight, reduction_axes) / max_val
+    fp_scale = calculate_nf4_scale(weight, reduction_axes) / max_val
 
-    scale = fns.log2(scale)
+    scale = fns.log2(fp_scale)
     scale = fns.ceil(scale)
     scale = fns.clip(scale, -127, 127)
     scale = 2**scale
 
-    return scale
+    group_scale = fp_scale / scale
+    group_scale = fns.mean(group_scale, axis=1 if reduction_axes==2 else 0, keepdims=True)
+    
+    diff_e8 = fns.mean((scale - fp_scale)**2)
+    diff_s_e8 = fns.mean((group_scale * scale - fp_scale)**2)
+    print("Scale diff before: ", diff_e8, " after ", diff_s_e8)
+    if diff_e8 < diff_s_e8:
+        print("ERROR")
+
+    return group_scale, scale
 
 
 def calculate_normalized_weight(weight: Tensor, scale: Tensor) -> Tensor:
@@ -163,6 +172,8 @@ def calculate_normalized_weight(weight: Tensor, scale: Tensor) -> Tensor:
     :param scale: Scale tensor used for normalization.
     :return: Normalized weight tensor.
     """
+    if type(scale) is tuple:
+        scale = scale[1]
     if weight.dtype != TensorDataType.float32:
         weight = weight.astype(TensorDataType.float32)
     if scale.dtype != TensorDataType.float32:
