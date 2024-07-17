@@ -35,6 +35,7 @@ from nncf.quantization.algorithms.weight_compression.backend import WeightCompre
 from nncf.quantization.algorithms.weight_compression.config import WeightCompressionConfig
 from nncf.quantization.algorithms.weight_compression.config import WeightCompressionParameters
 from nncf.quantization.algorithms.weight_compression.weight_lowering import compress_weight
+from nncf.quantization.algorithms.weight_compression.weight_lowering import CompressedScale
 from nncf.tensor import Tensor
 from nncf.tensor.definitions import TensorDataType
 
@@ -196,22 +197,30 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
                     converted_const, converted_zero_point, name=f"{const_node_name}/zero_point/subtract"
                 )
 
-            if isinstance(compressed_weight.scale, tuple):
+            if isinstance(compressed_weight.scale, CompressedScale):
                 scale_scale_const = opset.constant(
-                    compressed_weight.scale[0].data, dtype=ov.Type.f16, name=f"{const_node_name}/scale_scale"
+                    compressed_weight.scale.level_hp.data, dtype=ov.Type.f16, name=f"{const_node_name}/scale_hp"
                 )
                 scale_const = opset.constant(
-                    compressed_weight.scale[1].data, dtype=ov.Type.f16, name=f"{const_node_name}/scale_lp"
+                    compressed_weight.scale.level_lp.data, dtype=scale_dtype, name=f"{const_node_name}/scale_lp"
                 )
+                scale_const = opset.convert(scale_const, ov.Type.f16)
                 
                 scale_const = opset.multiply(
                     scale_const,
                     scale_scale_const,
                     name=f"{const_node_name}/scale",
                 )
+                src_shape = compressed_weight.scale.get_src_shape()
+                dst_shape = compressed_weight.scale.get_dst_shape()
+
+                if src_shape != dst_shape:
+                    scale_const = opset.reshape(scale_const, output_shape=dst_shape, special_zero=False)
+                
+                scale_dtype = ov.Type.f16
             else:
                 scale_const = opset.constant(
-                    compressed_weight.scale.data, dtype=ov.Type.f16, name=f"{const_node_name}/scale"
+                    compressed_weight.scale.data, dtype=scale_dtype, name=f"{const_node_name}/scale"
                 )
 
             if scale_dtype != ov.Type.f16:

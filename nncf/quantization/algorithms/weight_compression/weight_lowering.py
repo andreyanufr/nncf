@@ -66,6 +66,66 @@ CENTER_OF_NF4_QUANTILES = np.array(
     dtype=np.float32,
 )
 
+@dataclass
+class CompressedScale:
+    """
+    Two level scale for scale compression
+    params: level_hp: high precision level fp16/fp32
+    params: level_lp: low precision level fp4/fp8
+    """
+    level_hp: Tensor
+    level_lp: Tensor
+
+    @staticmethod
+    def reshape(scale: Tensor, reduction_axes: int, group_size: int):
+        channel_size = scale.shape[reduction_axes]
+        if channel_size % group_size != 0:
+            raise nncf.ValidationError(f"Channel size {channel_size} should be divisible by size of group {group_size}")
+
+        num_groups_per_channel = channel_size // group_size
+        shape = list(scale.shape)  # [a1, r, a2] - "r" refers to number of channels along reduction axis
+        shape[reduction_axes : reduction_axes + 1] = (num_groups_per_channel, group_size)
+        scale = scale.reshape(shape)
+        return scale
+
+    @staticmethod
+    def create(origin_scale: Tensor, compressed_scale: Tensor, group_size: int, reduction_axes: int):
+        if group_size == -1:
+            level_hp = origin_scale / compressed_scale
+            level_hp = fns.max(level_hp, axis=1 if reduction_axes==2 else 0, keepdims=True)
+        else:
+            origin_scale = CompressedScale.reshape(origin_scale, reduction_axes - 1, group_size)
+            compressed_scale = CompressedScale.reshape(compressed_scale, reduction_axes - 1, group_size)
+            level_hp = origin_scale / compressed_scale
+            level_hp = fns.max(level_hp, axis=2 if reduction_axes==2 else 1, keepdims=True)
+        return CompressedScale(level_hp, compressed_scale)
+
+    @property
+    def scale(self):
+        """
+        Returns:
+            tensor: decompressed scale in high precision
+        """
+        s = self.level_hp * self.level_lp
+        if len(s.shape) == 4:
+            if s.shape[-1] == 1:
+                s = s.reshape([s.shape[0], -1, 1])
+            else:
+                s = s.reshape([-1, 1, s.shape[0]])
+        return s
+    
+    def get_src_shape(self):
+        return self.level_lp.shape
+    
+    def get_dst_shape(self):
+        shape = self.get_src_shape()
+        if len(shape) == 4:
+            if shape[-1] == 1:
+                return [shape[0], shape[1] * shape[2], 1]
+            else:
+                return [shape[0] * shape[1], shape[2], shape[3]]
+        else:
+            return shape
 
 @dataclass
 class CompressedWeight:
@@ -148,20 +208,13 @@ def calculate_e2m1_scale(weight: Tensor, reduction_axes: ReductionAxes, max_val=
     fp_scale = calculate_nf4_scale(weight, reduction_axes) / max_val
 
     scale = fns.log2(fp_scale)
-    scale = fns.ceil(scale)
+    scale = fns.round(scale)
     scale = fns.clip(scale, -127, 127)
     scale = 2**scale
 
-    group_scale = fp_scale / scale
-    group_scale = fns.mean(group_scale, axis=1 if reduction_axes==2 else 0, keepdims=True)
-    
-    diff_e8 = fns.mean((scale - fp_scale)**2)
-    diff_s_e8 = fns.mean((group_scale * scale - fp_scale)**2)
-    print("Scale diff before: ", diff_e8, " after ", diff_s_e8)
-    if diff_e8 < diff_s_e8:
-        print("ERROR")
+    scale = CompressedScale.create(fp_scale, scale, 16, reduction_axes)
 
-    return group_scale, scale
+    return scale
 
 
 def calculate_normalized_weight(weight: Tensor, scale: Tensor) -> Tensor:
@@ -172,8 +225,9 @@ def calculate_normalized_weight(weight: Tensor, scale: Tensor) -> Tensor:
     :param scale: Scale tensor used for normalization.
     :return: Normalized weight tensor.
     """
-    if type(scale) is tuple:
-        scale = scale[1]
+    if isinstance(scale, CompressedScale):
+        scale = scale.scale
+
     if weight.dtype != TensorDataType.float32:
         weight = weight.astype(TensorDataType.float32)
     if scale.dtype != TensorDataType.float32:
