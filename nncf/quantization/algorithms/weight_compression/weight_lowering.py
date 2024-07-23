@@ -75,6 +75,7 @@ class CompressedScale:
     """
     level_hp: Tensor
     level_lp: Tensor
+    fp_scale: Tensor
 
     @staticmethod
     def reshape(scale: Tensor, reduction_axes: int, group_size: int):
@@ -90,6 +91,7 @@ class CompressedScale:
 
     @staticmethod
     def create(origin_scale: Tensor, compressed_scale: Tensor, group_size: int, reduction_axes: int):
+        fp_scale = origin_scale.clone()
         if group_size == -1:
             level_hp = origin_scale / compressed_scale
             level_hp = fns.max(level_hp, axis=1 if reduction_axes==2 else 0, keepdims=True)
@@ -97,8 +99,8 @@ class CompressedScale:
             origin_scale = CompressedScale.reshape(origin_scale, reduction_axes - 1, group_size)
             compressed_scale = CompressedScale.reshape(compressed_scale, reduction_axes - 1, group_size)
             level_hp = origin_scale / compressed_scale
-            level_hp = fns.max(level_hp, axis=2 if reduction_axes==2 else 1, keepdims=True)
-        return CompressedScale(level_hp, compressed_scale)
+            level_hp = fns.mean(level_hp, axis=2 if reduction_axes==2 else 1, keepdims=True)
+        return CompressedScale(level_hp, compressed_scale, fp_scale)
 
     @property
     def scale(self):
@@ -106,14 +108,17 @@ class CompressedScale:
         Returns:
             tensor: decompressed scale in high precision
         """
-        s = self.level_hp * self.level_lp
+        if self.fp_scale is not None:
+            s = self.fp_scale
+        else:
+            s = self.level_hp * self.level_lp
         if len(s.shape) == 4:
             if s.shape[-1] == 1:
                 s = s.reshape([s.shape[0], -1, 1])
             else:
                 s = s.reshape([-1, 1, s.shape[0]])
         return s
-    
+
     def get_src_shape(self):
         return self.level_lp.shape
     
@@ -208,11 +213,11 @@ def calculate_e2m1_scale(weight: Tensor, reduction_axes: ReductionAxes, max_val=
     fp_scale = calculate_nf4_scale(weight, reduction_axes) / max_val
 
     scale = fns.log2(fp_scale)
-    scale = fns.round(scale)
+    scale = fns.ceil(scale)
     scale = fns.clip(scale, -127, 127)
     scale = 2**scale
 
-    scale = CompressedScale.create(fp_scale, scale, 16, reduction_axes)
+    scale = CompressedScale.create(fp_scale, scale, 8, reduction_axes)
 
     return scale
 
