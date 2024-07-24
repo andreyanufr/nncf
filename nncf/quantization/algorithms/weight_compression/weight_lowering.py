@@ -66,6 +66,7 @@ CENTER_OF_NF4_QUANTILES = np.array(
     dtype=np.float32,
 )
 
+
 @dataclass
 class CompressedScale:
     """
@@ -73,6 +74,7 @@ class CompressedScale:
     params: level_hp: high precision level fp16/fp32
     params: level_lp: low precision level fp4/fp8
     """
+
     level_hp: Tensor
     level_lp: Tensor
     fp_scale: Tensor
@@ -93,13 +95,15 @@ class CompressedScale:
     def create(origin_scale: Tensor, compressed_scale: Tensor, group_size: int, reduction_axes: int):
         fp_scale = origin_scale.clone()
         if group_size == -1:
-            level_hp = origin_scale / compressed_scale
-            level_hp = fns.max(level_hp, axis=1 if reduction_axes==2 else 0, keepdims=True)
+            origin_scale_avg = fns.mean(origin_scale, axis=1 if reduction_axes == 2 else 0, keepdims=True)
+            compressed_scale_avg = fns.mean(compressed_scale, axis=1 if reduction_axes == 2 else 0, keepdims=True)
+            level_hp = origin_scale_avg / compressed_scale_avg
         else:
             origin_scale = CompressedScale.reshape(origin_scale, reduction_axes - 1, group_size)
             compressed_scale = CompressedScale.reshape(compressed_scale, reduction_axes - 1, group_size)
-            level_hp = origin_scale / compressed_scale
-            level_hp = fns.mean(level_hp, axis=2 if reduction_axes==2 else 1, keepdims=True)
+            origin_scale_avg = fns.mean(origin_scale, axis=2 if reduction_axes == 2 else 1, keepdims=True)
+            compressed_scale_avg = fns.mean(compressed_scale, axis=2 if reduction_axes == 2 else 1, keepdims=True)
+            level_hp = origin_scale_avg / compressed_scale_avg
         return CompressedScale(level_hp, compressed_scale, fp_scale)
 
     @property
@@ -108,10 +112,10 @@ class CompressedScale:
         Returns:
             tensor: decompressed scale in high precision
         """
-        if self.fp_scale is not None:
-            s = self.fp_scale
-        else:
-            s = self.level_hp * self.level_lp
+        # if self.fp_scale is not None:
+        #     s = self.fp_scale
+        # else:
+        s = self.level_hp * self.level_lp
         if len(s.shape) == 4:
             if s.shape[-1] == 1:
                 s = s.reshape([s.shape[0], -1, 1])
@@ -121,7 +125,7 @@ class CompressedScale:
 
     def get_src_shape(self):
         return self.level_lp.shape
-    
+
     def get_dst_shape(self):
         shape = self.get_src_shape()
         if len(shape) == 4:
@@ -131,6 +135,7 @@ class CompressedScale:
                 return [shape[0] * shape[1], shape[2], shape[3]]
         else:
             return shape
+
 
 @dataclass
 class CompressedWeight:

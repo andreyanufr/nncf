@@ -34,8 +34,8 @@ from nncf.quantization.algorithms.weight_compression.backend import AWQAlgoBacke
 from nncf.quantization.algorithms.weight_compression.backend import WeightCompressionAlgoBackend
 from nncf.quantization.algorithms.weight_compression.config import WeightCompressionConfig
 from nncf.quantization.algorithms.weight_compression.config import WeightCompressionParameters
-from nncf.quantization.algorithms.weight_compression.weight_lowering import compress_weight
 from nncf.quantization.algorithms.weight_compression.weight_lowering import CompressedScale
+from nncf.quantization.algorithms.weight_compression.weight_lowering import compress_weight
 from nncf.tensor import Tensor
 from nncf.tensor.definitions import TensorDataType
 
@@ -205,7 +205,7 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
                     compressed_weight.scale.level_lp.data, dtype=scale_dtype, name=f"{const_node_name}/scale_lp"
                 )
                 scale_const = opset.convert(scale_const, ov.Type.f16)
-                
+
                 scale_const = opset.multiply(
                     scale_const,
                     scale_scale_const,
@@ -216,7 +216,7 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
 
                 if src_shape != dst_shape:
                     scale_const = opset.reshape(scale_const, output_shape=dst_shape, special_zero=False)
-                
+
                 scale_dtype = ov.Type.f16
             else:
                 scale_const = opset.constant(
