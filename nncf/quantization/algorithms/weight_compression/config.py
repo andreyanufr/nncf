@@ -37,7 +37,9 @@ class WeightCompressionConfig:
         """
         :return: number of bits that is used for storing a single quantized value in the given mode.
         """
-        return 8 if self.mode in [CompressWeightsMode.INT8_SYM, CompressWeightsMode.INT8_ASYM] else 4
+        return 8 if self.mode in [CompressWeightsMode.INT8_SYM,
+                                  CompressWeightsMode.INT8_ASYM,
+                                  CompressWeightsMode.INT8_PALETTIZATION] else 4
 
     def is_integer(self):
         """

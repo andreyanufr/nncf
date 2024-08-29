@@ -94,6 +94,7 @@ class CompressWeightsMode(StrEnum):
     NF4 = "nf4"
     INT8 = "int8"  # Deprecated mode
     E2M1 = "e2m1"
+    INT8_PALETTIZATION = "int8_palettization"
 
 
 @api(canonical_alias="nncf.SensitivityMetric")

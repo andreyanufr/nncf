@@ -200,13 +200,21 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
             compression_dtype = ov.Type.i8
         elif compression_config.mode == CompressWeightsMode.INT8_ASYM:
             compression_dtype = ov.Type.u8
+        elif compression_config.mode == CompressWeightsMode.INT8_PALETTIZATION:
+            compression_dtype = ov.Type.u4
         else:
             raise ValueError(f"{compression_config.mode.value} is not supported.")
 
         original_shape = weight.shape
         compressed_weight = compress_weight(weight, reduction_axes, compression_config, layer_scales, layer_zero_points)
 
-        compressed_const = opset.constant(compressed_weight.tensor.data, dtype=compression_dtype, name=const_node_name)
+        if compression_config.mode == CompressWeightsMode.INT8_PALETTIZATION:
+            lut = opset.constant(compressed_weight.lut, dtype=ov.Type.i8, name=const_node_name + "_lut")
+            indices = opset.constant(compressed_weight.tensor.data, dtype=compression_dtype, name=const_node_name)
+            axis = opset.constant(0, dtype=ov.Type.i32, name=const_node_name + "_axis")
+            compressed_const = opset.gather(lut, indices, axis)
+        else:
+            compressed_const = opset.constant(compressed_weight.tensor.data, dtype=compression_dtype, name=const_node_name)
         converted_const = opset.convert(compressed_const, ov.Type.f16)
         if compressed_weight.zero_point is not None and compressed_weight.tensor.dtype == TensorDataType.uint8:
             zero_point_const = opset.constant(

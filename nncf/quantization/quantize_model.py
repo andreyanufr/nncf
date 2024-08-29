@@ -522,7 +522,7 @@ def compress_weights(
     if ratio is None:
         ratio = 1
     if group_size is None:
-        group_size = 128
+        group_size = 128 if not mode == CompressWeightsMode.INT8_PALETTIZATION else -1
     if all_layers is None:
         all_layers = False
     if awq is None:

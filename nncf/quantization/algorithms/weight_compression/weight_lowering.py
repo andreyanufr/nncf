@@ -9,8 +9,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Optional, Tuple
+
 
 import numpy as np
 
@@ -63,6 +65,7 @@ class CompressedWeight:
     tensor: Tensor
     scale: Tensor
     zero_point: Optional[Tensor] = None
+    lut: Optional[Tensor] = None
 
 
 def reshape_weight_for_grouped_quantization(
@@ -377,6 +380,132 @@ def do_int_quantization(
     return compressed_weights, scale, zero_point
 
 
+def palettization_clustering(compressed_weights, n_centers=2**4, n_iters=100):
+    lut = np.array([0] * n_centers)
+    min_val = int(fns.min(compressed_weights).item())
+    max_val = int(fns.max(compressed_weights).item())
+    offset = -min_val
+    n_elems = max_val - min_val + 1
+    hist = np.zeros(n_elems, dtype=np.int32)
+
+    important_elements = [min_val, max_val]
+    if min_val < 0 and max_val > 0:
+        important_elements.append(0)
+
+    res = np.unique(compressed_weights.data, return_index=False, return_inverse=False, return_counts=True)
+    uniq_data = res[0]
+    freq = res[1]
+
+    for i in range(len(uniq_data)):
+        hist[uniq_data[i] + offset] = freq[i]
+
+    #initialization
+    step = (max_val - min_val) / n_centers
+    for i in range(n_centers):
+        lut[i] = int(min_val + i * step)
+
+    idxs = np.zeros(n_elems, dtype=np.int32)
+
+    for n_iter in range(n_iters):
+        centers = np.zeros_like(lut)
+        denum = np.zeros_like(lut)
+        
+        for i in range(n_elems):
+            val = i - offset
+            freq = hist[i]
+            
+            min_dist = n_elems
+            idx = -1
+            for i_center in range(n_centers):
+                dist = abs(lut[i_center] - val)
+                if dist < min_dist:
+                    min_dist = dist
+                    idx = i_center
+            
+            centers[idx] += val * freq
+            denum[idx] += freq
+            idxs[i] = idx
+
+        for i_center in range(n_centers):
+            centers[i_center] = int(centers[i_center] / max(1, denum[i_center]))
+
+        for i in range(len(important_elements)):
+            val = important_elements[i]
+            min_dist = n_elems
+            idx = -1
+            for i_center in range(n_centers):
+                dist = abs(lut[i_center] - val)
+                if dist < min_dist:
+                    min_dist = dist
+                    idx = i_center
+            centers[idx] = val
+
+        lut = centers.copy()
+
+    compressed_weights.data[:] = idxs[compressed_weights.data + offset]
+
+    return compressed_weights, lut
+
+def do_palettization(
+    weight: Tensor,
+    reduction_axes: ReductionAxes,
+    config: WeightCompressionConfig,
+    precomputed_scale: Tensor = None,
+    precomputed_zero_point: Tensor = None,
+    invert_scale=False,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """
+    The method quantizes the given weights to integer data type uniformly in accordance with the compression config.
+    The config defines a quantization mode:
+        INT8_SYM mode refers to signed int8 symmetric weight compression without zero point -
+            quantization to [-128, 127] range.
+        INT8_ASYM mode refers to unsigned int8 asymmetric weight compression with a typical non-fixed zero-point -
+            quantization to [0, 255] range.
+        INT4_ASYM mode refers to unsigned int4 asymmetric weight compression with a typical non-fixed zero-point -
+            quantization to [0, 15] range.
+        INT4_SYM mode refers to signed int4 symmetric weight compression without zero point -
+            quantization to [-8, 7] range.
+        NF4 or E2M1 mode requires a dedicated procedure and it is not supported in this method.
+    One of the parameter of compression config is a group size. Quantization is per-channel, if group size equals to -1,
+    otherwise it's per-group, i.e. group size number of weights in the channel dimension share quantization parameters
+    (scales).
+
+    :param weight: Weight array to compress.
+    :param reduction_axes: Axes, along which to reduce (collect) different statistics (e.g. min, max).
+    :param config: Information on how to compress (quantize) a specific weight.
+    :param precomputed_scale: Precomputed scale.
+    :param precomputed_zero_point: Precomputed zero point.
+    :param invert_scale: applies inversion for scale and then multiply by weights instead of division.
+        Need as reference implementation for OV.
+    :return: The compressed weights tensor of uint8 (asymmetric mode) or int8 (symmetric mode) type,
+        scale tensor of float32 type and zero point tensor of int32 type that was used for its quantization.
+    """
+    assert config.is_integer(), "The function supports integer quantization only"
+    group_size = config.group_size
+
+    int_config = deepcopy(config)
+
+    if weight.dtype != TensorDataType.float32:
+        weight = weight.astype(TensorDataType.float32)
+
+    if group_size != -1:
+        # weights are reshaped from [a1, r, a2] to [a1, r//gs, gs, a2]
+        weight, reduction_axes = reshape_weight_for_grouped_quantization(weight, reduction_axes, group_size)
+
+    if precomputed_zero_point is None or precomputed_zero_point is None:
+        scale, zero_point = calculate_integer_quantization_params(weight, reduction_axes, int_config)
+    if precomputed_scale is not None:
+        scale = precomputed_scale
+    if precomputed_zero_point is not None:
+        zero_point = precomputed_zero_point
+
+    compressed_weights = calculate_quantized_weight(weight, int_config, scale, zero_point, invert_scale)
+
+    compressed_weights, lut = palettization_clustering(compressed_weights)
+    
+    return compressed_weights, scale, zero_point, lut
+
+
 def get_integer_quantization_error(
     weight: Tensor, reduction_axes: ReductionAxes, config: WeightCompressionConfig
 ) -> float:
@@ -426,6 +555,13 @@ def compress_weight(
             weight, reduction_axes, config.group_size, precomputed_scale, config.mode
         )
         return CompressedWeight(compressed_weight, scale)
+    elif config.mode == CompressWeightsMode.INT8_PALETTIZATION:
+        compressed_weight, scale, zero_point, lut = do_palettization(
+            weight, reduction_axes, config, precomputed_scale, precomputed_zero_point
+        )
+
+        return CompressedWeight(compressed_weight, scale, zero_point, lut)
+
     compressed_weight, scale, zero_point = do_int_quantization(
         weight, reduction_axes, config, precomputed_scale, precomputed_zero_point
     )
