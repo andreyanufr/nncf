@@ -223,6 +223,8 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         else:
             raise ValueError(f"{compression_config.mode.value} is not supported.")
 
+        print(const_node_name, compression_dtype)
+
         original_shape = weight.shape
         compressed_weight = compress_weight(weight, reduction_axes, compression_config, layer_scales, layer_zero_points)
 
