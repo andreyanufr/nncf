@@ -247,7 +247,14 @@ class WeightCompression(Algorithm):
         else:
             criterion_cls = MIXED_PRECISION_CRITERIA.get(self._sensitivity_metric)
             criterion = criterion_cls(
-                model, graph, self._backend_entity, ratio_defining_params, primary_config, self._ratio, activations
+                model,
+                graph,
+                self._backend_entity,
+                ratio_defining_params,
+                primary_config,
+                self._ratio,
+                activations,
+                self._advanced_parameters.mixed_precision_params,
             )
             criterion.assign_mixed_precision()
 

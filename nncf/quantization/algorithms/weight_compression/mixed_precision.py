@@ -16,6 +16,7 @@ from nncf.common.graph import NNCFGraph
 from nncf.common.logging.track_progress import track
 from nncf.common.utils.registry import Registry
 from nncf.parameters import SensitivityMetric
+from nncf.quantization.advanced_parameters import AdvancedMixedPrecisionParameters
 from nncf.quantization.algorithms.weight_compression.backend import WeightCompressionAlgoBackend
 from nncf.quantization.algorithms.weight_compression.config import WeightCompressionConfig
 from nncf.quantization.algorithms.weight_compression.config import WeightCompressionParameters
@@ -46,6 +47,7 @@ class MixedPrecisionCriterion:
         primary_config: WeightCompressionConfig,
         ratio: float,
         activations: Optional[Dict[str, List[Tensor]]] = None,
+        advanced_parameters: Optional[AdvancedMixedPrecisionParameters] = None,
     ):
         """
         :param model: The model.
@@ -64,6 +66,9 @@ class MixedPrecisionCriterion:
         self._activations = activations
         self._primary_config = primary_config
         self._ratio = ratio
+        self._advanced_parameters = (
+            advanced_parameters if advanced_parameters is not None else AdvancedMixedPrecisionParameters()
+        )
 
     @abstractmethod
     def _calc_sensitivity(self) -> List[float]:
@@ -103,9 +108,14 @@ class DataFreeCriterion(MixedPrecisionCriterion):
         weight = self._backend_entity.get_weight(
             weight_param.node_with_weight, weight_param.weight_port_id, self._model, self._graph
         )
-        backup_config = weight_param.compression_config
+        if self._advanced_parameters.use_primary_precision:
+            backup_config = self._primary_config
+        else:
+            backup_config = weight_param.compression_config
         reduction_axes = weight_param.reduction_axes
-        int_error = get_integer_quantization_error(weight, reduction_axes, backup_config)
+        int_error = get_integer_quantization_error(
+            weight, reduction_axes, backup_config, self._advanced_parameters.use_relative_error
+        )
         eps = fns.finfo(weight).eps
         return 1 / (int_error + eps)
 

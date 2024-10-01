@@ -376,7 +376,7 @@ def do_int_quantization(
 
 
 def get_integer_quantization_error(
-    weight: Tensor, reduction_axes: ReductionAxes, config: WeightCompressionConfig
+    weight: Tensor, reduction_axes: ReductionAxes, config: WeightCompressionConfig, use_relative_eror: bool = False
 ) -> float:
     """
     Calculates a quantity characterizing the difference between floating point weights and fake quantized
@@ -385,6 +385,7 @@ def get_integer_quantization_error(
     :param weight: Weight array to compress.
     :param reduction_axes: Axes, along which to reduce (collect) different statistics (e.g. min, max).
     :param config: Information on how to compress (quantize) a specific weight.
+    :param use_relative_eror: Defines return absolute or relative error
     :return: The quantity characterizing the error of integer quantization.
     """
     orig_shape = weight.shape
@@ -397,8 +398,11 @@ def get_integer_quantization_error(
 
     decompressed_weight = decompressed_weight.reshape(orig_shape)
     diff = (decompressed_weight - weight) ** 2
-    layer_err = fns.mean(diff, axis=reduction_axes)
-    val = fns.max(layer_err)
+    if use_relative_eror:
+        val = fns.mean(diff) / fns.mean(weight**2)
+    else:
+        layer_err = fns.mean(diff, axis=reduction_axes)
+        val = fns.max(layer_err)
     return val.item()
 
 

@@ -343,6 +343,17 @@ class AdvancedLoraCorrectionParameters:
 
 @api()
 @dataclass
+class AdvancedMixedPrecisionParameters:
+    """
+    Contains advanced parameters for MixedPrecision algorithm.
+    """
+
+    use_relative_error: bool = False
+    use_primary_precision: bool = False
+
+
+@api()
+@dataclass
 class AdvancedCompressionParameters:
     """
     Contains advanced parameters for compression algorithms.
@@ -366,6 +377,8 @@ class AdvancedCompressionParameters:
 
     # Advanced Lora Correction algorithm parameters
     lora_correction_params: AdvancedLoraCorrectionParameters = field(default_factory=AdvancedLoraCorrectionParameters)
+
+    mixed_precision_params: AdvancedMixedPrecisionParameters = field(default_factory=AdvancedMixedPrecisionParameters)
 
 
 @api()
