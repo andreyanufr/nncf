@@ -117,7 +117,11 @@ class DataFreeCriterion(MixedPrecisionCriterion):
             weight, reduction_axes, backup_config, self._advanced_parameters.use_relative_error
         )
         eps = fns.finfo(weight).eps
-        return 1 / (int_error + eps)
+
+        if self._advanced_parameters.use_primary_precision:
+            return int_error
+        else:
+            return 1 / (int_error + eps)
 
     def _calc_score_per_node(self, weight_param: WeightCompressionParameters) -> float:
         weight_score = self._calc_weight_sensitivity(weight_param)
