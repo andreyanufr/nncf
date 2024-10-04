@@ -515,9 +515,7 @@ def compress_weights(
     if backend == BackendType.OPENVINO:
         from nncf.openvino.quantization.quantize_model import compress_weights_impl as ov_compress_weights_impl
 
-        if any((awq, scale_estimation, gptq, lora_correction)) and (
-            dataset is None or mode == CompressWeightsMode.E2M1
-        ):
+        if any((awq, gptq, lora_correction)) and (dataset is None or mode == CompressWeightsMode.E2M1):
             raise AttributeError(
                 "Scale estimation, AWQ, GPTQ or Lora Correction algorithm is defined, "
                 "but dataset is None or mode is E2M1."

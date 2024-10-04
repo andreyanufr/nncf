@@ -401,8 +401,9 @@ def get_integer_quantization_error(
     if use_relative_eror:
         val = fns.mean(diff) / fns.mean(weight**2)
     else:
-        layer_err = fns.mean(diff, axis=reduction_axes)
-        val = fns.max(layer_err)
+        # layer_err = fns.mean(diff, axis=reduction_axes)
+        # val = fns.max(layer_err)
+        val = fns.mean(diff)
     return val.item()
 
 
