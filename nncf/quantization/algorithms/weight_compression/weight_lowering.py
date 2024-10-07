@@ -419,6 +419,8 @@ def compress_weight(
     :param precomputed_zero_point: Precomputed zero point.
     :return: The compressed weight and decompression parameters as instance of CompressedWeight
     """
+    if not type(weight) is Tensor:
+        weight = Tensor(weight)
     if not config.is_integer():
         compressed_weight, scale = calculate_normalized_weight_and_fp4_scale(
             weight, reduction_axes, config.group_size, precomputed_scale, config.mode
