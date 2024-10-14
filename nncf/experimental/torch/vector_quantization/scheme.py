@@ -70,21 +70,50 @@ def table_rectification(table : torch.Tensor, gt, indexes):
     
     gt = gt / max_gt * max_t
     
+    qw = table[indexes, :]
+    dists = torch.mean((qw - gt)**2, dim=-1)
+    
+    #print("Before: ", dists.mean())
+
     new_table = table.clone()
 
     # iteration over number of vectors
     for i in range(table.shape[0]):
+        if i == 0:
+            continue
         mask = (i == indexes).float()
+        dist_i = dists * mask
+        dist_i = (torch.max(dist_i) - dist_i) * mask
+        dist_denum = torch.sum(dist_i)
+        
+        if dist_denum < 0.00001:
+            continue
+        
+        dist_i = dist_i / dist_denum
+
         denom = torch.sum(mask)
         if denom < 1.0:
             continue
-        new_vec = torch.sum(gt * mask.unsqueeze(-1), dim=(0,1)) / denom
+        #new_vec = torch.sum(gt * mask.unsqueeze(-1), dim=(0,1,2)) / denom
+        new_vec = torch.sum(gt * dist_i.unsqueeze(-1), dim=(0,1,2))
         new_vec = new_vec.squeeze()
+        #max_t = torch.max(table[i, :])
         new_vec = new_vec / torch.max(new_vec) * max_t
         new_vec = torch.round(torch.clamp(new_vec, min=0.0, max=255.0))
+        #new_vec[torch.where(table[i, :] == 43)] = 43
         new_table[i, :] = new_vec
 
+    qw = new_table[indexes, :]
+    dists = torch.mean((qw - gt)**2, dim=-1)
+    
+    #print("After: ", dists.mean())
+ 
     return new_table
+
+
+def normalize(w, scale, max_q):
+    q = torch.clamp(scale * w, min=0.0, max=max_q)
+    return q
 
 
 def compress_decompress_fixed(weight: torch.Tensor):
@@ -109,34 +138,28 @@ def compress_decompress_fixed(weight: torch.Tensor):
     group_idxs = []
     group_scales = []
 
+    qv = q_vectors_256.clone()
+    for i in range(qv.shape[0]):
+        v = qv[i, :]
+        if torch.max(v) != 43:
+            v = torch.round(v / torch.max(v) * 43)
+            qv[i, :] = v
+
     for i in range(n_sub_groups):
         cur_w = gweight[..., i*group_size:(i+1)*group_size]
         cur_s = cur_w.max(dim=-1, keepdim=True)[0]
         mask = cur_s < torch.finfo(torch.float32).eps
         mask = mask.float()
-        cur_i_s = (2 * k_max  - 1) / (cur_s + mask)
+        tmp = torch.count_nonzero(mask)
+        #print(tmp)
         
-        #q = torch.round(torch.clamp(0.5 * (cur_i_s * cur_w - 1), min=0.0, max=2.0)).to(dtype=torch.uint8)
-        q = torch.clamp(0.5 * (cur_i_s * cur_w - 1), min=0.0, max=2.0)
-        # u = q[..., 0] << 0
-        
-        # for i in range(1, 8):
-        #     u |= (q[..., i] << 2*i)
-        
-        # idxs = grid_map[u.long()]
+        cur_i_s = q_max / (cur_s + mask)#(2 * k_max  - 1) / (cur_s + mask)
+        q = normalize(cur_w, cur_i_s, q_max)
 
         origin_shape = q.shape
-        idxs_dist = pairwise_dist(q_vectors_256.float(), q.reshape(q.shape[0]*q.shape[1],-1).float())
-        idxs_dist = idxs_dist.reshape(origin_shape[0], origin_shape[1])
-        # if torch.any(idxs) < -1:
-        #     print("ERROR")
-
-        idxs = idxs_dist #torch.where(idxs > -1, idxs, idxs_dist)
-        
+        idxs = pairwise_dist(qv.float(), q.reshape(q.shape[0]*q.shape[1],-1).float())
+        idxs = idxs.reshape(origin_shape[0], origin_shape[1])
         group_idxs.append(idxs)
- 
-        # cur_s = cur_s #(1.0 - mask) / (cur_s + mask)
-        # cur_s = cur_s / super_scale  # < 1.0
 
         cur_s = torch.round(torch.clamp(sub_scale_max * cur_s, min=0, max=sub_scale_max)) # 4bit scale
 
@@ -148,7 +171,7 @@ def compress_decompress_fixed(weight: torch.Tensor):
     super_scale = super_scale / q_max
     super_scale = super_scale / sub_scale_max
     
-    qw = q_vectors_256[group_idxs, :]
+    qw = qv[group_idxs, :]
     qw = qw * group_scales
     qw = qw.reshape(qw.shape[0], qw.shape[1], -1)
     qw = qw * super_scale
@@ -180,85 +203,72 @@ def compress_decompress_vq(weight: torch.Tensor, rectify=True):
     
     super_scale = gweight.max(dim=-1, keepdim=True)[0]
     gweight = gweight / super_scale
-    
-    #print(torch.unique(super_scale.flatten()))
 
     k_max = 3
     q_max = 43 #255 #43
     sub_scale_max = 15
-    
-    # grid = q_vectors_256
-    # grid_map = init_grid_256()
 
-    n_iters = 3
+    n_iters = 10
+
     qv = q_vectors_256.clone()
+    for i in range(qv.shape[0]):
+        v = qv[i, :]
+        if torch.max(v) != 43:
+            v = torch.round(v / torch.max(v) * 43)
+            qv[i, :] = v
     
+    qs = []
+    group_scales = []
+
     for n_i in range(n_iters):
         group_idxs = []
-        group_scales = []
-        rectified_tables = []
-
-        for i in range(n_sub_groups):
-            cur_w = gweight[..., i*group_size:(i+1)*group_size]
-            cur_s = cur_w.max(dim=-1, keepdim=True)[0]
-            mask = cur_s < torch.finfo(torch.float32).eps
-            mask = mask.float()
-            cur_i_s = (2 * k_max  - 1) / (cur_s + mask)
-            
-            #q = torch.round(torch.clamp(0.5 * (cur_i_s * cur_w - 1), min=0.0, max=2.0)).to(dtype=torch.uint8)
-            q = torch.clamp(0.5 * (cur_i_s * cur_w - 1), min=0.0, max=2.0)
-            # u = q[..., 0] << 0
-            
-            # for i in range(1, 8):
-            #     u |= (q[..., i] << 2*i)
-            
-            # idxs = grid_map[u.long()]
-
-            origin_shape = q.shape
-            idxs_dist = pairwise_dist(qv.float(), q.reshape(q.shape[0]*q.shape[1],-1).float())
-            idxs_dist = idxs_dist.reshape(origin_shape[0], origin_shape[1])
-            # if torch.any(idxs) < -1:
-            #     print("ERROR")
-
-            idxs = idxs_dist #torch.where(idxs > -1, idxs, idxs_dist)
-            
-            group_idxs.append(idxs)
-    
-            # cur_s = cur_s #(1.0 - mask) / (cur_s + mask)
-            # cur_s = cur_s / super_scale  # < 1.0
-
-            cur_s = torch.round(torch.clamp(sub_scale_max * cur_s, min=0, max=sub_scale_max)) # 4bit scale
-
-            group_scales.append(cur_s)
-            
-            rectified_tables.append(table_rectification(q_vectors_256, q, idxs))
         
 
-        qv_new = torch.round(torch.mean(torch.stack(rectified_tables).float(), dim=0))
-        qv = torch.round((3 * qv + qv_new) / 4)
-        q_max = torch.max(qv)
-
-        group_idxs = []
-        group_scales = []
-
         for i in range(n_sub_groups):
-            cur_w = gweight[..., i*group_size:(i+1)*group_size]
-            cur_s = cur_w.max(dim=-1, keepdim=True)[0]
-            mask = cur_s < torch.finfo(torch.float32).eps
-            mask = mask.float()
-            cur_i_s = (2 * k_max  - 1) / (cur_s + mask)
-            q = torch.clamp(0.5 * (cur_i_s * cur_w - 1), min=0.0, max=2.0)
+            if n_i == 0:
+                cur_w = gweight[..., i*group_size:(i+1)*group_size]
+                cur_s = cur_w.max(dim=-1, keepdim=True)[0]
+                mask = cur_s < torch.finfo(torch.float32).eps
+                mask = mask.float()
+                cur_i_s = q_max / (cur_s + mask)#(2 * k_max  - 1) / (cur_s + mask)
+                q = normalize(cur_w, cur_i_s, q_max)
 
-            origin_shape = q.shape
-            idxs_dist = pairwise_dist(qv.float(), q.reshape(q.shape[0]*q.shape[1],-1).float())
-            idxs_dist = idxs_dist.reshape(origin_shape[0], origin_shape[1])
-            idxs = idxs_dist
+                origin_shape = q.shape
+                idxs = pairwise_dist(qv.float(), q.reshape(q.shape[0]*q.shape[1],-1).float())
+                idxs = idxs.reshape(origin_shape[0], origin_shape[1])
+                group_idxs.append(idxs)
+                qs.append(q)
+                cur_s = torch.round(torch.clamp(sub_scale_max * cur_s, min=0, max=sub_scale_max)) # 4bit scale
+                group_scales.append(cur_s)
+            else:
+                q = qs[i]
+                origin_shape = q.shape
+                idxs_dist = pairwise_dist(qv.float(), q.reshape(q.shape[0]*q.shape[1],-1).float())
+                idxs_dist = idxs_dist.reshape(origin_shape[0], origin_shape[1])
+                idxs = idxs_dist #torch.where(idxs > -1, idxs, idxs_dist)
+                group_idxs.append(idxs)
+
+
+        if n_i + 1 != n_iters:
+            groups_idxs = torch.stack(group_idxs, dim=-1)
+            qss = torch.stack(qs, dim=-2)
+            qv_new = table_rectification(qv, qss, groups_idxs)
+            #qv_new = torch.round(qw_new)
+            #qv = torch.round((3 * qv + qv_new) / 4)
+            #qv = torch.round((qv + qv_new) / 2)
+            qv = torch.round(qv_new)
+            q_max = torch.max(qv)
+            group_idxs = []
+            #group_scales = []
+
+            for i in range(n_sub_groups):
+                q = qs[i]
+                origin_shape = q.shape
+                idxs_dist = pairwise_dist(qv.float(), q.reshape(q.shape[0]*q.shape[1],-1).float())
+                idxs_dist = idxs_dist.reshape(origin_shape[0], origin_shape[1])
+                idxs = idxs_dist
+                group_idxs.append(idxs)
             
-            group_idxs.append(idxs)
-            cur_s = torch.round(torch.clamp(sub_scale_max * cur_s, min=0, max=sub_scale_max)) # 4bit scale
-
-            group_scales.append(cur_s)
-
     group_idxs = torch.stack(group_idxs, dim=-1)    
     group_scales = torch.stack(group_scales, dim=2)
 
@@ -303,14 +313,14 @@ def compress_llama(model):
         for name, layer in model.named_modules():
             if isinstance(layer, nn.Linear):
                 weight = layer.weight
-                if 'k_proj' in name or 'o_proj' in name or 
+                if 'k_proj' in name or 'o_proj' in name:
                 # if 'v_proj' in name:
                 #     import numpy as np
                 #     np_name = "/home/aanuf/proj/int4_with_data/fp4/v_proj.npy"
                 #     npw = layer.weight.data.cpu().numpy()
                 #     np.save(np_name, npw)
-                #     print(name)
-                #     print('VQ')
+                    print(name)
+                    print('VQ')
                     layer.weight.data[:] = compress_decompress_vq(weight)
                 else:
                     layer.weight.data[:] = compress_decompress_int8(weight)
