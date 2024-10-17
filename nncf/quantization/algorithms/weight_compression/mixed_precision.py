@@ -91,6 +91,12 @@ class MixedPrecisionCriterion:
                 break
             weight_param.compression_config = self._primary_config
             num_weights_in_4bit += weight_param.num_weights
+        
+
+        for index in indexes_of_layers_in_ascending_order_of_scores:
+            weight_param = self._weight_params[index]
+            if weight_param.compression_config.num_bits == 8:
+                print("\"" + weight_param.weight_name+"\",")
 
 
 @MIXED_PRECISION_CRITERIA.register(SensitivityMetric.WEIGHT_QUANTIZATION_ERROR)
@@ -117,6 +123,7 @@ class DataFreeCriterion(MixedPrecisionCriterion):
         scores = []
         for weight_param in track(self._weight_params, description="Mixed-Precision assignment"):
             scores.append(self._calc_score_per_node(weight_param))
+            print("\"" + weight_param.weight_name+"\"", ":", scores[-1], ",")
         return scores
 
 
