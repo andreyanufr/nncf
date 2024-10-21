@@ -22,12 +22,12 @@ def compress_phi_example():
 def compress_llama_example():
     model_id = "meta-llama/Meta-Llama-3-8B-Instruct"
 
-    model = AutoModelForCausalLM.from_pretrained(model_id)
+    model = AutoModelForCausalLM.from_pretrained(model_id)#, device_map="cuda:1", torch_dtype=torch.float16)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
 
     compress_llama(model.model)
 
-    dst_path = "/home/aanuf/proj/int4_with_data/ov_meta-llama/Meta-Llama-3-8B-Instruct/pt_mixed_842_cb_256"
+    dst_path = "/home/aanuf/proj/int4_with_data/ov_meta-llama/Meta-Llama-3-8B-Instruct/pt_mixed_842_cb_256_no_scale"
 
     model.save_pretrained(dst_path)
     tokenizer.save_pretrained(dst_path)

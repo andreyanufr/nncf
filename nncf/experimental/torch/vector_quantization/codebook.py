@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 
 q_vectors_256 = torch.tensor(
     [
@@ -274,3 +275,10 @@ def get_packed_abs_grid_4096(scale=127):
     # for i in range(4096):
     #     print(cba[i, :])
     return cba
+
+
+def get_initial_array():
+    name = "/home/aanuf/libs/nncf_aa/nncf/experimental/torch/vector_quantization/cba.npy"
+    res = np.load(name)
+    res = torch.from_numpy(res)
+    return res

@@ -3,10 +3,13 @@ import torch
 import torch.nn as nn
 from codebook import q_vectors_256
 from codebook import get_packed_abs_grid_4096
+from scheme_signed_codebook import compress_by_signed_notebook
+from utils import pairwise_dist, table_rectification_fast
 
 from nncf.quantization.algorithms.weight_compression import weight_lowering
 
 q_vectors_4096 = get_packed_abs_grid_4096()
+prev = None
 
 # 2.5625 bpw
 class GroupParams:
@@ -66,19 +69,6 @@ def compress_decompress_int4(weight):
 
     return dweight.data
 
-
-def pairwise_dist(xyz1, xyz2, normalize=True):
-    if normalize:
-        xyz1 = xyz1 / torch.norm(xyz1, dim=-1, keepdim=True)
-        xyz2 = xyz2 / torch.norm(xyz2, dim=-1, keepdim=True)
-    
-    r_xyz1 = torch.sum(xyz1 * xyz1, dim=1, keepdim=True)  # (B,N,1)
-    r_xyz2 = torch.sum(xyz2 * xyz2, dim=1, keepdim=True)  # (B,M,1)
-    mul = torch.matmul(xyz2, xyz1.permute(1, 0))         # (B,M,N)
-    dist = r_xyz2 - 2 * mul + r_xyz1.permute(1, 0)       # (B,M,N)
-    return torch.argmin(dist, dim=-1)
-
-
 def table_rectification(table : torch.Tensor, gt, indexes):
     max_t = torch.max(table)
     max_gt = torch.max(gt)
@@ -124,36 +114,6 @@ def table_rectification(table : torch.Tensor, gt, indexes):
  
     return new_table
 
-
-
-def table_rectification_fast(table : torch.Tensor, gt, indexes):    
-    qw = table[indexes, :]
-    dists = torch.mean((qw - gt)**2, dim=-1)
-    
-    print("Before: ", dists.mean())
-
-    new_table = table.clone()
-    denums = []
-    # iteration over number of vectors
-    for i in range(table.shape[0]):
-        mask = (i == indexes)
-        if not torch.any(mask):
-            continue
-        mask = mask.float()
-        denom = torch.sum(mask)
-        if denom < 1.0:
-            continue
-        denums.append(denom.item())
-        new_vec = torch.sum(gt * mask.unsqueeze(-1), dim=(0,1,2)) / denom
-        new_vec = new_vec.squeeze()
-        new_vec = torch.round(torch.clamp(new_vec, min=0.0, max=127))
-        new_table[i, :] = new_vec
-
-    qw = new_table[indexes, :]
-    dists = torch.mean((qw - gt)**2, dim=-1)
-    print("After: ", dists.mean())
- 
-    return new_table
 
 
 def table_rectification_group(table : torch.Tensor, gt, indexes):
@@ -210,7 +170,7 @@ def normalize(w, scale, max_q):
 
 
 def compress_decompress_fixed(weight: torch.Tensor):
-    out_ch, out_ch = weight.shape
+    out_ch, in_ch = weight.shape
     super_group_size = 256
     group_size = 8
     n_sub_groups = super_group_size // group_size
@@ -343,11 +303,17 @@ def compress_decompress_vq_codebook_per_tensor_4096(weight: torch.Tensor):
     super_scale = gweight.max(dim=-1, keepdim=True)[0]
     gweight = gweight / super_scale
 
-    n_iters = 10
+    n_iters = 20
 
-    qv = q_vectors_4096.clone()
-    q_max = qv.max()
+    qv = q_vectors_4096.clone().to(weight.device)
     
+    # global prev
+    # if not prev is None:
+    #     qv = prev #(qv + prev) // 2
+    #qv = q_vectors_256.clone()
+    #qv = torch.round(qv / qv.max() * 127)
+    q_max = 127 #qv.max()
+
     qs = []
 
     for n_i in range(n_iters):
@@ -364,21 +330,34 @@ def compress_decompress_vq_codebook_per_tensor_4096(weight: torch.Tensor):
             idxs = idxs.reshape(origin_shape[0], origin_shape[1])
             group_idxs.append(idxs)
 
+        if n_i == 5:
+            scores = [0] * qv.shape[0]
+            group_idxs = torch.stack(group_idxs, dim=-1)
+            for i in range(qv.shape[0]):
+                scores[i] = torch.count_nonzero(group_idxs == i)
+            top_idxs = torch.topk(torch.tensor(scores), 256)[1]
+            qv = qv[top_idxs, :]
+            group_idxs = []
+            for i in range(n_sub_groups):
+                idxs = pairwise_dist(qv.float(), qs[i].reshape(q.shape[0]*q.shape[1],-1).float(), normalize=False)    
+                idxs = idxs.reshape(origin_shape[0], origin_shape[1])
+                group_idxs.append(idxs)
+
         if n_i + 1 != n_iters:
-            groups_idxs = torch.stack(group_idxs, dim=-1)
-            qss = torch.stack(qs, dim=-2)
+            groups_idxs = torch.stack(group_idxs, dim=-1) # [32][4096, 16]
+            qss = torch.stack(qs, dim=-2) # [32][4096, 16, 8]
             qv_new = table_rectification_fast(qv, qss, groups_idxs)
             qv = torch.round(torch.clamp(qv_new, 0, q_max))
             q_max = torch.max(qv)
-            group_idxs = []
+            #group_idxs = []
 
-            for i in range(n_sub_groups):
-                q = qs[i]
-                origin_shape = q.shape
-                idxs_dist = pairwise_dist(qv.float(), q.reshape(q.shape[0]*q.shape[1],-1).float(), normalize=False)
-                idxs_dist = idxs_dist.reshape(origin_shape[0], origin_shape[1])
-                idxs = idxs_dist
-                group_idxs.append(idxs)
+            # for i in range(n_sub_groups):
+            #     q = qs[i]
+            #     origin_shape = q.shape
+            #     idxs_dist = pairwise_dist(qv.float(), q.reshape(q.shape[0]*q.shape[1],-1).float(), normalize=False)
+            #     idxs_dist = idxs_dist.reshape(origin_shape[0], origin_shape[1])
+            #     idxs = idxs_dist
+            #     group_idxs.append(idxs)
 
     #print(torch.unique(group_idxs))
     group_idxs = torch.stack(group_idxs, dim=-1)
@@ -388,6 +367,8 @@ def compress_decompress_vq_codebook_per_tensor_4096(weight: torch.Tensor):
     qw = qw * super_scale
     qw = qw * signum
     qw = qw.reshape(weight.shape)
+    
+    prev = qv
     
 
     abs_err = torch.mean((weight-qw)**2)
@@ -510,6 +491,7 @@ def compress_decompress_vq_codebook_per_tensor_256(weight: torch.Tensor):
 
 
 def compress_decompress_vq(weight: torch.Tensor, rectify=True):
+    return compress_by_signed_notebook(weight)
     if not rectify:
         #return compress_decompress_fixed_4096(weight)
         return compress_decompress_fixed(weight)
@@ -763,7 +745,7 @@ def compress_llama(model):
                 bits = bit_config[name]
                 print(name, weight.shape, bits)
                 if bits == 2:
-                    layer.weight.data[:] = compress_decompress_vq(weight)
+                    layer.weight.data[:] = compress_decompress_vq(weight.to("cuda:1")).to('cpu')
                 elif bits == 4:
                     layer.weight.data[:] = compress_decompress_int4(weight)
                 else:
