@@ -32,9 +32,9 @@ def pairwise_attn(xyz1, xyz2, normalize=True, alpha=0.01):
 
 
 def table_rectification_fast(table : torch.Tensor, gt, indexes):    
-    qw = table[indexes, :]
-    #dists = torch.mean((qw - gt)**2, dim=-1)
-    #print("Before: ", dists.mean())
+    # qw = table[indexes, :]
+    # dists = torch.mean((qw - gt)**2, dim=-1)
+    # print("Before: ", dists.mean())
     new_table = table.clone()
     denums = []
     # iteration over number of vectors
@@ -42,6 +42,8 @@ def table_rectification_fast(table : torch.Tensor, gt, indexes):
     for i in range(1, len(gt.shape) - 1):
         sum_dim.append(i)
     sum_dim = tuple(sum_dim)
+    scale = new_table.max(dim=1)[0]
+    
     for i in range(table.shape[0]):
         mask = (i == indexes)
         if not torch.any(mask):
@@ -53,6 +55,7 @@ def table_rectification_fast(table : torch.Tensor, gt, indexes):
         denums.append(denom.item())
         new_vec = torch.sum(gt * mask.unsqueeze(-1), dim=sum_dim) / denom
         new_vec = new_vec.squeeze()
+        new_vec = new_vec / new_vec.max() * scale[i]
         new_vec = torch.round(torch.clamp(new_vec, min=0.0, max=127))
         new_table[i, :] = new_vec
 
@@ -68,7 +71,7 @@ def table_rectification(table : torch.Tensor, gt, indexes):
     qw = table[indexes, :]
     dists = torch.mean((qw - gt)**2, dim=-1)
     
-    #print("Before: ", dists.mean())
+    print("Before: ", dists.mean())
 
     new_table = table.clone()
     sum_dim = [0]
@@ -103,6 +106,6 @@ def table_rectification(table : torch.Tensor, gt, indexes):
 
     qw = new_table[indexes, :]
     dists = torch.mean((qw - gt)**2, dim=-1)
-    #print("After: ", dists.mean())
+    print("After: ", dists.mean())
  
     return new_table

@@ -27,7 +27,7 @@ def compress_llama_example():
 
     compress_llama(model.model)
 
-    dst_path = "/home/aanuf/proj/int4_with_data/ov_meta-llama/Meta-Llama-3-8B-Instruct/pt_mixed_842_cb_256_no_scale"
+    dst_path = "/home/aanuf/proj/int4_with_data/ov_meta-llama/Meta-Llama-3-8B-Instruct/pt_mixed_256_8_4096_keep_max"
 
     model.save_pretrained(dst_path)
     tokenizer.save_pretrained(dst_path)
