@@ -792,7 +792,7 @@ def compress_llama(model):
                 bits = bit_config[name]
                 print(name, weight.shape, bits)
                 if bits == 2:
-                    layer.weight.data[:] = compress_decompress_vq(weight.to("cuda:1")).to('cpu')
+                    layer.weight.data[:] = compress_decompress_vq(weight.to("cuda:2")).to('cpu')
                 elif bits == 4:
                     layer.weight.data[:] = compress_decompress_int4(weight)
                 else:

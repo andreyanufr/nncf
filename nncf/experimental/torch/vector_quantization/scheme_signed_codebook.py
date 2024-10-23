@@ -226,12 +226,13 @@ def compress_by_signed_notebook_group_wise(weight: torch.Tensor, super_group_siz
     group_codebook = []
     group_idxs = []
 
-    assert qweights.shape[1] % 8 == 0
+    assert gweight.shape[1] % 8 == 0
 
-    n_steps = qweights.shape[1] // 8
-    
+    n_steps = gweight.shape[1] // 64
+    codebook_group_sz = gweight.shape[1] // n_steps
+
     for i_g in range(n_steps):#gweight.shape[1]):
-        i_gweights = gweight[:, i_g, :]
+        i_gweights = gweight[:, i_g * codebook_group_sz: (i_g + 1) * codebook_group_sz, :]
         i_gweights = i_gweights.reshape(-1, group_size)
         sg = get_signed_groups(i_gweights)
         sg_weight = torch.zeros(n_signs)
@@ -263,9 +264,9 @@ def compress_by_signed_notebook_group_wise(weight: torch.Tensor, super_group_siz
         group_idxs.append(idxs)
     
     qweights = []
-    for i_g in range(gweight.shape[1]):
+    for i_g in range(n_steps):
         i_qweights = group_codebook[i_g][group_idxs[i_g], :]
-        i_qweights = i_qweights.reshape(gweight.shape[0], 1, gweight.shape[2])
+        i_qweights = i_qweights.reshape(gweight.shape[0], codebook_group_sz, gweight.shape[2])
         qweights.append(i_qweights)
     qweights = torch.cat(qweights, dim=1)
 
