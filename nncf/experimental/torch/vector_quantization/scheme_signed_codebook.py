@@ -62,7 +62,7 @@ def test_to_sign():
     print(sq)
 
 
-def get_codebook_attn(weight: torch.Tensor, sign, targe_sz, rectification_iterations=20):
+def get_codebook_attn(weight: torch.Tensor, sign, targe_sz, rectification_iterations=30):
     qv = q_vectors_4096.clone().to(weight.device)
     #qv = torch.round(qv / qv.max() * 127)
     #qv = torch.cat([qv, qv // 2, qv // 4, qv // 8])
@@ -73,14 +73,29 @@ def get_codebook_attn(weight: torch.Tensor, sign, targe_sz, rectification_iterat
     weight = q_max * weight.abs().float()
     
     best_alpha = 0.01
+    iter_shape = weight.shape[0]#qv.shape[0]
+    step = iter_shape
 
-    attn = pairwise_attn(qv.float(), weight, normalize=False, alpha=best_alpha)
+    attn = pairwise_attn(qv.float(), weight[:iter_shape//2, :], normalize=False, alpha=best_alpha)
     scores = torch.sum(attn, dim=0)
-    while 2 * targe_sz < scores.shape[0] and False:
-        top_idxs = torch.topk(scores, scores.shape[0] // 2)[1]
-        qv = qv[top_idxs, :]
-        attn = pairwise_attn(qv.float(), weight, normalize=False, alpha=best_alpha)
-        scores = torch.sum(attn, dim=0) 
+
+    attn = pairwise_attn(qv.float(), weight[iter_shape//2:, :], normalize=False, alpha=best_alpha)
+    scores += torch.sum(attn, dim=0)
+
+    # while iter_shape < weight.shape[0]:
+    #     if iter_shape + 2 * step < weight.shape[0]:
+    #         attn = pairwise_attn(qv.float(), weight[iter_shape:iter_shape+step, :], normalize=False, alpha=best_alpha)
+    #     else:
+    #         attn = pairwise_attn(qv.float(), weight[iter_shape:, :], normalize=False, alpha=best_alpha)
+    #         iter_shape += step
+    #     scores += torch.sum(attn, dim=0)
+    #     iter_shape += step
+    
+    # while 2 * targe_sz < scores.shape[0] and False:
+    #     top_idxs = torch.topk(scores, scores.shape[0] // 2)[1]
+    #     qv = qv[top_idxs, :]
+    #     attn = pairwise_attn(qv.float(), weight, normalize=False, alpha=best_alpha)
+    #     scores = torch.sum(attn, dim=0) 
     top_idxs = torch.topk(scores, targe_sz)[1]
     qv = qv[top_idxs, :]
 
@@ -89,8 +104,8 @@ def get_codebook_attn(weight: torch.Tensor, sign, targe_sz, rectification_iterat
         qv_new = table_rectification_fast(qv, weight, idxs)
         #qv_new = table_rectification(qv, weight, idxs)
         qv = torch.round(torch.clamp(qv_new, 0, q_max))
-        if r_i + 1 < rectification_iterations:
-            idxs = pairwise_dist(qv.float(), weight, normalize=False)
+        #if r_i + 1 < rectification_iterations:
+        idxs = pairwise_dist(qv.float(), weight, normalize=False)
     qv = qv * sign.unsqueeze(0)
     return idxs, qv
 
@@ -156,6 +171,10 @@ def compress_by_signed_notebook(weight: torch.Tensor, super_group_size = 256,
         
     sg_weight /= torch.sum(sg_weight)
     n_per_sg_group = torch.round(target_sz * sg_weight)
+
+    diff = target_sz - torch.sum(n_per_sg_group)
+    if diff != 0:
+        n_per_sg_group[torch.argmax(n_per_sg_group)] += diff
     
     codebook = []
     idxs = torch.zeros(gweight.shape[0]).long().to(weight.device)
@@ -163,8 +182,8 @@ def compress_by_signed_notebook(weight: torch.Tensor, super_group_size = 256,
     for i in range(n_signs):
         i_idxs = torch.where(sg == i)[0]
         gr_weights = gweight[i_idxs, :]
-        #gr_idxs, gr_codebook = get_codebook_attn(gr_weights, i, int(n_per_sg_group[i].item()))
-        gr_idxs, gr_codebook = get_kmeans_codebook(gr_weights, int(n_per_sg_group[i].item()))
+        gr_idxs, gr_codebook = get_codebook_attn(gr_weights, i, int(n_per_sg_group[i].item()))
+        #gr_idxs, gr_codebook = get_kmeans_codebook(gr_weights, int(n_per_sg_group[i].item()))
         idxs[i_idxs] = gr_idxs + offset
         codebook.append(gr_codebook)
         offset += gr_codebook.shape[0]
@@ -207,7 +226,11 @@ def compress_by_signed_notebook_group_wise(weight: torch.Tensor, super_group_siz
     group_codebook = []
     group_idxs = []
 
-    for i_g in range(gweight.shape[1]):
+    assert qweights.shape[1] % 8 == 0
+
+    n_steps = qweights.shape[1] // 8
+    
+    for i_g in range(n_steps):#gweight.shape[1]):
         i_gweights = gweight[:, i_g, :]
         i_gweights = i_gweights.reshape(-1, group_size)
         sg = get_signed_groups(i_gweights)
@@ -215,11 +238,14 @@ def compress_by_signed_notebook_group_wise(weight: torch.Tensor, super_group_siz
 
         for i in range(n_signs):
             sg_weight[i] = torch.count_nonzero(sg == i)
-            #print(i, sg_weight[i])
             
         sg_weight /= torch.sum(sg_weight)
         n_per_sg_group = torch.round(target_sz * sg_weight)
-        
+
+        diff = target_sz - torch.sum(n_per_sg_group)
+        if diff != 0:
+            n_per_sg_group[torch.argmax(n_per_sg_group)] += diff
+
         codebook = []
         idxs = torch.zeros(i_gweights.shape[0]).long().to(weight.device)
         offset = 0

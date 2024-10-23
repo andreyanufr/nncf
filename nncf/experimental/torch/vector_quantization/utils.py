@@ -55,7 +55,7 @@ def table_rectification_fast(table : torch.Tensor, gt, indexes):
         denums.append(denom.item())
         new_vec = torch.sum(gt * mask.unsqueeze(-1), dim=sum_dim) / denom
         new_vec = new_vec.squeeze()
-        new_vec = new_vec / new_vec.max() * scale[i]
+        #new_vec = new_vec / new_vec.max() * scale[i]
         new_vec = torch.round(torch.clamp(new_vec, min=0.0, max=127))
         new_table[i, :] = new_vec
 
@@ -81,8 +81,8 @@ def table_rectification(table : torch.Tensor, gt, indexes):
 
     # iteration over number of vectors
     for i in range(table.shape[0]):
-        if i == 0:
-            continue
+        # if i == 0:
+        #     continue
         mask = (i == indexes).float()
         dist_i = dists * mask
         dist_i = (torch.max(dist_i) - dist_i) * mask
