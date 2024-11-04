@@ -1,9 +1,12 @@
 import sys
+import datasets
+import functools
 import torch
 import torch.nn as nn
 from codebook import q_vectors_256
 from codebook import get_packed_abs_grid_4096
-from scheme_signed_codebook import compress_by_signed_notebook, compress_by_signed_notebook_group_wise, pairwise_attn
+from scheme_signed_codebook import compress_by_signed_notebook, compress_by_signed_notebook_mit_residual
+from scheme_signed_codebook import compress_by_signed_notebook_group_wise, pairwise_attn
 from utils import pairwise_dist, table_rectification_fast
 
 from nncf.quantization.algorithms.weight_compression import weight_lowering
@@ -66,6 +69,11 @@ def compress_decompress_int4(weight):
     dweight = weight_lowering.do_int_dequantization(compressed_weights.tensor, compressed_weights.scale,
                                                     compressed_weights.zero_point, 1)
     #weight_lowering.do_int_quantization()
+    
+    # abs_err = torch.mean((weight - dweight.data)**2)
+    # rel_err = abs_err / torch.mean(weight**2)
+    # print(f"Abs err {abs_err}, rel_err: {rel_err}")
+    # sys.stdout.flush()
 
     return dweight.data
 
@@ -534,18 +542,20 @@ def compress_decompress_vq_codebook_per_tensor_256(weight: torch.Tensor):
     return qw
 
 
-def compress_decompress_vq(weight: torch.Tensor, rectify=True):
-    #return compress_by_signed_notebook(weight)
-    #return compress_by_signed_notebook_group_wise(weight, 128, 8, 2**10)
-    #return compress_by_signed_notebook(weight, 64, 4, 2**8)
-    return compress_by_signed_notebook_group_wise(weight, 64, 4, 2**8)
+def compress_decompress_vq(weight: torch.Tensor, rectify=True, stat=None):
+    #return compress_by_signed_notebook(weight, 64, 8, 2**16, stat=stat)
+    #return compress_by_signed_notebook_group_wise(weight, 64, 8, 2**16, stat=stat)
+    return compress_by_signed_notebook_mit_residual(weight, 64, 4, 2**8, stat)
+    #return compress_by_signed_notebook_mit_residual(weight, 64, 8, 2**12)
+
+    #return compress_by_signed_notebook_group_wise(weight, 64, 4, 256)
     if not rectify:
         #return compress_decompress_fixed_4096(weight)
         return compress_decompress_fixed(weight)
 
     #return compress_decompress_vq_codebook_per_tensor_256(weight)
-    #return compress_decompress_vq_codebook_per_tensor_4096(weight, 64, 4, 16)
-    return compress_decompress_vq_tables(weight)
+    #return compress_decompress_vq_codebook_per_tensor_4096(weight, 64, 8, 2**12)
+    #return compress_decompress_vq_tables(weight)
     
     out_ch, out_ch = weight.shape
     super_group_size = 256
@@ -782,7 +792,13 @@ def compress_phi(model):
                     layer.weight.data[:] = compress_decompress_int8(weight)
 
 
-def compress_llama(model):
+def is_matched(names, layer_name):
+    for name in names:
+        if name in layer_name:
+            return True
+    return False
+
+def compress_llama(model, vq_names, stats=None):
     from llama_config import get_llama_3_8b_instruct_config
     bit_config = get_llama_3_8b_instruct_config(model)
     with torch.no_grad():
@@ -791,8 +807,10 @@ def compress_llama(model):
                 weight = layer.weight
                 bits = bit_config[name]
                 print(name, weight.shape, bits)
-                if bits == 2:
-                    layer.weight.data[:] = compress_decompress_vq(weight.to("cuda:2")).to('cpu')
+                if is_matched(vq_names, name):
+                    name = 'model.' + name
+                    stat = stats[name] if stats is not None and name in stats else None
+                    layer.weight.data[:] = compress_decompress_vq(weight.to("cuda:2"), stat=stat).to('cpu')
                 elif bits == 4:
                     layer.weight.data[:] = compress_decompress_int4(weight)
                 else:
@@ -811,3 +829,41 @@ def compress_llama(model):
                 #     layer.weight.data[:] = compress_decompress_int8(weight)
                 #     #print(name, layer.weight.shape)
                 #     #print('int8')
+
+stats = {}
+def hook(name, layer, input, output):
+    if not name in stats:
+        stats[name] = []
+    stats[name].append(input[0].mean(dim=1))
+
+def compute_stats(model, tokenizer, layer_names, n_samples=64):
+    global stats
+    stats = {}
+    with torch.no_grad():
+        for name, layer in model.named_modules():
+            if isinstance(layer, nn.Linear) and is_matched(layer_names, name):
+                layer.register_forward_hook(
+                    functools.partial(hook, name)
+                )
+
+    dataset = datasets.load_dataset('wikitext', 'wikitext-2-v1', split='train')
+    dataset = dataset.filter(lambda example: len(example["text"]) > 80)
+    
+    for item in dataset:
+        n_samples -= 1
+        text = item['text']
+
+        inputs = tokenizer(text, return_tensors="pt").to(device=model.device)
+        with torch.no_grad():
+            model(**inputs)
+        if n_samples < 0:
+            break
+
+    res = {}
+    for k, v in stats.items():
+        v = torch.cat(v)
+        res[k] = torch.mean(v.abs(), dim=0)#[0]
+
+    stats = {}    
+    
+    return res

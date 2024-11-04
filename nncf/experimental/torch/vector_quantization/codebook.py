@@ -276,6 +276,14 @@ def get_packed_abs_grid_4096(scale=127):
     #     print(cba[i, :])
     return cba
 
+def get_packed_abs_grid_d4():
+    intr = torch.arange(-8, 8)
+    d4 = torch.cartesian_prod(*[intr] * 4).float() + 1/ 2
+    d4m2 = (d4.sum(dim=-1) % 2 == 0)
+
+    d4abs = torch.unique(d4[sorted(torch.where(d4m2)[0])].abs(), dim=0)
+
+    return d4abs
 
 def get_initial_array():
     name = "/home/aanuf/libs/nncf_aa/nncf/experimental/torch/vector_quantization/cba.npy"
