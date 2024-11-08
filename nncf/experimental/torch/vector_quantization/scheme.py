@@ -7,6 +7,7 @@ from codebook import q_vectors_256
 from codebook import get_packed_abs_grid_4096
 from scheme_signed_codebook import compress_by_signed_notebook, compress_by_signed_notebook_mit_residual
 from scheme_signed_codebook import compress_by_signed_notebook_group_wise, pairwise_attn
+from scheme_signed_codebook import compress_by_signed_notebook_group_wise_with_residual
 from utils import pairwise_dist, table_rectification_fast
 
 from nncf.quantization.algorithms.weight_compression import weight_lowering
@@ -544,10 +545,10 @@ def compress_decompress_vq_codebook_per_tensor_256(weight: torch.Tensor):
 
 def compress_decompress_vq(weight: torch.Tensor, rectify=True, stat=None):
     #return compress_by_signed_notebook(weight, 64, 8, 2**16, stat=stat)
-    #return compress_by_signed_notebook_group_wise(weight, 64, 8, 2**16, stat=stat)
-    return compress_by_signed_notebook_mit_residual(weight, 64, 4, 2**8, stat)
+    #return compress_by_signed_notebook_group_wise(weight, 64, 8, 2**14, stat=stat)
+    #return compress_by_signed_notebook_mit_residual(weight, 64, 4, 2**8, stat)
     #return compress_by_signed_notebook_mit_residual(weight, 64, 8, 2**12)
-
+    return compress_by_signed_notebook_group_wise_with_residual(weight, 64, 4, 2**8, stat)
     #return compress_by_signed_notebook_group_wise(weight, 64, 4, 256)
     if not rectify:
         #return compress_decompress_fixed_4096(weight)
@@ -792,13 +793,16 @@ def compress_phi(model):
                     layer.weight.data[:] = compress_decompress_int8(weight)
 
 
-def is_matched(names, layer_name):
+def is_matched(names, layer_name, exclude=[]):
+    for name in exclude:
+        if name in layer_name:
+            return False
     for name in names:
         if name in layer_name:
             return True
     return False
 
-def compress_llama(model, vq_names, stats=None):
+def compress_llama(model, vq_names, exclude=[], stats=None):
     from llama_config import get_llama_3_8b_instruct_config
     bit_config = get_llama_3_8b_instruct_config(model)
     with torch.no_grad():
@@ -807,7 +811,7 @@ def compress_llama(model, vq_names, stats=None):
                 weight = layer.weight
                 bits = bit_config[name]
                 print(name, weight.shape, bits)
-                if is_matched(vq_names, name):
+                if is_matched(vq_names, name, exclude):
                     name = 'model.' + name
                     stat = stats[name] if stats is not None and name in stats else None
                     layer.weight.data[:] = compress_decompress_vq(weight.to("cuda:2"), stat=stat).to('cpu')
@@ -862,7 +866,7 @@ def compute_stats(model, tokenizer, layer_names, n_samples=64):
     res = {}
     for k, v in stats.items():
         v = torch.cat(v)
-        res[k] = torch.mean(v.abs(), dim=0)#[0]
+        res[k] = [torch.max(v.abs(), dim=0)[0].float(), v.float()]
 
     stats = {}    
     

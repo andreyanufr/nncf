@@ -74,28 +74,31 @@ def test_to_sign():
 
 
 def get_codebook_kmeans(weight: torch.Tensor, sign, targe_sz, normalize=True,
-                        sample_weight=None):
+                        sample_weight=None, init='k-means++'):
     q_max = 127 #qv.max()
 
     if sign is not None:
         sign = to_sign(sign, weight.shape[-1]).to(weight.device)
         weight = weight.abs().float()
-    else:
-        sign = torch.Tensor([1.0]).to(weight.device)
+    # else:
+    #     sign = torch.Tensor([1.0]).to(weight.device)
 
     if normalize:
         weight = q_max * weight
     weight = weight.round()
 
-    kmeans = KMeans(n_clusters=targe_sz, random_state=0, init='k-means++', n_init="auto", max_iter=1000).fit(weight.cpu().numpy(),
+    kmeans = KMeans(n_clusters=targe_sz, random_state=0, init=init, n_init="auto", max_iter=1000).fit(weight.cpu().numpy(),
                                                                                                sample_weight=sample_weight)
     #kmeans = GaussianMixture(n_components=targe_sz).fit(weight.cpu().numpy())
     #kmeans = MeanShift().fit(weight.cpu().numpy())
     #kmeans = Birch(n_clusters=targe_sz).fit(weight.cpu().numpy())
 
     qv = torch.tensor(kmeans.cluster_centers_).to(weight.device)
-    qv = torch.round(torch.clamp(qv, 0, q_max))
-    qv = qv * sign.unsqueeze(0)
+    if sign is not None:
+        qv = torch.round(torch.clamp(qv, 0, q_max))
+        qv = qv * sign.unsqueeze(0)
+    else:
+        qv = torch.round(torch.clamp(qv, -q_max, q_max))
 
     idxs = torch.tensor(kmeans.labels_).to(weight.device).long()
 
@@ -263,7 +266,7 @@ def compress_by_signed_notebook(weight: torch.Tensor, super_group_size = 256,
     out_ch, in_ch = weight.shape
     importance = None
     if stat is not None:
-        importance = torch.ones_like(weight) * stat.unsqueeze(0).to(weight.device)
+        importance = torch.ones_like(weight) * stat[0].unsqueeze(0).to(weight.device)
 
     n_sub_groups = super_group_size // group_size
     assert out_ch % super_group_size == 0
@@ -275,9 +278,9 @@ def compress_by_signed_notebook(weight: torch.Tensor, super_group_size = 256,
         importance = importance / denum
     
     super_scale = gweight.abs().max(dim=-1, keepdim=True)[0]
-    mask = (gweight >= 0).long()
-    mask = torch.sum(mask, dim=-1, keepdim=True)
-    super_scale[torch.where(mask < super_group_size // 2)] *= -1
+    # mask = (gweight >= 0).long()
+    # mask = torch.sum(mask, dim=-1, keepdim=True)
+    # super_scale[torch.where(mask < super_group_size // 2)] *= -1
     gweight = gweight / super_scale
     
     super_group_shape = gweight.shape
@@ -307,7 +310,8 @@ def compress_by_signed_notebook(weight: torch.Tensor, super_group_size = 256,
         i_idxs = torch.where(sg == i)[0]
         gr_weights = gweight[i_idxs, :]
         if importance is not None:
-            gr_importance = importance[i_idxs, :].mean(dim=1).cpu().numpy()
+            #gr_importance = importance[i_idxs, :].mean(dim=1).cpu().numpy()
+            gr_importance = importance[i_idxs, :].cpu().numpy()
             #gr_idxs, gr_codebook = get_codebook_attn_weighted(gr_weights, i, int(n_per_sg_group[i].item()), gr_importance)
             gr_idxs, gr_codebook = get_codebook_kmeans(gr_weights, i, int(n_per_sg_group[i].item()),
                                                        sample_weight=gr_importance)
@@ -321,21 +325,76 @@ def compress_by_signed_notebook(weight: torch.Tensor, super_group_size = 256,
     
     codebook = torch.cat(codebook)
     
+    idxs, codebook = get_codebook_kmeans(gweight, None,
+                                        target_sz, sample_weight=importance, init=codebook.cpu().numpy())
+    
     #idxs, codebook = get_codebook_kmeans(gweight, None, target_sz, True, importance.mean(dim=1).cpu().numpy())
 
-    super_scale = super_scale / 127
+    
     qweights = codebook[idxs, :]
     qweights = qweights.reshape(super_group_shape[0], super_group_shape[1], super_group_shape[2] // group_size, -1)
     qweights = qweights.reshape(super_group_shape[0], super_group_shape[1], -1)
 
-    # gweight = gweight.reshape(super_group_shape[0], super_group_shape[1], super_group_shape[2] // group_size, -1)
-    # gweight = gweight.reshape(super_group_shape[0], super_group_shape[1], -1)
-    
-    # num = torch.sum(torch.mul(qweights, gweight * super_scale), dim=-1, keepdim=True)
-    # denum = torch.sum(torch.mul(qweights, qweights), dim=-1, keepdim=True)
-    # super_scale_ = num / denum
+    gweight = gweight.reshape(super_group_shape[0], super_group_shape[1], super_group_shape[2] // group_size, -1)
+    gweight = gweight.reshape(super_group_shape[0], super_group_shape[1], -1)
 
-    qweights = qweights * super_scale
+    if importance is not None:
+        importance = importance.reshape(super_group_shape[0], super_group_shape[1], super_group_shape[2] // group_size, -1)
+        importance = importance.reshape(super_group_shape[0], super_group_shape[1], -1)
+        # denum = torch.abs(importance).sum(axis=-1, keepdim=True)
+        # importance = importance / denum
+        # denum = qweights
+        # denum[torch.where(denum == 0)] = 1.0
+        # gweight = gweight * super_scale
+        # super_scale_ = gweight / denum
+        # super_scale_ = super_scale_ * importance
+        # super_scale_ = super_scale_.sum(axis=-1, keepdim=True)
+
+        gweight = gweight * super_scale
+        wqweights = importance * qweights
+        num = torch.sum(torch.mul(wqweights, gweight), dim=-1, keepdim=True)
+        denum = torch.sum(torch.mul(wqweights, qweights), dim=-1, keepdim=True)
+        super_scale_ = num / denum
+        
+        X = stat[1]
+        X = X.reshape(-1, X.shape[1]//super_group_size, super_group_size).permute(1, 2, 0).to(gweight.device)
+
+        Yfp = torch.matmul(gweight.permute(1, 0, 2), X)
+        Yq = torch.matmul((qweights * super_scale_).permute(1, 0, 2), X)
+        diff = torch.abs(Yfp - Yq).mean(dim=-1, keepdim=True).permute(1, 0, 2) + 0.1 * torch.abs(qweights * super_scale_ - gweight).mean(dim=-1, keepdim=True)
+        
+        print("Diff before: ", diff.mean())
+        scale_steps = 10
+        res_scale = super_scale_.clone()
+        
+        if verbose:
+            abs_err = torch.mean((weight - (qweights * super_scale_).reshape(weight.shape))**2)
+            rel_err = abs_err / torch.mean(weight**2)
+            print(f"before SE Abs err {abs_err}, rel_err: {rel_err}")
+            sys.stdout.flush()
+        
+        for scale_step in range(-scale_steps, scale_steps + 1):
+            factor = 1.0 - 0.01 * scale_step
+            scaled_scale = factor * (super_scale / 127)
+
+            Yq = torch.matmul((qweights * scaled_scale).permute(1, 0, 2), X)
+            diff_cur = torch.abs(Yfp - Yq).mean(dim=-1, keepdim=True).permute(1, 0, 2) + 0.1 * torch.abs(qweights * scaled_scale - gweight).mean(dim=-1, keepdim=True) + 1e-5
+            
+            mask = diff_cur < diff
+            
+            res_scale[mask] = scaled_scale[mask]
+            diff[mask] = diff_cur[mask]
+        
+        print("Diff after: ", diff.mean())
+        
+        super_scale_ = res_scale.clone()         
+    else:    
+        num = torch.sum(torch.mul(qweights, gweight * super_scale), dim=-1, keepdim=True)
+        denum = torch.sum(torch.mul(qweights, qweights), dim=-1, keepdim=True)
+        super_scale_ = num / denum
+
+    super_scale = super_scale / 127 
+    qweights = qweights * super_scale_
     qweights = qweights.reshape(weight.shape)
 
     if verbose:
@@ -410,6 +469,10 @@ def compress_by_signed_notebook_mit_residual(weight: torch.Tensor, super_group_s
     
     codebook = torch.cat(codebook)
 
+    idxs, codebook = get_codebook_kmeans(gweight, None,
+                                         target_sz, sample_weight=importance, init=codebook.cpu().numpy())
+
+    #codebook = torch.from_numpy(codebook)
     super_scale = super_scale / 127
     qweights = codebook[idxs, :]
 
@@ -420,10 +483,11 @@ def compress_by_signed_notebook_mit_residual(weight: torch.Tensor, super_group_s
             residual = residual.reshape(super_group_shape[0], super_group_shape[1], super_group_shape[2] // group_size, -1)
             residual = residual.reshape(super_group_shape[0], super_group_shape[1], -1)
             residual = residual.reshape(-1, 8)
-            
-            importance = importance.reshape(super_group_shape[0], super_group_shape[1], super_group_shape[2] // group_size, -1)
-            importance = importance.reshape(super_group_shape[0], super_group_shape[1], -1)
-            importance = importance.reshape(-1, 8)
+
+            if importance is not None:
+                importance = importance.reshape(super_group_shape[0], super_group_shape[1], super_group_shape[2] // group_size, -1)
+                importance = importance.reshape(super_group_shape[0], super_group_shape[1], -1)
+                importance = importance.reshape(-1, 8)
 
         sg = get_signed_groups(residual)
         n_per_sg_group = torch.ones(n_signs)
@@ -475,111 +539,85 @@ def compress_by_signed_notebook_mit_residual(weight: torch.Tensor, super_group_s
 
 
 def compress_by_signed_notebook_group_wise(weight: torch.Tensor, super_group_size = 256,
-                                group_size = 8, target_sz=2**14, stat=None):
+                                group_size = 8, target_sz=2**14, stat=None, per_rows=True):
     out_ch, in_ch = weight.shape
     n_sub_groups = super_group_size // group_size
     
     res = []
 
-    ratio = max(in_ch // out_ch, 1)
-    
-    group_size_2 = 8 * super_group_size * ratio
-    n_iters = in_ch // group_size_2
+    n_iters = max(1, weight.shape[0] * weight.shape[1] // (4096*1024)) # minimal size of llama-3b
 
-    for i in range(n_iters):
-        cur_stat = None
-        if stat is not None:
-            cur_stat = stat[i*group_size_2:(i+1)*group_size_2]
-        gr_w = weight[:, i*group_size_2:(i+1)*group_size_2]
-        qgr_w = compress_by_signed_notebook(gr_w, super_group_size, group_size, target_sz, verbose=False, stat=cur_stat)
-        res.append(qgr_w)
-    
-    res = torch.cat(res, dim=1)
-    
+    if per_rows:
+        step = weight.shape[0] // n_iters
+        for i in range(n_iters):
+            cur_stat = None
+            if stat is not None:
+                cur_stat = stat[0] #[stat[0], stat[1][:, i*step:(i+1)*step]]
+            gr_w = weight[i*step:(i+1)*step, :]
+            qgr_w = compress_by_signed_notebook(gr_w, super_group_size, group_size, target_sz, stat=cur_stat)
+            res.append(qgr_w)
+        res = torch.cat(res, dim=0)
+    else:
+        step = weight.shape[1] // n_iters
+        while step % super_group_size != 0:
+            n_iters -= 1
+            step = weight.shape[1] // n_iters
+        for i in range(n_iters):
+            cur_stat = None
+            if stat is not None:
+                cur_stat = [stat[0][i*step:(i+1)*step], stat[1][:, i*step:(i+1)*step]]
+            gr_w = weight[:, i*step:(i+1)*step]
+            qgr_w = compress_by_signed_notebook(gr_w, super_group_size, group_size, target_sz, stat=cur_stat)
+            res.append(qgr_w)
+        res = torch.cat(res, dim=1)
+
     abs_err = torch.mean((weight - res)**2)
     rel_err = abs_err / torch.mean(weight**2)
     print(f"Abs err {abs_err}, rel_err: {rel_err}")
     sys.stdout.flush()
     
     return res
+
+
+def compress_by_signed_notebook_group_wise_with_residual(weight: torch.Tensor, super_group_size = 256,
+                                group_size = 8, target_sz=2**14, stat=None, per_rows=True):
+    out_ch, in_ch = weight.shape
+    n_sub_groups = super_group_size // group_size
     
-    assert out_ch % super_group_size == 0
-    
-    gweight = weight.reshape(out_ch, -1, super_group_size)
-    
-    super_scale = gweight.abs().max(dim=-1, keepdim=True)[0]
-    mask = (gweight >= 0).long()
-    mask = torch.sum(mask, dim=-1, keepdim=True)
-    super_scale[torch.where(mask < super_group_size // 2)] *= -1
-    gweight = gweight / super_scale
-    
-    super_group_shape = gweight.shape
-    #gweight = gweight.reshape(super_group_shape[0], super_group_shape[1], -1, group_size)
-    
-    n_signs = 2**group_size
-    group_codebook = []
-    group_idxs = []
+    res = []
 
-    assert gweight.shape[1] % 8 == 0
+    n_iters = max(1, weight.shape[0] * weight.shape[1] // (4096*1024)) # minimal size of llama-3b
 
-    n_steps = gweight.shape[1] // 4
-    codebook_group_sz = gweight.shape[1] // n_steps
+    if per_rows:
+        step = weight.shape[0] // n_iters
+        for i in range(n_iters):
+            cur_stat = None
+            if stat is not None:
+                cur_stat = stat[0] #[stat[0], stat[1][:, i*step:(i+1)*step]]
+            gr_w = weight[i*step:(i+1)*step, :]
+            qgr_w = compress_by_signed_notebook_mit_residual(gr_w, super_group_size, group_size, target_sz, stat=cur_stat)
+            res.append(qgr_w)
+        res = torch.cat(res, dim=0)
+    else:
+        step = weight.shape[1] // n_iters
+        while step % super_group_size != 0:
+            n_iters -= 1
+            step = weight.shape[1] // n_iters
+        for i in range(n_iters):
+            cur_stat = None
+            if stat is not None:
+                cur_stat = [stat[0][i*step:(i+1)*step], stat[1][:, i*step:(i+1)*step]]
+            gr_w = weight[:, i*step:(i+1)*step]
+            qgr_w = compress_by_signed_notebook_mit_residual(gr_w, super_group_size, group_size, target_sz, stat=cur_stat)
+            res.append(qgr_w)
+        res = torch.cat(res, dim=1)
 
-    for i_g in range(n_steps):#gweight.shape[1]):
-        i_gweights = gweight[:, i_g * codebook_group_sz: (i_g + 1) * codebook_group_sz, :]
-        i_gweights = i_gweights.reshape(-1, group_size)
-        sg = get_signed_groups(i_gweights)
-        sg_weight = torch.zeros(n_signs)
-
-        for i in range(n_signs):
-            sg_weight[i] = torch.count_nonzero(sg == i)
-            
-        sg_weight /= torch.sum(sg_weight)
-        n_per_sg_group = torch.round(target_sz * sg_weight)
-
-        diff = target_sz - torch.sum(n_per_sg_group)
-        if diff != 0:
-            n_per_sg_group[torch.argmax(n_per_sg_group)] += diff
-
-        codebook = []
-        idxs = torch.zeros(i_gweights.shape[0]).long().to(weight.device)
-        offset = 0
-        for i in range(n_signs):
-            i_idxs = torch.where(sg == i)[0]
-            gr_weights = i_gweights[i_idxs, :]
-            gr_idxs, gr_codebook = get_codebook_attn(gr_weights, i, int(n_per_sg_group[i].item()))
-            #gr_idxs, gr_codebook = get_kmeans_codebook(gr_weights, int(n_per_sg_group[i].item()))
-            idxs[i_idxs] = gr_idxs + offset
-            codebook.append(gr_codebook)
-            offset += gr_codebook.shape[0]
-        
-        codebook = torch.cat(codebook)
-        
-        group_codebook.append(codebook)
-        group_idxs.append(idxs)
-    
-    qweights = []
-    q_max = 127
-    for i_g in range(n_steps):
-        i_qweights = group_codebook[i_g][group_idxs[i_g], :]
-        q_max = max(q_max, group_codebook[i_g].max())
-        i_qweights = i_qweights.reshape(gweight.shape[0], codebook_group_sz, gweight.shape[2])
-        qweights.append(i_qweights)
-    qweights = torch.cat(qweights, dim=1)
-
-    super_scale = super_scale / q_max
-    #qweights = qweights.reshape(super_group_shape[0], super_group_shape[1], super_group_shape[2] // group_size, -1)
-    #qweights = qweights.reshape(super_group_shape[0], super_group_shape[1], -1)
-    qweights = qweights * super_scale
-    qweights = qweights.reshape(weight.shape)
-
-    abs_err = torch.mean((weight - qweights)**2)
+    abs_err = torch.mean((weight - res)**2)
     rel_err = abs_err / torch.mean(weight**2)
-
     print(f"Abs err {abs_err}, rel_err: {rel_err}")
-    #print(torch.sum(n_per_sg_group))
-    return qweights
-
+    sys.stdout.flush()
+    
+    return res
 
 if __name__ == "__main__":
     test_signed_groups()

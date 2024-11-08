@@ -25,32 +25,18 @@ def compress_llama_example():
     model = AutoModelForCausalLM.from_pretrained(model_id)#, device_map="cuda:1", torch_dtype=torch.float16)
     tokenizer = AutoTokenizer.from_pretrained(model_id, max_tokens=128)
 
-    vq_names = ["o_proj", "k_proj"]
-    stats = compute_stats(model, tokenizer, vq_names, 128)
-    compress_llama(model.model, vq_names, stats=stats)
+    vq_names = ["o_proj", "k_proj"]#, "up_proj"]
+    exclude = []#".0.", ".1.", ".2.", ".30.", ".31."]
+    stats = None #compute_stats(model, tokenizer, vq_names, 128)#128)
+    model = model.cpu().to(dtype=torch.float32)
+    compress_llama(model.model, vq_names, exclude, stats=stats)
 
-    dst_path = "/home/aanuf/proj/int4_with_data/ov_meta-llama/Meta-Llama-3-8B-Instruct/pt_mixed_2_16_8_stats"
-
-    model.save_pretrained(dst_path)
-    tokenizer.save_pretrained(dst_path)
-    
-    
-def compress_llama_example_70b():
-    model_id = "meta-llama/Llama-3.1-70B"
-
-    model = AutoModelForCausalLM.from_pretrained(model_id)#, device_map="cuda:1", torch_dtype=torch.float16)
-    tokenizer = AutoTokenizer.from_pretrained(model_id, max_tokens=128)
-
-    vq_names = ["o_proj", "k_proj"]
-    stats = None #compute_stats(model, tokenizer, vq_names, 128)
-    compress_llama(model.model, vq_names, stats=stats)
-
-    dst_path = "/dev/data/aanuf/models/meta-llama_Llama-3.1-70B_pt_mixed_256_4_residual"
+    dst_path = "/home/aanuf/proj/int4_with_data/ov_meta-llama/Meta-Llama-3-8B-Instruct/pt_mixed_2_8_4_group_wise_per_row_k_means_all"#_stats_2d_se"
 
     model.save_pretrained(dst_path)
     tokenizer.save_pretrained(dst_path)
 
 
-compress_llama_example_70b()
+compress_llama_example()
 
 # compress_phi_example()
