@@ -7,6 +7,11 @@ from nncf.tensor import Tensor
 from sklearn.cluster import KMeans
 
 
+
+class WeightVQ:
+    def __init__(codebook, idx_codebook, residual, idx_residual):
+        pass
+
 def get_signed_groups(weight: Tensor):
     assert len(weight.shape) == 2
     sz = weight.shape[1]
@@ -59,8 +64,8 @@ def get_codebook_kmeans(weight: torch.Tensor, sign, targe_sz, normalize=True,
 
 
 
-def compress_by_signed_notebook_with_residual(weight: torch.Tensor, super_group_size = 256,
-                                group_size = 8, target_sz=2**14, stat=None, verbose=True, residual_sz=8):
+def compress_by_signed_notebook_with_residual(weight: torch.Tensor, super_group_size = 64,
+                                group_size = 4, target_sz=2**8, stat=None, verbose=True, residual_sz=8):
     out_ch, _ = weight.shape
     assert out_ch % super_group_size == 0
     
@@ -124,10 +129,16 @@ def compress_by_signed_notebook_with_residual(weight: torch.Tensor, super_group_
     if residual_sz:
         n_signs = 2**8
         residual = gweight * 127 - qweights
+        
+        tmp = qweights[:]
         if residual.shape[-1] != residual_sz:
             residual = residual.reshape(super_group_shape[0], super_group_shape[1], super_group_shape[2] // group_size, -1)
             residual = residual.reshape(super_group_shape[0], super_group_shape[1], -1)
             residual = residual.reshape(-1, residual_sz)
+            
+            tmp = tmp.reshape(super_group_shape[0], super_group_shape[1], super_group_shape[2] // group_size, -1)
+            tmp = tmp.reshape(super_group_shape[0], super_group_shape[1], -1)
+            tmp = tmp.reshape(-1, residual_sz)
 
             if importance is not None:
                 importance = importance.reshape(super_group_shape[0], super_group_shape[1], super_group_shape[2] // group_size, -1)
@@ -155,6 +166,39 @@ def compress_by_signed_notebook_with_residual(weight: torch.Tensor, super_group_
         residual_codebook = torch.cat(residual_codebook)
         
         q_residual = residual_codebook[residual_idxs, :]
+        idxs = torch.where(tmp + q_residual < -128)
+        res_idxs = residual_idxs[idxs[0]]
+        visited = {}
+        for i, ridx in enumerate(res_idxs):
+            y = idxs[0][i]
+            x = idxs[1][i]
+            c = (ridx, x)
+            diff = -128 - (tmp[y, x] + residual_codebook[ridx, x])
+            if c in visited and diff > visited[c]:
+                visited[c] = diff
+            else:
+                visited[c] = diff
+       
+        for k, v in visited.items():
+            residual_codebook[k[0], k[1]] = min(residual_codebook[k[0], k[1]] + v, 0)
+        q_residual = residual_codebook[residual_idxs, :]
+
+        idxs = torch.where(tmp + q_residual > 127)
+        res_idxs = residual_idxs[idxs[0]]
+        visited = {}
+        for i, ridx in enumerate(res_idxs):
+            y = idxs[0][i]
+            x = idxs[1][i]
+            c = (ridx, x)
+            diff = 127 - (tmp[y, x] + residual_codebook[ridx, x])
+            if c in visited and diff > visited[c]:
+                visited[c] = diff
+            else:
+                visited[c] = diff
+       
+        for k, v in visited.items():
+            residual_codebook[k[0], k[1]] = max(residual_codebook[k[0], k[1]] + v, 0)
+        q_residual = residual_codebook[residual_idxs, :]
 
         qweights = qweights.reshape(super_group_shape[0], super_group_shape[1], super_group_shape[2] // group_size, -1)
         qweights = qweights.reshape(super_group_shape[0], super_group_shape[1], -1)
@@ -176,11 +220,14 @@ def compress_by_signed_notebook_with_residual(weight: torch.Tensor, super_group_
         
         print(f"Abs err {abs_err}, rel_err: {rel_err}")
         sys.stdout.flush()
-    return qweights
+    
+    
+    return codebook, idxs, residual_codebook, residual_idxs, super_scale
+    #return qweights
 
 
 def compress_by_signed_notebook_group_wise_with_residual(weight: torch.Tensor, super_group_size = 256,
-                                group_size = 8, target_sz=2**14, stat=None, per_rows=True):    
+                                group_size = 8, target_sz=2**14, stat=None, per_rows=True, verbose=False):  
     res = []
 
     n_iters = max(1, weight.shape[0] * weight.shape[1] // (4096*1024)) # minimal size of llama-3b
@@ -209,8 +256,10 @@ def compress_by_signed_notebook_group_wise_with_residual(weight: torch.Tensor, s
             res.append(qgr_w)
         res = torch.cat(res, dim=1)
 
-    abs_err = torch.mean((weight - res)**2)
-    rel_err = abs_err / torch.mean(weight**2)
-    print(f"Abs err {abs_err}, rel_err: {rel_err}")
-    sys.stdout.flush()
+    if verbose:
+        abs_err = torch.mean((weight - res)**2)
+        rel_err = abs_err / torch.mean(weight**2)
+        print(f"Abs err {abs_err}, rel_err: {rel_err}")
+        sys.stdout.flush()
+
     return res
