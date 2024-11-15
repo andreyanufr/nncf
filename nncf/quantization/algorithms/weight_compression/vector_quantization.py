@@ -9,8 +9,32 @@ from sklearn.cluster import KMeans
 
 
 class WeightVQ:
-    def __init__(codebook, idx_codebook, residual, idx_residual):
-        pass
+    def __init__(self, codebook, idx_codebook, residual, idx_residual, scale, super_group_shape, group_size):
+        self.codebook = codebook
+        self.idx_codebook = idx_codebook
+        self.residual = residual
+        self.idx_residual = idx_residual
+        self.scale = scale
+        self.super_group_shape = super_group_shape
+        self.group_size = group_size
+
+    def decompress(self):
+        res = self.codebook[self.idx_codebook, :]
+        res = res.reshape(self.super_group_shape[0], self.super_group_shape[1], self.super_group_shape[2] // self.group_size, -1)
+        res = res.reshape(self.super_group_shape[0], self.super_group_shape[1], -1)
+        
+        if self.residual:
+            q_residual = self.residual[self.idx_residual, :]
+            q_residual = q_residual.reshape(self.super_group_shape[0], self.super_group_shape[1], self.super_group_shape[2] // 8, -1)
+            q_residual = q_residual.reshape(self.super_group_shape[0], self.super_group_shape[1], -1)
+            res = res + q_residual
+        
+        res = res * self.scale
+        res = res.reshape(res.shape[0], res.shape[1] * res.shape[2])
+
+        return res
+
+
 
 def get_signed_groups(weight: Tensor):
     assert len(weight.shape) == 2
@@ -68,7 +92,6 @@ def compress_by_signed_notebook_with_residual(weight: torch.Tensor, super_group_
                                 group_size = 4, target_sz=2**8, stat=None, verbose=True, residual_sz=8):
     out_ch, _ = weight.shape
     assert out_ch % super_group_size == 0
-    
     gweight = weight.reshape(out_ch, -1, super_group_size)
 
     importance = None
@@ -220,10 +243,8 @@ def compress_by_signed_notebook_with_residual(weight: torch.Tensor, super_group_
         
         print(f"Abs err {abs_err}, rel_err: {rel_err}")
         sys.stdout.flush()
-    
-    
-    return codebook, idxs, residual_codebook, residual_idxs, super_scale
-    #return qweights
+
+    return WeightVQ(codebook, idxs, residual_codebook, residual_idxs, super_scale, super_group_shape, group_size)
 
 
 def compress_by_signed_notebook_group_wise_with_residual(weight: torch.Tensor, super_group_size = 256,
@@ -241,7 +262,6 @@ def compress_by_signed_notebook_group_wise_with_residual(weight: torch.Tensor, s
             gr_w = weight[i*step:(i+1)*step, :]
             qgr_w = compress_by_signed_notebook_with_residual(gr_w, super_group_size, group_size, target_sz, stat=cur_stat, verbose=False)
             res.append(qgr_w)
-        res = torch.cat(res, dim=0)
     else:
         step = weight.shape[1] // n_iters
         while step % super_group_size != 0:
@@ -254,9 +274,11 @@ def compress_by_signed_notebook_group_wise_with_residual(weight: torch.Tensor, s
             gr_w = weight[:, i*step:(i+1)*step]
             qgr_w = compress_by_signed_notebook_with_residual(gr_w, super_group_size, group_size, target_sz, stat=cur_stat, verbose=False)
             res.append(qgr_w)
-        res = torch.cat(res, dim=1)
 
     if verbose:
+        qweights = [qw.decompress() for qw in res]
+        qweights = torch.cat(qweights, dim=0 if per_rows else 1)
+        
         abs_err = torch.mean((weight - res)**2)
         rel_err = abs_err / torch.mean(weight**2)
         print(f"Abs err {abs_err}, rel_err: {rel_err}")
