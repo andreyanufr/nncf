@@ -49,6 +49,10 @@ from nncf.quantization.algorithms.weight_compression.backend import WeightCompre
 from nncf.quantization.algorithms.weight_compression.config import WeightCompressionConfig
 from nncf.quantization.algorithms.weight_compression.config import WeightCompressionParameters
 from nncf.quantization.algorithms.weight_compression.lora_correction import LoraCorrectionAlgorithm
+from nncf.quantization.algorithms.weight_compression.vector_quantization import WeightVQ
+from nncf.quantization.algorithms.weight_compression.vector_quantization import (
+    compress_by_signed_notebook_group_wise_with_residual,
+)
 from nncf.quantization.algorithms.weight_compression.weight_lowering import compress_weight
 from nncf.tensor import Tensor
 from nncf.tensor.definitions import TensorDataType
@@ -214,6 +218,84 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         for node_output_source_port in node_output_source_ports:
             node_output_source_port.replace_source_output(add.output(0))
 
+    def _create_vq_subgraph(
+        self,
+        weight: Tensor,
+        compression_config: WeightCompressionConfig,
+        reduction_axes: Tuple[int, ...],
+        const_node_name: str,
+        weight_port_id: int,
+        const_dtype,
+        should_add_convert_node: bool,
+        layer_scales: Optional[Tensor] = None,
+        layer_zero_points: Optional[Tensor] = None,
+    ):
+        scale_dtype = ov.Type.f16
+        if compression_config.mode == CompressWeightsMode.VQ_3BIT:
+            compression_dtype = ov.Type.i8
+            idxs_dtype = ov.Type.u8
+        else:
+            raise nncf.ParameterNotSupportedError(f"{compression_config.mode.value} is not supported.")
+
+        compressed_weight = compress_by_signed_notebook_group_wise_with_residual(weight, 64, 4, 2**8, verbose=True)
+
+        for i, weigth_vq in enumerate(compressed_weight):
+            # weigth_vq = WeightVQ()
+            codebook = opset.constant(
+                weigth_vq.codebook.data, dtype=compression_dtype, name=const_node_name + f"vq_emb_{i}"
+            )
+            codebook_idxs = opset.constant(
+                weigth_vq.idx_codebook.data, dtype=idxs_dtype, name=const_node_name + f"vq_emb_idx_{i}"
+            )
+            weights = opset.gather(codebook, codebook_idxs, axis=0, name=const_node_name + f"vq_emb_gather_{i}")
+            shape = opset.constant(
+                [weigth_vq.super_group_shape[0], weigth_vq.super_group_shape[1], -1],
+                name=const_node_name + f"vq_emb_shape_0_{i}",
+            )
+            weights = opset.reshape(weights, shape, special_zero=False, name=const_node_name + f"vq_emb_reshape_0_{i}")
+
+            if weigth_vq.residual is not None:
+                residual_codebook = opset.constant(
+                    weigth_vq.residual.data, dtype=compression_dtype, name=const_node_name + f"vq_emb_res_{i}"
+                )
+                residual_idxs = opset.constant(
+                    weigth_vq.idx_residual.data, dtype=idxs_dtype, name=const_node_name + f"vq_emb_res_idx_{i}"
+                )
+                residual_weights = opset.gather(
+                    residual_codebook, residual_idxs, axis=0, name=const_node_name + f"vq_emb_res_gather_{i}"
+                )
+                residual_shape = opset.constant(
+                    [weigth_vq.super_group_shape[0], weigth_vq.super_group_shape[1], -1],
+                    name=const_node_name + f"vq_emb_res_shape_0_{i}",
+                )
+                residual_weights = opset.reshape(
+                    residual_weights,
+                    residual_shape,
+                    special_zero=False,
+                    name=const_node_name + f"vq_emb_res_reshape_0_{i}",
+                )
+                weights = opset.add(weights, residual_weights)
+
+        original_shape = weight.shape
+
+        converted_const = opset.convert(weights, ov.Type.f16)
+        scale_const = opset.constant(weigth_vq.scale.data, dtype=scale_dtype, name=f"{const_node_name}/scale")
+        if scale_dtype != ov.Type.f16:
+            scale_const = opset.convert(scale_const, ov.Type.f16)
+
+        mul = opset.multiply(
+            converted_const,
+            scale_const,
+            name=f"{const_node_name}/fq_weights_{weight_port_id}",
+        )
+
+        if compression_config.group_size != -1:
+            mul = opset.reshape(mul, output_shape=original_shape, special_zero=False)
+
+        if should_add_convert_node:
+            mul = opset.convert(mul, const_dtype, name=f"{const_node_name}/fq_weights_{weight_port_id}/convert")
+        return mul, compressed_weight
+
     def _create_compression_subgraph(
         self,
         weight: Tensor,
@@ -226,6 +308,18 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         layer_scales: Optional[Tensor] = None,
         layer_zero_points: Optional[Tensor] = None,
     ):
+        if compression_config.mode == CompressWeightsMode.VQ_3BIT:
+            return self._create_vq_subgraph(
+                weight,
+                compression_config,
+                reduction_axes,
+                const_node_name,
+                weight_port_id,
+                const_dtype,
+                should_add_convert_node,
+                layer_scales,
+                layer_zero_points,
+            )
         scale_dtype = ov.Type.f16
         if compression_config.mode == CompressWeightsMode.NF4:
             compression_dtype = ov.Type.nf4

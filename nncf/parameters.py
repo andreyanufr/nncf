@@ -94,6 +94,7 @@ class CompressWeightsMode(StrEnum):
     NF4 = "nf4"
     INT8 = "int8"  # Deprecated mode
     E2M1 = "e2m1"
+    VQ_3BIT = "vq_3bit"
 
 
 @api(canonical_alias="nncf.BackupMode")
