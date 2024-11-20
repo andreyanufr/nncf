@@ -76,7 +76,7 @@ def get_codebook_kmeans(
         weight = q_max * weight
     weight = weight.round()
 
-    kmeans = KMeans(n_clusters=targe_sz, random_state=0, init=init, n_init="auto", max_iter=1000).fit(
+    kmeans = KMeans(n_clusters=targe_sz, random_state=0, init=init, n_init="auto" if isinstance(init, str) else 1, max_iter=1000).fit(
         weight.cpu().numpy(), sample_weight=sample_weight
     )
     qv = torch.tensor(kmeans.cluster_centers_).to(weight.device)
@@ -95,8 +95,8 @@ def compress_by_signed_notebook_with_residual(
     weight: torch.Tensor, super_group_size=64, group_size=4, target_sz=2**8, stat=None, verbose=True, residual_sz=8
 ):
     weight = torch.Tensor(weight.data)
-    out_ch, _ = weight.shape
-    assert out_ch % super_group_size == 0
+    out_ch, in_ch = weight.shape
+    assert in_ch % super_group_size == 0
     gweight = weight.reshape(out_ch, -1, super_group_size)
 
     importance = None
@@ -276,9 +276,13 @@ def compress_by_signed_notebook_group_wise_with_residual(
 ):
     res = []
 
-    n_iters = max(1, weight.shape[0] * weight.shape[1] // (4096 * 1024))  # minimal size of llama-3b
+    shape_per_codebook = 4096 * 1024
+    #shape_per_codebook = 614400 -- for debug in small models
+    n_iters = max(1, weight.shape[0] * weight.shape[1] // shape_per_codebook)  # minimal size of llama-3b
 
     if per_rows:
+        while weight.shape[0] % n_iters != 0:
+            n_iters -= 1
         step = weight.shape[0] // n_iters
         for i in range(n_iters):
             cur_stat = None

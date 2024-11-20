@@ -239,8 +239,9 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
 
         compressed_weight = compress_by_signed_notebook_group_wise_with_residual(weight, 64, 4, 2**8, verbose=True)
 
+        weights_to_concat = []
         for i, weigth_vq in enumerate(compressed_weight):
-            # weigth_vq = WeightVQ()
+            #weigth_vq = WeightVQ()
             codebook = opset.constant(
                 weigth_vq.codebook.data, dtype=compression_dtype, name=const_node_name + f"vq_emb_{i}"
             )
@@ -275,22 +276,31 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
                     name=const_node_name + f"vq_emb_res_reshape_0_{i}",
                 )
                 weights = opset.add(weights, residual_weights)
+            
+            converted_const = opset.convert(weights, ov.Type.f16)
+            scale_const = opset.constant(weigth_vq.scale.data, dtype=scale_dtype, name=f"{const_node_name}/scale")
+            
+            if scale_dtype != ov.Type.f16:
+                scale_const = opset.convert(scale_const, ov.Type.f16)
 
-        original_shape = weight.shape
+            weights = opset.multiply(
+                converted_const,
+                scale_const,
+                name=f"{const_node_name}/fq_weights_{weight_port_id}",
+            )
+            
+            shape = list(weights.shape)
+            shape = opset.constant(
+                [shape[0], shape[1] * shape[2]],
+                name=const_node_name + f"w_shape_{i}",
+            )
+            weights = opset.reshape(weights, shape, special_zero=False, name=const_node_name + f"w_reshape_{i}")    
+            weights_to_concat.append(weights)
 
-        converted_const = opset.convert(weights, ov.Type.f16)
-        scale_const = opset.constant(weigth_vq.scale.data, dtype=scale_dtype, name=f"{const_node_name}/scale")
-        if scale_dtype != ov.Type.f16:
-            scale_const = opset.convert(scale_const, ov.Type.f16)
-
-        mul = opset.multiply(
-            converted_const,
-            scale_const,
-            name=f"{const_node_name}/fq_weights_{weight_port_id}",
-        )
-
-        if compression_config.group_size != -1:
-            mul = opset.reshape(mul, output_shape=original_shape, special_zero=False)
+        if len(weights_to_concat) > 1:
+            mul = opset.concat(weights_to_concat, 0, name=f"{const_node_name}/w_concat")
+        else:
+            mul = weights_to_concat[0]
 
         if should_add_convert_node:
             mul = opset.convert(mul, const_dtype, name=f"{const_node_name}/fq_weights_{weight_port_id}/convert")
