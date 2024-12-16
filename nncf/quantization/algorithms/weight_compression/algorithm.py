@@ -127,10 +127,10 @@ def check_user_compression_configuration(
     Validates the user's weight compression configuration for correctness.
     """
     if mode in INT8_MODES:
-        if (ratio and ratio != 1) or (group_size and group_size != -1):
+        if (ratio and ratio != 1):
             raise nncf.ParameterNotSupportedError(
                 "INT8 modes require per-channel quantization of all layers in 8 bit. "
-                "Default values of `ratio` (1) and `group_size` (-1) cannot be overridden."
+                "Default value of `ratio` (1) cannot be overridden."
             )
 
         if advanced_parameters and advanced_parameters.statistics_path:
@@ -141,9 +141,7 @@ def check_user_compression_configuration(
         unsupported_options = {
             "all_layers": all_layers,
             "sensitivity_metric": sensitivity_metric,
-            "dataset": dataset,
             "awq": awq,
-            "scale_estimation": scale_estimation,
             "gptq": gptq,
             "lora_correction": lora_correction,
             "backup_mode": backup_mode,

@@ -360,10 +360,12 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         assert mode in [
             CompressWeightsMode.INT4_SYM,
             CompressWeightsMode.INT4_ASYM,
+            CompressWeightsMode.INT8_SYM,
+            CompressWeightsMode.INT8_ASYM,
         ], f"Only int4 supported, but given={mode}"
         num_bits = config.num_bits
 
-        asym_quant = mode in [CompressWeightsMode.INT4_ASYM]
+        asym_quant = mode in [CompressWeightsMode.INT4_ASYM, CompressWeightsMode.INT8_ASYM]
         level_low = 0 if asym_quant else -(2 ** (num_bits - 1))
         level_high = 2**num_bits - 1 if asym_quant else 2 ** (num_bits - 1) - 1
 

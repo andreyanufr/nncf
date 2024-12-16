@@ -134,8 +134,10 @@ class ScaleEstimation:
             node_name = wp.node_with_weight.node_name
             config = wp.compression_config
 
-            if config.num_bits != 4 or node_name not in self._statistics:
+            if node_name not in self._statistics:
                 scales[weight_name] = None
+                continue
+            if 'aten::to/Convert' in node_name:
                 continue
 
             stats = self._statistics[node_name]
