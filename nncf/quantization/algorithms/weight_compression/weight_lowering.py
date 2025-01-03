@@ -248,6 +248,18 @@ def calculate_normalized_weight_and_fp4_scale(
     return norm_weight, scale
 
 
+def rectify_scale_for_asym(min_values, max_values, scale, zero_point):
+    print("Shape in", scale.shape)
+    x = fns.where(fns.abs(min_values) > max_values, min_values, max_values)
+    qx = fns.round(x / scale)
+    qx = qx * scale
+
+    coeff = x / qx
+    scale_r = scale * coeff
+
+    print("Shape out", scale.shape)
+    return scale_r
+
 def calculate_integer_quantization_params(
     weight: Tensor, reduction_axes: ReductionAxes, config: WeightCompressionConfig
 ) -> Tuple[Tensor, Tensor]:
@@ -275,7 +287,8 @@ def calculate_integer_quantization_params(
         scale, zero_point = calculate_scale_zero_point(
             min_values, max_values, level_low, level_high, narrow_range=False
         )
-        return scale, zero_point
+        scale_r = rectify_scale_for_asym(min_values, max_values, scale, zero_point)
+        return scale_r, zero_point
 
     scale = calculate_signed_scale(weight, reduction_axes, num_bits)
     return scale, None
@@ -356,6 +369,10 @@ def do_int_quantization(
     :return: The compressed weights tensor of uint8 (asymmetric mode) or int8 (symmetric mode) type,
         scale tensor of float32 type and zero point tensor of int32 type that was used for its quantization.
     """
+    
+    if not isinstance(weight, Tensor):
+        weight = Tensor(weight)
+    
     assert config.is_integer(), "The function supports integer quantization only"
     group_size = config.group_size
     is_asym = config.mode in [CompressWeightsMode.INT8_ASYM, CompressWeightsMode.INT4_ASYM]

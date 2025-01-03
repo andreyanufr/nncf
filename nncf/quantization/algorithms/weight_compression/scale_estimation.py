@@ -137,8 +137,13 @@ class ScaleEstimation:
             if config.num_bits != 4 or node_name not in self._statistics:
                 scales[weight_name] = None
                 continue
-
-            stats = self._statistics[node_name]
+            
+            # if 'down_proj' in weight_name:
+            #     continue
+            
+            stats = None
+            if self._statistics is not None:
+                stats = self._statistics[node_name]
 
             weight_data = self._backend_entity.get_weight_names_and_port_ids(wp.node_with_weight, graph)
             if len(weight_data) != 1:  # not supported by the algorithm
@@ -157,6 +162,7 @@ class ScaleEstimation:
                 self._initial_steps,
                 self._scale_steps,
                 self._weight_penalty,
+                weight_name
             )
 
         return scales, zero_points
@@ -172,6 +178,7 @@ class ScaleEstimation:
         initial_steps: int = 5,
         scale_steps: int = 10,
         weight_penalty: float = -1.0,
+        name= ""
     ) -> Tensor:
         """
         Calculates the quantization parameters for a given set of weights and activations.
@@ -197,6 +204,10 @@ class ScaleEstimation:
             and quantized weights. A value of -1 disables the penalty. Defaults to -1.0.
         :return: A tensor containing the calculated quantization scales and zero points if applicable.
         """
+        if statistics is None:
+            return ScaleEstimation.calculate_date_free_quantization_params(backend_entity, weight, reduction_axes, config,
+                                                                initial_steps, scale_steps, name)
+
         reduction_axis = reduction_axes[0]
 
         s, X = process_stats(statistics, subset_size)
@@ -373,6 +384,241 @@ class ScaleEstimation:
             zp = fns.squeeze(zp, axis=1)
 
         return result_scale, zp
+
+
+    @staticmethod
+    def calculate_date_free_quantization_params(
+        backend_entity: WeightCompressionAlgoBackend,
+        weight: Tensor,
+        reduction_axes: Tuple[int, ...],
+        config: WeightCompressionConfig,
+        initial_steps: int = 5,
+        scale_steps: int = 10,
+        name = ""
+    ) -> Tensor:
+        """
+        Calculates the quantization parameters for a given set of weights and activations.
+        This function estimates the optimal quantization scale for weight compression by
+        minimizing the difference between floating-point operations and operations with
+        quantized weights.
+
+        The function uses an iterative process:
+        1. Initial scale rectification based on activation statistics.
+        2. A grid search to further refine the scale parameters.
+
+        :param backend_entity: The backend-specific implementation of the weight compression algorithm.
+        :param statistics: The input activations of the layer reduced over batch and sequence length dimensions,
+            together with original activation tensor shapes.
+        :param weight: The weight tensor that is being quantized.
+        :param reduction_axes: Tuple specifying the axes along which the reduction is performed for quantization.
+        :param config: Configuration parameters for the weight compression, including quantization settings.
+        :param subset_size: The number of samples to use for scale estimation. Defaults to 32.
+        :param initial_steps: The number of steps for initial scale rectification using activation statistics.
+            Defaults to 5.
+        :param scale_steps: The number of steps for refining the scale using a grid search. Defaults to 10.
+        :param weight_penalty: Penalty coefficient applied to the difference between floating-point
+            and quantized weights. A value of -1 disables the penalty. Defaults to -1.0.
+        :return: A tensor containing the calculated quantization scales and zero points if applicable.
+        """
+        reduction_axis = reduction_axes[0]
+
+        weight = weight.astype(TensorDataType.float32)
+        eps = fns.finfo(weight).eps
+        
+        orig_shape = weight.shape
+
+        if reduction_axis == 0:
+            weight = fns.transpose(weight)
+            reduction_axis = 1
+
+        group_size = config.group_size if config.group_size != -1 else weight.shape[reduction_axis]
+        cur_config = deepcopy(config)
+        cur_config.group_size = group_size
+
+        original_weight = fns.zeros_like(weight) + weight
+        if config.mode == CompressWeightsMode.NF4:
+            norm_weight, scale = calculate_normalized_weight_and_fp4_scale(
+                original_weight, reduction_axis, cur_config.group_size
+            )
+            compressed_weights = do_nf4_quantization(norm_weight, scale, is_normalized_weight=True)
+            q_weights = do_nf4_dequantization(compressed_weights, scale, reduction_axis)
+            zp = None
+        else:
+            compressed_weights, scale, zp = do_int_quantization(original_weight, reduction_axis, cur_config)
+            if zp is not None:
+                zp = zp.astype(scale.dtype)
+            q_weights = do_int_dequantization(compressed_weights, scale, zp, reduction_axis)
+
+
+        original_weight, _ = reshape_weight_for_grouped_quantization(original_weight, reduction_axis, group_size)
+
+        # all weight in group has importance based on corresponding input activations
+        importance = fns.abs(original_weight)**2
+
+        target, zero_mask = get_target_zero_mask(compressed_weights, zp)
+        importance = fns.where(zero_mask, 0.0, importance)
+
+        # normalize importances for every group of weights to make sum of them equal to 1.0
+        denum = fns.sum(importance, axis=2, keepdims=True)
+        importance = importance / (denum + eps)
+
+        q_weights, _ = reshape_weight_for_grouped_quantization(q_weights, reduction_axis, group_size)
+
+        result_scale = None
+        best_diffs = fns.mean((q_weights - original_weight) ** 2, axis=-1)
+        
+        #print("Init: ", fns.mean(best_diffs))
+
+        zp_shape = zp.shape if zp is not None else None
+        key = (config.mode, config.num_bits) + q_weights.shape + scale.shape
+        if zp is not None:
+            key += zp_shape
+        if config.mode != CompressWeightsMode.NF4:
+            if key in ScaleEstimation.compress_decompress_cache:
+                compress_decompress_model = ScaleEstimation.compress_decompress_cache[key]["compress_decompress_model"]
+                compress_model = ScaleEstimation.compress_decompress_cache[key]["compress_model"]
+            else:
+                compress_decompress_model = backend_entity.get_compress_decompress_pipeline(
+                    config, q_weights.shape, scale.shape, zp_shape
+                )
+                compress_model = backend_entity.get_compress_pipeline(config, q_weights.shape, scale.shape, zp_shape)
+                ScaleEstimation.compress_decompress_cache[key] = {
+                    "compress_decompress_model": compress_decompress_model,
+                    "compress_model": compress_model,
+                }
+        scale_sign = scale / fns.abs(scale)
+        zero_scale = 0.001
+        zero_mask = zero_scale * zero_mask.astype(original_weight.dtype)
+
+        input_tensors = [original_weight.data, None]
+        if zp is not None:
+            input_tensors.append(zp.data)
+        # iterative rectification of initial scale
+        for i in range(initial_steps):
+            near_to_ideal_scale = estimate_scales(original_weight, target, zero_mask, importance)
+            near_to_ideal_scale = near_to_ideal_scale * scale_sign
+            input_tensors[1] = near_to_ideal_scale.data
+
+            if config.mode == CompressWeightsMode.NF4:
+                g_compressed_weighs = do_nf4_quantization(original_weight, near_to_ideal_scale)
+                out = do_nf4_dequantization(g_compressed_weighs, near_to_ideal_scale)
+            else:
+                out = compress_decompress_model(input_tensors)
+            q_weights_ = fns.zeros_like(original_weight) + out
+            ideal_scale_diffs = fns.mean((q_weights_ - original_weight) ** 2, axis=-1)
+
+            mask = (ideal_scale_diffs > best_diffs).astype(best_diffs.dtype)
+
+            best_diffs = mask * best_diffs + (1.0 - mask) * ideal_scale_diffs
+
+            mask = fns.unsqueeze(mask, axis=2)
+
+            if result_scale is None:
+                near_to_ideal_scale = mask * scale + (1.0 - mask) * near_to_ideal_scale
+            else:
+                near_to_ideal_scale = mask * result_scale + (1.0 - mask) * near_to_ideal_scale
+            result_scale = near_to_ideal_scale
+            input_tensors[1] = near_to_ideal_scale.data
+
+            if i < initial_steps - 1:
+                if config.mode == CompressWeightsMode.NF4:
+                    out = do_nf4_quantization(original_weight, near_to_ideal_scale)
+                else:
+                    out = compress_model(input_tensors)
+                compressed_weights = fns.zeros_like(original_weight) + out
+                target, zero_mask = get_target_zero_mask(compressed_weights, zp)
+                zero_mask = zero_scale * zero_mask.astype(original_weight.dtype)
+        
+        #print("Initial iters: ", fns.mean(best_diffs))
+
+        # iterative rectification of scale based on grid search
+        for scale_step in range(scale_steps):
+            factor = 1.0 - 0.05 * scale_step
+            scaled_scale = factor * scale
+
+            input_tensors[1] = scaled_scale.data
+            if config.mode == CompressWeightsMode.NF4:
+                out = do_nf4_quantization(original_weight, scaled_scale)
+            else:
+                out = compress_model(input_tensors)
+            compressed_weights = fns.zeros_like(original_weight) + out
+
+            target, zero_mask = get_target_zero_mask(compressed_weights, zp)
+            zero_mask = zero_scale * zero_mask.astype(original_weight.dtype)
+            near_to_ideal_scale = estimate_scales(original_weight, target, zero_mask, importance)
+            near_to_ideal_scale = near_to_ideal_scale * scale_sign
+
+            input_tensors[1] = near_to_ideal_scale.data
+            if config.mode == CompressWeightsMode.NF4:
+                g_compressed_weighs = do_nf4_quantization(original_weight, near_to_ideal_scale)
+                out = do_nf4_dequantization(g_compressed_weighs, near_to_ideal_scale)
+            else:
+                out = compress_decompress_model(input_tensors)
+            q_weights_ = fns.zeros_like(original_weight) + out
+
+            ideal_scale_diffs = fns.mean((q_weights_ - original_weight) ** 2, axis=-1)
+
+            mask = (ideal_scale_diffs > best_diffs).astype(best_diffs.dtype)
+
+            best_diffs = mask * best_diffs + (1.0 - mask) * ideal_scale_diffs
+
+            mask = fns.unsqueeze(mask, axis=2)
+
+            if result_scale is None:
+                near_to_ideal_scale = mask * scale + (1.0 - mask) * near_to_ideal_scale
+            else:
+                near_to_ideal_scale = mask * result_scale + (1.0 - mask) * near_to_ideal_scale
+            result_scale = near_to_ideal_scale
+        
+        #print("Final iters: ", fns.mean(best_diffs))
+        #print("++++++")
+        
+        if 'down_proj' in name:
+            super_w = [[2, (808, 525)], [4, (2723, 525)], [7, (5559, 525)], [13, (-1, 525)], [29, (1286, 525)], [30, (-1, 525)], [31, (407, 2024)]]
+            for val in super_w:
+                tmp = '.' + str(val[0]) + '.mlp.down_proj.'
+                if tmp not in name:
+                    continue
+                index = val[1] # [col, row]
+                print(name)
+                
+                g_index = [index[1], index[0] // group_size, index[0] % group_size]
+
+                if index[0] == -1:
+                    result_scale[g_index[0], :] = scale[g_index[0], :]
+                else:
+                    result_scale[g_index[0], g_index[1]] = scale[g_index[0], g_index[1]]
+                input_tensors[1] = result_scale.data
+                if config.mode == CompressWeightsMode.NF4:
+                    g_compressed_weighs = do_nf4_quantization(original_weight, near_to_ideal_scale)
+                    out = do_nf4_dequantization(g_compressed_weighs, near_to_ideal_scale)
+                else:
+                    # if index[0] != -1:
+                    #     result_scale[g_index[0], g_index[1]] = scale[g_index[0], g_index[1]]
+                    out = compress_decompress_model(input_tensors)
+                q_weights = fns.zeros_like(original_weight) + out
+                
+                
+                original_weight = original_weight.reshape(orig_shape)
+                q_weights = q_weights.reshape(orig_shape)
+                index = [index[0], index[1]]
+                if index[0] == -1:
+                    import numpy as np
+                    diff = fns.abs(original_weight[index[1], :] - q_weights[index[1], :])
+                    idx = np.argmax(original_weight[index[1], :].data)
+                    index[0] = idx
+                    diff = diff[idx]
+                else:
+                    diff = fns.abs(original_weight[index[1], index[0]] - q_weights[index[1], index[0]])
+                print("Diff for super W: ", diff, diff / original_weight[index[1], index[0]]*100)
+
+        if config.group_size == -1:
+            result_scale = fns.squeeze(result_scale, axis=1)
+        if zp is not None and config.group_size == -1:
+            zp = fns.squeeze(zp, axis=1)
+
+        return result_scale, zp
+
 
     @staticmethod
     def activations_to_wc_statistics(activations: List[Tensor]) -> WCTensorStatistic:

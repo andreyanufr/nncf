@@ -490,7 +490,7 @@ class WeightCompression(Algorithm):
         nodes_to_compress = self.get_nodes_to_compress(graph)
 
         statistics = None
-        if self._data_aware_mixed_precision or self._data_aware_compression:
+        if dataset is not None and (self._data_aware_mixed_precision or self._data_aware_compression):
             matmul_nodes_to_compress = [
                 node for node in nodes_to_compress if node.metatype in self._backend_entity.matmul_metatypes
             ]
