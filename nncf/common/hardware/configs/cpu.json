@@ -7,7 +7,7 @@
                 "mode": [
                     "symmetric"
                 ],
-                "granularity": "pertensor",
+                "granularity": ["perchannel", "pertensor"],
                 "narrow_range": false
             },
             "q8_a": {
@@ -16,7 +16,7 @@
                     "symmetric",
                     "asymmetric"
                 ],
-                "granularity": "pertensor",
+                "granularity": ["perchannel", "pertensor"],
                 "narrow_range": false
             },
             "q8_a_ch": {

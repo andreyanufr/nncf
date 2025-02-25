@@ -73,7 +73,7 @@ from nncf.scopes import get_ignored_node_names_from_ignored_scope
 TModel = TypeVar("TModel")
 
 DEFAULT_QCONFIG = QuantizerConfig(
-    num_bits=8, mode=QuantizationScheme.SYMMETRIC, signedness_to_force=None, per_channel=False
+    num_bits=8, mode=QuantizationScheme.SYMMETRIC, signedness_to_force=None, per_channel=True
 )
 
 
@@ -470,7 +470,7 @@ class MinMaxQuantization(Algorithm):
         channel_axes = ()
         if qconfig.per_channel:
             channel_axes = (
-                self._backend_entity.get_weight_quantization_axes(node, target_point, len(shape)) if is_weight else (1,)
+                self._backend_entity.get_weight_quantization_axes(node, target_point, len(shape)) if is_weight else (-1,)
             )
 
         # Weight statistics is constant, so only one collection is enough.
@@ -687,6 +687,8 @@ class MinMaxQuantization(Algorithm):
         ip_graph = ip_graph.get_ip_graph_with_merged_hw_optimized_operations(hw_patterns)
         post_processing_types = self._backend_entity.post_processing_metatypes
         metatypes_to_ignore = self._backend_entity.get_ignored_metatypes(self._model_type, self._target_device)
+        
+        
         solver = QuantizerPropagationSolver(
             activation_ignored_scopes=ignored_names,
             weight_ignored_scopes=list(ignored_names.keys()),
@@ -1022,7 +1024,7 @@ class MinMaxQuantization(Algorithm):
             if self._mode is not None:
                 destination_type = self._quantization_params[q_group].destination_type
                 parameters = calculate_convert_parameters(
-                    unified_values, is_per_channel=qconfig.per_channel, destination_type=destination_type
+                    unified_values, is_per_channel=qconfig.per_channel, destination_type=destination_type, is_activation=True
                 )
                 for quantization_target_point in unified_scale_group:
                     transformation_layout.register(
@@ -1062,7 +1064,7 @@ class MinMaxQuantization(Algorithm):
                 if self._mode is not None:
                     destination_type = self._quantization_params[quant_group].destination_type
                     parameters = calculate_convert_parameters(
-                        statistics, is_per_channel=qconfig.per_channel, destination_type=destination_type
+                        statistics, is_per_channel=qconfig.per_channel, destination_type=destination_type, is_activation=(quant_group==QuantizerGroup.ACTIVATIONS)
                     )
                     command = self._backend_entity.create_convert_insertion_command(
                         quantization_target_point, parameters
