@@ -255,7 +255,7 @@ def calculate_convert_parameters(
     is_per_channel: False,
     destination_type: FP8Type = FP8Type.E4M3,
     activation_scale: float = 0.5,
-    is_activation = False,
+    is_activation=False,
 ) -> FakeConvertParameters:
     """
     Calculates FakeConvert layer attributes for weight/activation quantizer.
@@ -270,9 +270,9 @@ def calculate_convert_parameters(
 
     max_values = statistics.max_values
     min_values = statistics.min_values
-    
+
     # if max_values.size > 1 and is_activation and destination_type == FP8Type.E4M3:
-    #     min_bin_per_channel = 100 
+    #     min_bin_per_channel = 100
     #     quants = [1.9531e-03, 3.9062e-03, 5.8594e-03, 7.8125e-03, 9.7656e-03,
     #             1.1719e-02, 1.3672e-02, 1.5625e-02, 1.7578e-02, 1.9531e-02, 2.1484e-02,
     #             2.3438e-02, 2.5391e-02, 2.7344e-02, 2.9297e-02, 3.1250e-02, 3.5156e-02,
@@ -295,17 +295,17 @@ def calculate_convert_parameters(
     #             1.6000e+02, 1.7600e+02, 1.9200e+02, 2.0800e+02, 2.2400e+02, 2.4000e+02,
     #             2.5600e+02, 2.8800e+02, 3.2000e+02, 3.5200e+02, 3.8400e+02, 4.1600e+02,
     #             4.4800e+02]
-        
+
     #     max_destination_value = destination_type_maximum[destination_type]
     #     tensor_dtype = fns.finfo(max_values)
     #     scale = max_destination_value / fns.maximum(fns.max(max_values), fns.max(fns.abs(min_values) + tensor_dtype.eps))
-        
+
     #     per_channel = fns.maximum(max_values, fns.abs(min_values) + tensor_dtype.eps) * scale
     #     bin_counter = fns.zeros_like(per_channel)
     #     for th in quants:
     #         bin_counter[per_channel >= th] += 1
     #     bin_per_channel = fns.mean(bin_counter)
-        
+
     #     print(fns.maximum(fns.max(max_values), fns.max(fns.abs(min_values) + tensor_dtype.eps)))
     #     print("Clipped value 0: ", 1 / (scale / max_destination_value), bin_per_channel)
     #     while bin_per_channel < min_bin_per_channel:
@@ -323,11 +323,14 @@ def calculate_convert_parameters(
     #     if not is_per_channel:
     #         scale = fns.squeeze(activation_scale * scale)
 
-    max_values = fns.minimum(max_values, 50)
-    min_values = fns.maximum(min_values, -50)
+    max_values = fns.max(max_values)  # fns.minimum(max_values, 50)
+    min_values = fns.min(min_values)  # fns.maximum(min_values, -50)
     max_destination_value = destination_type_maximum[destination_type]
     tensor_dtype = fns.finfo(max_values)
-    scale = max_destination_value / fns.maximum(fns.max(max_values), fns.max(fns.abs(min_values) + tensor_dtype.eps))
+    scale = max_destination_value / fns.maximum(max_values, fns.abs(min_values) + tensor_dtype.eps)
+
+    if is_activation:
+        print(max_values, min_values, scale)
 
     shift = fns.zeros_like(scale).astype(TensorDataType.float32)
     scale = scale.astype(TensorDataType.float32)
