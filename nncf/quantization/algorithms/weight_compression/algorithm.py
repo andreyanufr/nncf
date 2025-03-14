@@ -37,6 +37,7 @@ from nncf.quantization.advanced_parameters import AdvancedCompressionParameters
 from nncf.quantization.advanced_parameters import convert_to_dict_recursively
 from nncf.quantization.algorithms.algorithm import Algorithm
 from nncf.quantization.algorithms.weight_compression.awq import AWQ
+from nncf.quantization.algorithms.weight_compression.hadamart import Hadamart
 from nncf.quantization.algorithms.weight_compression.config import WeightCompressionParameters
 from nncf.quantization.algorithms.weight_compression.gptq import GPTQ
 from nncf.quantization.algorithms.weight_compression.lora_correction import LoraCorrectionAlgorithm
@@ -259,6 +260,8 @@ class WeightCompression(Algorithm):
         criterion_cls = MIXED_PRECISION_CRITERIA.get(self._sensitivity_metric)
         self._mixed_precision_algo = criterion_cls(primary_config, self._ratio, self._subset_size)
         self._statistics_path = self._advanced_parameters.statistics_path
+
+        self.hadamart_algo = Hadamart()
 
         if self._awq:
             awq_params = self._advanced_parameters.awq_params
@@ -604,6 +607,8 @@ class WeightCompression(Algorithm):
             statistics = self.awq_algo.update_statistics(statistics)
             # del is used to prematurely mark non-necessary data as free for garbage collection
             del self.awq_algo
+        
+        self.hadamart_algo.apply(model, graph, all_weight_params, nodes_to_compress, None, self._backend_entity)
 
         scales = {}
         zero_points = {}
