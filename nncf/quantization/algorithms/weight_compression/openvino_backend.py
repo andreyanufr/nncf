@@ -32,7 +32,7 @@ from nncf.openvino.graph.metatypes import openvino_metatypes as om
 from nncf.openvino.graph.metatypes.groups import ATOMIC_ACTIVATIONS_OPERATIONS
 from nncf.openvino.graph.model_transformer import OVModelTransformer
 from nncf.openvino.graph.node_utils import convert_op
-from nncf.openvino.graph.node_utils import create_ov_const_from_tensor
+from nncf.openvino.graph.node_utils import create_ov_const_from_tensor, create_ov_codebook_unpacking_tensor
 from nncf.openvino.graph.node_utils import get_const_value_as_numpy_tensor
 from nncf.openvino.graph.node_utils import get_const_value_as_ov_tensor
 from nncf.openvino.graph.node_utils import get_weight_channel_axes
@@ -228,7 +228,7 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
             scale_dtype = ov.Type.f8e8m0
         elif compression_config.mode == CompressWeightsMode.INT4_SYM:
             compression_dtype = ov.Type.i4
-        elif compression_config.mode == CompressWeightsMode.INT4_ASYM:
+        elif compression_config.mode in [CompressWeightsMode.INT4_ASYM, CompressWeightsMode.CBF4]:
             compression_dtype = ov.Type.u4
         elif compression_config.mode == CompressWeightsMode.INT8_SYM:
             compression_dtype = ov.Type.i8
@@ -247,9 +247,15 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
                 layer_scales,
                 layer_zero_points,
             )
-        compressed_const = create_ov_const_from_tensor(
-            compressed_weight.tensor, compression_dtype, name=const_node_name
-        )
+        if compression_config.mode != CompressWeightsMode.CBF4:
+            compressed_const = create_ov_const_from_tensor(
+                compressed_weight.tensor, compression_dtype, name=const_node_name
+            )
+        else:
+            compressed_const = create_ov_codebook_unpacking_tensor(
+                compressed_weight.codebook, compressed_weight.tensor, compression_dtype, name=const_node_name
+            )
+
         converted_const = opset.convert(compressed_const, ov.Type.f16)
 
         if compressed_weight.zero_point is not None:

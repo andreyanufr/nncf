@@ -20,6 +20,7 @@ from nncf.common.utils.backend import is_openvino_at_least
 from nncf.common.utils.backend import is_openvino_available
 from nncf.parameters import CompressWeightsMode
 from nncf.quantization.algorithms.weight_compression.config import WeightCompressionConfig
+from nncf.quantization.algorithms.weight_compression.codebook import weights_clusterization_k_means
 from nncf.quantization.fake_quantize import calculate_scale_zero_point
 from nncf.tensor import Tensor
 from nncf.tensor import functions as fns
@@ -380,6 +381,10 @@ def compress_weight(
     :param precomputed_zero_point: Precomputed zero point.
     :return: The compressed weight and decompression parameters as instance of CompressedWeight
     """
+    if config.mode == CompressWeightsMode.CBF4:
+        data = np.array([-8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7], dtype=np.float32) / 8.0
+        data = NF4_QUANTILES
+        return weights_clusterization_k_means(weight, n_init=data)
     if not config.is_integer:
         if weight.backend == TensorBackend.ov:
             weight = weight.as_numpy_tensor()
