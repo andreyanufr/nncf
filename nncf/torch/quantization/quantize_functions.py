@@ -252,6 +252,16 @@ class ExportQuantizeToONNXQuantDequant(torch.autograd.Function):
         return grad_outputs[0]
 
 
+class RoundSTE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, inputs):
+        return torch.round(inputs)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output
+
+
 def get_scale_zp_from_input_low_input_high(level_low, level_high, input_low, input_high):
     y_scale = (input_high - input_low) / (level_high - level_low)
     y_zero_point = (level_low * input_high - level_high * input_low) / (input_high - input_low)
@@ -356,6 +366,60 @@ def symmetric_quantize_lora(input_, input_shape, A, B, scale, level_low, level_h
         level_high,
         levels,
     )
+
+
+@register_operator()
+def quantize_lora_scale(
+    input_, input_shape, A, B, col_scale, row_scale, A_bias, B_bias, level_low, level_high, eps, skip: bool = False
+):
+    if has_torch_function_unary(input_):
+        return handle_torch_function(
+            quantize_lora_scale,
+            (input_,),
+            input_shape,
+            A,
+            B,
+            col_scale,
+            row_scale,
+            A_bias,
+            B_bias,
+            level_low,
+            level_high,
+            eps,
+            skip,
+        )
+    if skip:
+        return input_
+
+    input_ = input_ / (B @ A + col_scale + row_scale).exp() + B_bias @ A_bias
+    orig_shape = input_.shape
+    input_ = input_.reshape(input_shape)
+
+    input_low = torch.amin(input_, dim=-1, keepdim=True).float()
+    input_high = torch.amax(input_, dim=-1, keepdim=True).float()
+
+    if level_low == 0:  # asymmetric quantization
+        levels = level_high - level_low + 1
+        scale = (input_high - input_low) / (levels - 1)
+        scale = torch.where(torch.abs(scale) < eps, eps, scale)
+        expected_level_low = level_low
+        zero_point = expected_level_low - torch.round(input_low / scale)
+        zero_point = torch.clip(zero_point, level_low, level_high)
+    else:
+        w_abs_min = torch.abs(input_low)
+        w_max = input_high
+        scale = torch.where(w_abs_min >= w_max, w_abs_min, -w_max)
+        scale = torch.where(torch.abs(scale) < eps, eps, scale)
+        scale = scale / abs(level_low)
+        zero_point = torch.zeros_like(scale)
+
+    x_int = RoundSTE.apply(input_ / scale + zero_point)
+    x_quant = torch.clamp(x_int, level_low, level_high)
+    fq_weight = (x_quant - zero_point) * scale
+    fq_weight = fq_weight.to(input_.dtype)
+    fq_weight = fq_weight.reshape(orig_shape)
+
+    return fq_weight
 
 
 class TuneRange(torch.autograd.Function):

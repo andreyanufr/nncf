@@ -52,6 +52,7 @@ from nncf.torch.quantization.quantize_functions import decompress_symmetric
 from nncf.torch.quantization.quantize_functions import get_scale_zp_from_input_low_input_high
 from nncf.torch.quantization.quantize_functions import pack_int4
 from nncf.torch.quantization.quantize_functions import pack_uint4
+from nncf.torch.quantization.quantize_functions import quantize_lora_scale
 from nncf.torch.quantization.quantize_functions import symmetric_quantize
 from nncf.torch.quantization.quantize_functions import symmetric_quantize_lora
 from nncf.torch.quantization.quantize_functions import unpack_int4
@@ -1065,15 +1066,12 @@ class AsymmetricQuantizer(BaseQuantizer):
         )
 
 
-class LoraMixin:
+class LoraMixin(nn.Module):
     """
     Represents learnable LoRA (Low-Rank Adaptation) adapters for quantization modules.
     """
 
-    LORA_A_PARAM_NAME = "lora_A"
-    LORA_B_PARAM_NAME = "lora_B"
-
-    def init_lora(self, lspec: PTLoraSpec):
+    def init_lora(self, lspec: PTLoraSpec, use_scale: bool = False):
         self._lspec = lspec
         default_lora_dtype = torch.bfloat16
         out_features, in_features = lspec.orig_weight_shape
@@ -1083,21 +1081,25 @@ class LoraMixin:
             raise nncf.ValidationError(msg)
         self.lora_A = torch.nn.Parameter(torch.ones((rank, in_features), dtype=default_lora_dtype))
         self.lora_B = torch.nn.Parameter(torch.zeros((out_features, rank), dtype=default_lora_dtype))
+        if use_scale:
+            self.col_scale = torch.nn.Parameter(torch.zeros((out_features, 1), dtype=default_lora_dtype))
+            self.row_scale = torch.nn.Parameter(torch.zeros((1, in_features), dtype=default_lora_dtype))
+            self.lora_A_bias = torch.nn.Parameter(torch.ones((rank, in_features), dtype=default_lora_dtype))
+            self.lora_B_bias = torch.nn.Parameter(torch.zeros((out_features, rank), dtype=default_lora_dtype))
+            torch.nn.init.kaiming_uniform_(self.lora_A, a=0.25)
+            torch.nn.init.kaiming_uniform_(self.lora_B, a=2.25)
 
     def enable_gradients(self):
-        self.lora_A.requires_grad = True
-        self.lora_B.requires_grad = True
+        for _, p in self.named_parameters():
+            p.requires_grad = True
 
     @abstractmethod
     def disable_gradients(self):
-        self.lora_A.requires_grad = False
-        self.lora_B.requires_grad = False
+        for _, p in self.named_parameters():
+            p.requires_grad = False
 
     def get_adapters(self) -> Dict[str, torch.Tensor]:
-        return {
-            self.LORA_A_PARAM_NAME: self.lora_A,
-            self.LORA_B_PARAM_NAME: self.lora_B,
-        }
+        return {name: p for name, p in self.named_parameters()}
 
 
 @COMPRESSION_MODULES.register()
@@ -1194,6 +1196,112 @@ class SymmetricLoraQuantizer(SymmetricQuantizer, LoraMixin):
 
     @classmethod
     def from_config(cls, state) -> "SymmetricLoraQuantizer":
+        qspec = PTQuantizerSpec.from_state(state["qspec"])
+        lspec = PTLoraSpec.from_state(state["lspec"])
+        return cls(qspec, lspec)
+
+
+@COMPRESSION_MODULES.register()
+@QUANTIZATION_MODULES.register(QuantizationMode.ASYMMETRIC_LORA_SCALE)
+class AsymmetricLoraScaleQuantizer(BaseQuantizer, LoraMixin):
+    _arg_names = ["qspec", "lspec"]
+
+    def __init__(self, qspec: PTQuantizerSpec, lspec: PTLoraSpec):
+        super().__init__(qspec)
+        self.init_lora(lspec, use_scale=True)
+
+    def quantize(self, x: torch.Tensor, execute_traced_op_as_identity: bool = False):
+        # TODO: (dokuchaev) remove within new tracing (ticket-163869)
+        with DisableTorchFunction():
+            # in multi-device case after loading nncf checkpoint, quantizers have a different device.
+            self.to(x.device)
+        return quantize_lora_scale(
+            x,
+            self._lspec.weight_shape,
+            self.lora_A,
+            self.lora_B,
+            self.col_scale,
+            self.row_scale,
+            self.lora_A_bias,
+            self.lora_B_bias,
+            self.input_low,
+            self.input_range,
+            self.level_low,
+            self.level_high,
+            self.levels,
+            self.eps,
+            skip=execute_traced_op_as_identity,
+        )
+
+    def enable_gradients(self) -> None:
+        super().enable_gradients()
+        LoraMixin.enable_gradients(self)
+
+    def disable_gradients(self) -> None:
+        super().disable_gradients()
+        LoraMixin.disable_gradients(self)
+
+    def get_trainable_params(self) -> Dict[str, torch.nn.Parameter]:
+        params = super().get_trainable_params()
+        params.update(LoraMixin.get_adapters(self))
+        return params
+
+    def get_config(self) -> Dict[str, Any]:
+        return {"qspec": super().get_config(), "lspec": self._lspec.get_state()}
+
+    @classmethod
+    def from_config(cls, state) -> "AsymmetricLoraScaleQuantizer":
+        qspec = PTQuantizerSpec.from_state(state["qspec"])
+        lspec = PTLoraSpec.from_state(state["lspec"])
+        return cls(qspec, lspec)
+
+
+@COMPRESSION_MODULES.register()
+@QUANTIZATION_MODULES.register(QuantizationMode.SYMMETRIC_LORA_SCALE)
+class SymmetricLoraScaleQuantizer(BaseQuantizer, LoraMixin):
+    def __init__(self, qspec: PTQuantizerSpec, lspec: PTLoraSpec):
+        super().__init__(qspec)
+        self.init_lora(lspec, use_scale=True)
+
+    def quantize(self, x, execute_traced_op_as_identity: bool = False):
+        # TODO: (dokuchaev) remove within new tracing (ticket-163869)
+        with DisableTorchFunction():
+            # in multi-device case after loading nncf checkpoint, quantizers have a different device.
+            self.to(x.device)
+        return symmetric_quantize_lora(
+            x,
+            self._lspec.weight_shape,
+            self.lora_A,
+            self.lora_B,
+            self.col_scale,
+            self.row_scale,
+            self.lora_A_bias,
+            self.lora_B_bias,
+            self.level_low,
+            self.level_high,
+            self.levels,
+            self.eps,
+            skip=execute_traced_op_as_identity,
+        )
+
+    def enable_gradients(self) -> None:
+        super().enable_gradients()
+        LoraMixin.enable_gradients(self)
+
+    def disable_gradients(self) -> None:
+        super().disable_gradients()
+        LoraMixin.disable_gradients(self)
+
+    def get_trainable_params(self) -> Dict[str, torch.Tensor]:
+        params = super().get_trainable_params()
+        params.update(LoraMixin.get_adapters(self))
+        return params
+
+    def get_config(self) -> Dict[str, Any]:
+        return {"qspec": super().get_config(), "lspec": self._lspec.get_state()}
+
+    @classmethod
+    def from_config(cls, state) -> "SymmetricLoraScaleQuantizer":
         qspec = PTQuantizerSpec.from_state(state["qspec"])
         lspec = PTLoraSpec.from_state(state["lspec"])
         return cls(qspec, lspec)

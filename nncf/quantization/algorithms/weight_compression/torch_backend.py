@@ -307,6 +307,9 @@ class PTWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         if compression_format == CompressionFormat.FQ:
             mode_vs_schema_map[CompressWeightsMode.INT4_ASYM] = QuantizationScheme.ASYMMETRIC
             mode_vs_schema_map[CompressWeightsMode.INT4_SYM] = QuantizationScheme.SYMMETRIC
+        elif compression_format == CompressionFormat.FQ_LORA_SCALE:
+            mode_vs_schema_map[CompressWeightsMode.INT4_ASYM] = QuantizationScheme.ASYMMETRIC_LORA_SCALE
+            mode_vs_schema_map[CompressWeightsMode.INT4_SYM] = QuantizationScheme.SYMMETRIC_LORA_SCALE
         if is_all_8bit and compression_format == CompressionFormat.FQ_LORA:
             mode_vs_schema_map[CompressWeightsMode.INT8_ASYM] = QuantizationScheme.ASYMMETRIC_LORA
             mode_vs_schema_map[CompressWeightsMode.INT8_SYM] = QuantizationScheme.SYMMETRIC_LORA

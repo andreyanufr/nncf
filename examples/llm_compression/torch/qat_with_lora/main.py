@@ -38,7 +38,9 @@ from nncf.parameters import StripFormat
 from nncf.quantization.quantize_model import compress_weights
 from nncf.torch.model_creation import load_from_config
 from nncf.torch.quantization.layers import AsymmetricLoraQuantizer
+from nncf.torch.quantization.layers import AsymmetricLoraScaleQuantizer
 from nncf.torch.quantization.layers import SymmetricLoraQuantizer
+from nncf.torch.quantization.layers import SymmetricLoraScaleQuantizer
 
 
 def get_wikitext2(nsamples: int, seqlen: int, tokenizer: Any, device: torch.device) -> List[Tensor]:
@@ -166,7 +168,15 @@ def set_trainable(model: nn.Module, lora_lr: float, fq_lr: float) -> List[Dict[s
     transformations = model.nncf.transformation_layout().transformations
     for command in transformations:
         quantizer = command.fn
-        if isinstance(quantizer, (AsymmetricLoraQuantizer, SymmetricLoraQuantizer)) and (quantizer.num_bits == 4):
+        if isinstance(
+            quantizer,
+            (
+                AsymmetricLoraQuantizer,
+                AsymmetricLoraScaleQuantizer,
+                SymmetricLoraQuantizer,
+                SymmetricLoraScaleQuantizer,
+            ),
+        ) and (quantizer.num_bits == 4):
             quantizer.enable_gradients()
             params = quantizer.get_trainable_params()
             adapters = quantizer.get_adapters()
@@ -295,7 +305,7 @@ def main(argv) -> float:
     device = "cuda"
     torch_dtype = torch.bfloat16
     compression_config = dict(
-        mode=CompressWeightsMode.INT4_ASYM, group_size=64, compression_format=CompressionFormat.FQ_LORA
+        mode=CompressWeightsMode.INT4_ASYM, group_size=64, compression_format=CompressionFormat.FQ_LORA_SCALE
     )
 
     # Configure output and log files.
