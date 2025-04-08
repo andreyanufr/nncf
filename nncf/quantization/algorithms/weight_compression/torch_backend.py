@@ -332,7 +332,13 @@ class PTWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         )
 
         quantizer_cls = QUANTIZATION_MODULES.get(schema)
-        if schema in [QuantizationScheme.ASYMMETRIC_LORA, QuantizationScheme.SYMMETRIC_LORA]:
+        print(quantizer_cls)
+        if schema in [
+            QuantizationScheme.ASYMMETRIC_LORA,
+            QuantizationScheme.SYMMETRIC_LORA,
+            QuantizationScheme.ASYMMETRIC_LORA_SCALE,
+            QuantizationScheme.SYMMETRIC_LORA_SCALE,
+        ]:
             lora_spec = PTLoraSpec(
                 lora_rank=lora_adapter_rank, orig_weight_shape=orig_weight_shape, weight_shape=weight_shape
             )
@@ -356,8 +362,9 @@ class PTWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
             quantizer.input_low = torch.nn.Parameter(input_low.type(dtype))
             quantizer.input_range = torch.nn.Parameter(input_range.type(dtype) - quantizer.eps)
         else:
-            scale = scale.type(quantizer.scale.dtype)
-            quantizer.scale = torch.nn.Parameter(scale * levels / 2)
+            if hasattr(quantizer, "scale"):
+                scale = scale.type(quantizer.scale.dtype)
+                quantizer.scale = torch.nn.Parameter(scale * levels / 2)
 
         target_node_name = wc_params.weight_name
         target_point = PTTargetPoint(TargetType.OPERATOR_POST_HOOK, target_node_name=target_node_name)

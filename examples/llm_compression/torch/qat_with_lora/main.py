@@ -272,7 +272,7 @@ def get_argument_parser() -> argparse.ArgumentParser:
     )
 
     # Data params
-    parser.add_argument("--nsamples", type=int, default=1024, help="Number of training samples")
+    parser.add_argument("--nsamples", type=int, default=128, help="Number of training samples")
     parser.add_argument("--seqlen", type=int, default=1024, help="Calibration data context length.")
 
     # Training params
@@ -313,8 +313,8 @@ def main(argv) -> float:
     tensorboard_dir = output_dir / "tb" / datetime.now().strftime("%Y-%m-%d__%H-%M-%S")
     last_dir = output_dir / "last"
     best_dir = output_dir / "best"
-    if not args.resume:
-        shutil.rmtree(output_dir, ignore_errors=True)
+    # if not args.resume:
+    #     shutil.rmtree(output_dir, ignore_errors=True)
     for path in [output_dir, tensorboard_dir, last_dir, best_dir]:
         path.mkdir(exist_ok=True, parents=True)
     wwb_ref_file = output_dir / "wwb_ref.csv"

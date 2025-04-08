@@ -1082,24 +1082,25 @@ class LoraMixin(nn.Module):
         self.lora_A = torch.nn.Parameter(torch.ones((rank, in_features), dtype=default_lora_dtype))
         self.lora_B = torch.nn.Parameter(torch.zeros((out_features, rank), dtype=default_lora_dtype))
         if use_scale:
-            self.col_scale = torch.nn.Parameter(torch.zeros((out_features, 1), dtype=default_lora_dtype))
-            self.row_scale = torch.nn.Parameter(torch.zeros((1, in_features), dtype=default_lora_dtype))
-            self.lora_A_bias = torch.nn.Parameter(torch.ones((rank, in_features), dtype=default_lora_dtype))
-            self.lora_B_bias = torch.nn.Parameter(torch.zeros((out_features, rank), dtype=default_lora_dtype))
-            torch.nn.init.kaiming_uniform_(self.lora_A, a=0.25)
-            torch.nn.init.kaiming_uniform_(self.lora_B, a=2.25)
+            self.lora_col_scale = torch.nn.Parameter(torch.zeros((out_features, 1), dtype=default_lora_dtype))
+            self.lora_row_scale = torch.nn.Parameter(torch.zeros((1, in_features), dtype=default_lora_dtype))
+            self.lora_A_scale = torch.nn.Parameter(torch.ones((rank, in_features), dtype=default_lora_dtype))
+            self.lora_B_scale = torch.nn.Parameter(torch.zeros((out_features, rank), dtype=default_lora_dtype))
+            torch.nn.init.kaiming_uniform_(self.lora_A_scale, a=0.25)
 
     def enable_gradients(self):
-        for _, p in self.named_parameters():
-            p.requires_grad = True
+        for name, p in self.named_parameters():
+            if "lora_" in name:
+                p.requires_grad = True
 
     @abstractmethod
     def disable_gradients(self):
-        for _, p in self.named_parameters():
-            p.requires_grad = False
+        for name, p in self.named_parameters():
+            if "lora_" in name:
+                p.requires_grad = False
 
     def get_adapters(self) -> Dict[str, torch.Tensor]:
-        return {name: p for name, p in self.named_parameters()}
+        return {name: p for name, p in self.named_parameters() if "lora_" in name}
 
 
 @COMPRESSION_MODULES.register()
@@ -1209,6 +1210,9 @@ class AsymmetricLoraScaleQuantizer(BaseQuantizer, LoraMixin):
     def __init__(self, qspec: PTQuantizerSpec, lspec: PTLoraSpec):
         super().__init__(qspec)
         self.init_lora(lspec, use_scale=True)
+        self.eps = 0.00006103515625
+        self.level_low = 0
+        self.level_high = 15
 
     def quantize(self, x: torch.Tensor, execute_traced_op_as_identity: bool = False):
         # TODO: (dokuchaev) remove within new tracing (ticket-163869)
@@ -1220,15 +1224,12 @@ class AsymmetricLoraScaleQuantizer(BaseQuantizer, LoraMixin):
             self._lspec.weight_shape,
             self.lora_A,
             self.lora_B,
-            self.col_scale,
-            self.row_scale,
-            self.lora_A_bias,
-            self.lora_B_bias,
-            self.input_low,
-            self.input_range,
+            self.lora_col_scale,
+            self.lora_row_scale,
+            self.lora_A_scale,
+            self.lora_B_scale,
             self.level_low,
             self.level_high,
-            self.levels,
             self.eps,
             skip=execute_traced_op_as_identity,
         )
@@ -1255,6 +1256,56 @@ class AsymmetricLoraScaleQuantizer(BaseQuantizer, LoraMixin):
         lspec = PTLoraSpec.from_state(state["lspec"])
         return cls(qspec, lspec)
 
+    def _apply_minmax_init(self, min_values: torch.Tensor, max_values: torch.Tensor, log_module_name: str = None):
+        pass
+
+    def _get_input_low_input_high(self):
+        pass
+
+    def _prepare_export_quantization(self, x: torch.Tensor):
+        with no_jit_trace():
+            level_high, level_low, input_low, input_high = quantize_lora_scale(
+                x,
+                self._lspec.weight_shape,
+                self.lora_A,
+                self.lora_B,
+                self.lora_col_scale,
+                self.lora_row_scale,
+                self.lora_A_scale,
+                self.lora_B_scale,
+                self.level_low,
+                self.level_high,
+                self.eps,
+                skip=False,
+                return_quantization_params=True,
+            )
+
+            if self._is_quantized_on_export:
+                x = self.quantize(x, execute_traced_op_as_identity=False)
+        return x, level_high, level_low, input_low, input_high
+
+    def get_parameters_for_torch_fq(self) -> Tuple[int, int, torch.Tensor, torch.Tensor]:
+        # TODO: (anufriev) implement
+        return None, None, None, None
+
+    def get_quantizer_config(self) -> QuantizerConfig:
+        return QuantizerConfig(
+            num_bits=self.num_bits,
+            mode=QuantizationMode.ASYMMETRIC,
+            signedness_to_force=self.signed,
+            per_channel=self.per_channel,
+        )
+
+    def set_levels(self):
+        scaled_num_bits = 1 if self._half_range else 0
+        self.level_low, self.level_high = calculate_symmetric_level_ranges(
+            self.num_bits - scaled_num_bits, self.signed, self._narrow_range
+        )
+
+    @property
+    def signed(self):
+        return True
+
 
 @COMPRESSION_MODULES.register()
 @QUANTIZATION_MODULES.register(QuantizationMode.SYMMETRIC_LORA_SCALE)
@@ -1262,24 +1313,25 @@ class SymmetricLoraScaleQuantizer(BaseQuantizer, LoraMixin):
     def __init__(self, qspec: PTQuantizerSpec, lspec: PTLoraSpec):
         super().__init__(qspec)
         self.init_lora(lspec, use_scale=True)
+        self.level_low = -8
+        self.level_high = 7
 
     def quantize(self, x, execute_traced_op_as_identity: bool = False):
         # TODO: (dokuchaev) remove within new tracing (ticket-163869)
         with DisableTorchFunction():
             # in multi-device case after loading nncf checkpoint, quantizers have a different device.
             self.to(x.device)
-        return symmetric_quantize_lora(
+        return quantize_lora_scale(
             x,
             self._lspec.weight_shape,
             self.lora_A,
             self.lora_B,
-            self.col_scale,
-            self.row_scale,
+            self.lora_col_scale,
+            self.lora_row_scale,
             self.lora_A_bias,
             self.lora_B_bias,
             self.level_low,
             self.level_high,
-            self.levels,
             self.eps,
             skip=execute_traced_op_as_identity,
         )
@@ -1305,6 +1357,56 @@ class SymmetricLoraScaleQuantizer(BaseQuantizer, LoraMixin):
         qspec = PTQuantizerSpec.from_state(state["qspec"])
         lspec = PTLoraSpec.from_state(state["lspec"])
         return cls(qspec, lspec)
+
+    def _apply_minmax_init(self, min_values: torch.Tensor, max_values: torch.Tensor, log_module_name: str = None):
+        pass
+
+    def _get_input_low_input_high(self):
+        pass
+
+    def _prepare_export_quantization(self, x: torch.Tensor):
+        with no_jit_trace():
+            level_high, level_low, input_low, input_high = quantize_lora_scale(
+                x,
+                self._lspec.weight_shape,
+                self.lora_A,
+                self.lora_B,
+                self.lora_col_scale,
+                self.lora_row_scale,
+                self.lora_A_bias,
+                self.lora_B_bias,
+                self.level_low,
+                self.level_high,
+                self.eps,
+                skip=False,
+                return_quantization_params=True,
+            )
+
+            if self._is_quantized_on_export:
+                x = self.quantize(x, execute_traced_op_as_identity=False)
+        return x, level_high, level_low, input_low, input_high
+
+    def get_parameters_for_torch_fq(self) -> Tuple[int, int, torch.Tensor, torch.Tensor]:
+        # TODO: (anufriev) implement
+        return None, None, None, None
+
+    def get_quantizer_config(self) -> QuantizerConfig:
+        return QuantizerConfig(
+            num_bits=self.num_bits,
+            mode=QuantizationMode.ASYMMETRIC,
+            signedness_to_force=self.signed,
+            per_channel=self.per_channel,
+        )
+
+    def set_levels(self):
+        scaled_num_bits = 1 if self._half_range else 0
+        self.level_low, self.level_high = calculate_symmetric_level_ranges(
+            self.num_bits - scaled_num_bits, self.signed, self._narrow_range
+        )
+
+    @property
+    def signed(self):
+        return True
 
 
 def get_per_channel_scale_shape(input_shape, is_weights, channel_idx: Optional[int] = None) -> List[int]:

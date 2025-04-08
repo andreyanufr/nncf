@@ -308,9 +308,9 @@ class MinMaxQuantization(Algorithm):
                 msg = f"overflow_fix option with {self._overflow_fix} value is not supported with the mode option!"
                 raise nncf.ParameterNotSupportedError(msg)
 
-            if self._quantize_outputs:
-                msg = "quantize_outputs option is not supported with the mode option!"
-                raise nncf.ParameterNotSupportedError(msg)
+            # if self._quantize_outputs:
+            #     msg = "quantize_outputs option is not supported with the mode option!"
+            #     raise nncf.ParameterNotSupportedError(msg)
 
     def _reset_cache(self) -> None:
         """

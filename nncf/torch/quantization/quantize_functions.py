@@ -370,7 +370,19 @@ def symmetric_quantize_lora(input_, input_shape, A, B, scale, level_low, level_h
 
 @register_operator()
 def quantize_lora_scale(
-    input_, input_shape, A, B, col_scale, row_scale, A_bias, B_bias, level_low, level_high, eps, skip: bool = False
+    input_,
+    input_shape,
+    A,
+    B,
+    col_scale,
+    row_scale,
+    A_scale,
+    B_scale,
+    level_low,
+    level_high,
+    eps,
+    skip: bool = False,
+    return_quantization_params: bool = False,
 ):
     if has_torch_function_unary(input_):
         return handle_torch_function(
@@ -381,8 +393,8 @@ def quantize_lora_scale(
             B,
             col_scale,
             row_scale,
-            A_bias,
-            B_bias,
+            A_scale,
+            B_scale,
             level_low,
             level_high,
             eps,
@@ -391,7 +403,7 @@ def quantize_lora_scale(
     if skip:
         return input_
 
-    input_ = input_ / (B @ A + col_scale + row_scale).exp() + B_bias @ A_bias
+    input_ = input_ / (B_scale @ A_scale + col_scale + row_scale).exp() + B @ A
     orig_shape = input_.shape
     input_ = input_.reshape(input_shape)
 
@@ -412,6 +424,9 @@ def quantize_lora_scale(
         scale = torch.where(torch.abs(scale) < eps, eps, scale)
         scale = scale / abs(level_low)
         zero_point = torch.zeros_like(scale)
+
+    if return_quantization_params:
+        return level_high, level_low, input_low, input_high
 
     x_int = RoundSTE.apply(input_ / scale + zero_point)
     x_quant = torch.clamp(x_int, level_low, level_high)
