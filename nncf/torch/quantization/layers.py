@@ -1204,7 +1204,7 @@ class SymmetricLoraQuantizer(SymmetricQuantizer, LoraMixin):
 
 @COMPRESSION_MODULES.register()
 @QUANTIZATION_MODULES.register(QuantizationMode.ASYMMETRIC_LORA_SCALE)
-class AsymmetricLoraScaleQuantizer(BaseQuantizer, LoraMixin):
+class AsymmetricLoraScaleQuantizer(AsymmetricQuantizer, LoraMixin):
     _arg_names = ["qspec", "lspec"]
 
     def __init__(self, qspec: PTQuantizerSpec, lspec: PTLoraSpec):
@@ -1232,6 +1232,27 @@ class AsymmetricLoraScaleQuantizer(BaseQuantizer, LoraMixin):
             self.level_high,
             self.eps,
             skip=execute_traced_op_as_identity,
+        )
+    
+    
+    def get_data_for_decompression(self, x: torch.Tensor):
+        # TODO: (dokuchaev) remove within new tracing (ticket-163869)
+        with DisableTorchFunction():
+            # in multi-device case after loading nncf checkpoint, quantizers have a different device.
+            self.to(x.device)
+        return quantize_lora_scale(
+            x,
+            self._lspec.weight_shape,
+            self.lora_A,
+            self.lora_B,
+            self.lora_col_scale,
+            self.lora_row_scale,
+            self.lora_A_scale,
+            self.lora_B_scale,
+            self.level_low,
+            self.level_high,
+            self.eps,
+            return_data_for_decompression=True,
         )
 
     def enable_gradients(self) -> None:
@@ -1309,7 +1330,7 @@ class AsymmetricLoraScaleQuantizer(BaseQuantizer, LoraMixin):
 
 @COMPRESSION_MODULES.register()
 @QUANTIZATION_MODULES.register(QuantizationMode.SYMMETRIC_LORA_SCALE)
-class SymmetricLoraScaleQuantizer(BaseQuantizer, LoraMixin):
+class SymmetricLoraScaleQuantizer(SymmetricQuantizer, LoraMixin):
     def __init__(self, qspec: PTQuantizerSpec, lspec: PTLoraSpec):
         super().__init__(qspec)
         self.init_lora(lspec, use_scale=True)
@@ -1334,6 +1355,26 @@ class SymmetricLoraScaleQuantizer(BaseQuantizer, LoraMixin):
             self.level_high,
             self.eps,
             skip=execute_traced_op_as_identity,
+        )
+
+    def get_data_for_decompression(self, x: torch.Tensor):
+        # TODO: (dokuchaev) remove within new tracing (ticket-163869)
+        with DisableTorchFunction():
+            # in multi-device case after loading nncf checkpoint, quantizers have a different device.
+            self.to(x.device)
+        return quantize_lora_scale(
+            x,
+            self._lspec.weight_shape,
+            self.lora_A,
+            self.lora_B,
+            self.lora_col_scale,
+            self.lora_row_scale,
+            self.lora_A_bias,
+            self.lora_B_bias,
+            self.level_low,
+            self.level_high,
+            self.eps,
+            return_data_for_decompression=True,
         )
 
     def enable_gradients(self) -> None:

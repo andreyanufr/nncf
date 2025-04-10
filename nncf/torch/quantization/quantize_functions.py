@@ -383,6 +383,7 @@ def quantize_lora_scale(
     eps,
     skip: bool = False,
     return_quantization_params: bool = False,
+    return_data_for_decompression: bool = False,
 ):
     if has_torch_function_unary(input_):
         return handle_torch_function(
@@ -430,6 +431,10 @@ def quantize_lora_scale(
 
     x_int = RoundSTE.apply(input_ / scale + zero_point)
     x_quant = torch.clamp(x_int, level_low, level_high)
+    
+    if return_data_for_decompression:
+        return scale, zero_point, x_quant
+    
     fq_weight = (x_quant - zero_point) * scale
     fq_weight = fq_weight.to(input_.dtype)
     fq_weight = fq_weight.reshape(orig_shape)

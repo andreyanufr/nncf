@@ -14,6 +14,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import torch
 import torch.nn.functional as F

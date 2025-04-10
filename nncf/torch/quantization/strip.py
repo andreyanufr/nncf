@@ -29,6 +29,7 @@ from nncf.torch.model_graph_manager import split_const_name
 from nncf.torch.model_transformer import PTModelTransformer
 from nncf.torch.nncf_network import NNCFNetwork
 from nncf.torch.quantization.layers import AsymmetricQuantizer
+from nncf.torch.quantization.layers import AsymmetricLoraScaleQuantizer
 from nncf.torch.quantization.layers import BaseQuantizer
 from nncf.torch.quantization.layers import BaseWeightsDecompressor
 from nncf.torch.quantization.layers import INT4AsymmetricWeightsDecompressor
@@ -36,6 +37,7 @@ from nncf.torch.quantization.layers import INT4SymmetricWeightsDecompressor
 from nncf.torch.quantization.layers import INT8AsymmetricWeightsDecompressor
 from nncf.torch.quantization.layers import INT8SymmetricWeightsDecompressor
 from nncf.torch.quantization.layers import SymmetricQuantizer
+from nncf.torch.quantization.layers import SymmetricLoraScaleQuantizer
 from nncf.torch.quantization.quantize_functions import TuneRange
 
 SUPPORTED_NUM_BITS_FOR_STRIP_MODEL = [8]
@@ -299,6 +301,51 @@ def sym_fq_to_decompressor(
     return decompressor, q_weight
 
 
+def lora_scale_to_decompressor(
+    quantizer: AsymmetricLoraScaleQuantizer, weight: torch.Tensor
+) -> Tuple[BaseWeightsDecompressor, torch.Tensor]:
+    """
+    Converts an asymmetric quantizer and original weight tensor to a decompressor and quantized weight tensor.
+
+    :param quantizer: The asymmetric quantizer instance.
+    :param weight: The weight tensor to be compressed and used in decompressor.
+    :return: The decompressor and quantized weight corresponding to the given quantizer and original weight.
+    """
+    assert isinstance(quantizer, (AsymmetricLoraScaleQuantizer, SymmetricLoraScaleQuantizer))
+    weight_dtype = weight.dtype
+    weight_shape = weight.shape
+    
+
+    scale, zero_point, q_weight = quantizer.get_data_for_decompression(weight)
+
+    if quantizer.level_low == 0:
+        integer_dtype = torch.uint8
+        if quantizer.num_bits == 8:
+            decompressor = INT8AsymmetricWeightsDecompressor(scale=scale, zero_point=zero_point, result_dtype=weight_dtype)
+        else:
+            decompressor = INT4AsymmetricWeightsDecompressor(
+                scale=scale,
+                zero_point=zero_point,
+                compressed_weight_shape=q_weight.shape,
+                result_shape=weight_shape,
+                result_dtype=weight_dtype,
+            )
+    else:
+        integer_dtype = torch.int8
+        if quantizer.num_bits == 8:
+            decompressor = INT8SymmetricWeightsDecompressor(scale=scale, result_dtype=weight_dtype)
+        else:
+            decompressor = INT4SymmetricWeightsDecompressor(
+                scale=scale,
+                compressed_weight_shape=q_weight.shape,
+                result_shape=weight_shape,
+                result_dtype=weight_dtype,
+            )
+    q_weight = q_weight.to(integer_dtype)
+
+    return decompressor, q_weight
+
+
 def replace_with_decompressors(model: NNCFNetwork) -> NNCFNetwork:
     """
     Performs transformation from fake quantize format (FQ) to dequantization one (DQ).
@@ -345,7 +392,10 @@ def replace_with_decompressors(model: NNCFNetwork) -> NNCFNetwork:
         weight_name = weight_node.layer_attributes.name
         weight = get_const_data(weight_node, model)
 
-        convert_fn = asym_fq_to_decompressor if isinstance(quantizer, AsymmetricQuantizer) else sym_fq_to_decompressor
+        if isinstance(quantizer, (AsymmetricLoraScaleQuantizer, SymmetricLoraScaleQuantizer)):
+            convert_fn = lora_scale_to_decompressor
+        else:
+            convert_fn = asym_fq_to_decompressor if isinstance(quantizer, AsymmetricQuantizer) else sym_fq_to_decompressor
         decompressor, q_weight = convert_fn(quantizer, weight)
 
         packed_tensor = decompressor.pack_weight(q_weight)
