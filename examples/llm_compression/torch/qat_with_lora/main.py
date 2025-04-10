@@ -9,20 +9,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
+import os
 import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
-import os
+from typing import Any, Dict, List, Optional, Union
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import torch
 import torch.nn.functional as F
 import transformers
 from datasets import load_dataset
+from lm_eval import simple_evaluate
+from lm_eval.models.optimum_lm import OptimumLM
 from optimum.exporters.openvino.convert import export_from_model
 from optimum.intel.openvino import OVModelForCausalLM
+from optimum.modeling_base import OptimizedModel
 from torch import Tensor
 from torch import nn
 from torch.utils.tensorboard import SummaryWriter
@@ -67,6 +71,24 @@ def get_wikitext2(nsamples: int, seqlen: int, tokenizer: Any, device: torch.devi
         inp = trainenc.input_ids[:, i:j].to(device)
         trainloader.append(inp)
     return trainloader
+
+
+def measure_perplexity(
+    optimum_model: OptimizedModel, max_length: Optional[int] = None, limit: Optional[Union[int, float]] = None
+) -> float:
+    """
+    Measure perplexity on the Wikitext dataset, via rolling loglikelihoods for a given model.
+
+    :param optimum_model: A model to be evaluated.
+    :param max_length: The maximum sequence length for evaluation.
+    :param limit: Limit the number of examples per task (only use this for testing).
+        If <1, limit is a percentage of the total number of examples.
+    :return: The similarity score as a float.
+    """
+    print("#" * 50 + " Evaluate via lm-eval-harness " + "#" * 50)
+    lm_obj = OptimumLM(pretrained=optimum_model, max_length=max_length)
+    results = simple_evaluate(lm_obj, tasks=["wikitext"], limit=limit)
+    return results["results"]["wikitext"]["word_perplexity,none"]
 
 
 @torch.no_grad()
@@ -250,6 +272,14 @@ def export_to_openvino(
     )
 
 
+def limit_type(astr: str):
+    value = int(astr)
+    if value < 0 or value > 1:
+        msg = "value not in range [0,1]"
+        raise argparse.ArgumentTypeError(msg)
+    return value
+
+
 def get_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=True)
 
@@ -276,6 +306,14 @@ def get_argument_parser() -> argparse.ArgumentParser:
     # Data params
     parser.add_argument("--nsamples", type=int, default=128, help="Number of training samples")
     parser.add_argument("--seqlen", type=int, default=1024, help="Calibration data context length.")
+    parser.add_argument("--eval_seqlen", type=int, default=2048, help="Evaluation data context length.")
+    parser.add_argument(
+        "--limit",
+        type=limit_type,
+        default=None,
+        help="A percentage of the total number of examples for evaluation. "
+        "Should be on the range [0,1]. If None, all samples will be used.",
+    )
 
     # Training params
     parser.add_argument(
@@ -307,7 +345,7 @@ def main(argv) -> float:
     device = "cuda"
     torch_dtype = torch.bfloat16
     compression_config = dict(
-        mode=CompressWeightsMode.INT4_ASYM, group_size=64, compression_format=CompressionFormat.FQ_LORA_SCALE
+        mode=CompressWeightsMode.INT4_SYM, group_size=64, compression_format=CompressionFormat.FQ_LORA_SCALE
     )
 
     # Configure output and log files.
@@ -353,9 +391,10 @@ def main(argv) -> float:
 
     # Convert torch checkpoint to an OpenVINO model and evaluate it via WWB.
     model_for_eval = export_to_openvino(args.pretrained, train_loader[0], ckpt_file, last_dir)
-    best_similarity = measure_similarity(model_for_eval, tokenizer, wwb_ref_file)
-    tb.add_scalar("similarity", best_similarity, 0)
-    print(f"Initial WWB similarity= {best_similarity:.4f}")
+    best_perplexity = measure_perplexity(model_for_eval, args.eval_seqlen, args.limit)
+    tb.add_scalar("perplexity", best_perplexity, 0)
+    print(f"Initial perplexity on wikitext = {best_perplexity:.4f}")
+    del model_for_eval
 
     # Run tuning with distillation loss and validation on WWB after each epoch.
     grad_accumulation_steps = args.batch_size // args.microbatch_size
@@ -405,16 +444,17 @@ def main(argv) -> float:
         # Save the best checkpoint and OpenVINO IR for the highest similarity score obtained from WWB.
         save_checkpoint(model, ckpt_file)
         model_for_eval = export_to_openvino(args.pretrained, train_loader[0], ckpt_file, last_dir)
-        similarity = measure_similarity(model_for_eval, tokenizer, wwb_ref_file)
-        print(f"[Epoch {epoch}], WWB similarity = {similarity:.4f}")
-        tb.add_scalar("similarity", similarity, total_microbatches)
-        if similarity > best_similarity:
-            print(f"New best WWB similarity = {similarity:.4f}")
-            best_similarity = similarity
+        perplexity = measure_perplexity(model_for_eval, args.eval_seqlen, args.limit)
+        tb.add_scalar("perplexity", perplexity, total_microbatches)
+        print(f"[Epoch {epoch}], perplexity on wikitext = {perplexity:.4f}")
+        del model_for_eval
+        if perplexity < best_perplexity:
+            print(f"New best perplexity = {perplexity:.4f}")
+            best_perplexity = perplexity
             shutil.copytree(last_dir, best_dir, dirs_exist_ok=True)
 
-    print(f"The finetuned OV model with the best similarity={best_similarity} saved to: {best_dir}")
-    return best_similarity
+    print(f"The finetuned OV model with the best perplexity={best_perplexity} saved to: {best_dir}")
+    return best_perplexity
 
 
 if __name__ == "__main__":

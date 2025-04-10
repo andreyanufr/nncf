@@ -1233,8 +1233,7 @@ class AsymmetricLoraScaleQuantizer(AsymmetricQuantizer, LoraMixin):
             self.eps,
             skip=execute_traced_op_as_identity,
         )
-    
-    
+
     def get_data_for_decompression(self, x: torch.Tensor):
         # TODO: (dokuchaev) remove within new tracing (ticket-163869)
         with DisableTorchFunction():
@@ -1349,8 +1348,8 @@ class SymmetricLoraScaleQuantizer(SymmetricQuantizer, LoraMixin):
             self.lora_B,
             self.lora_col_scale,
             self.lora_row_scale,
-            self.lora_A_bias,
-            self.lora_B_bias,
+            self.lora_A_scale,
+            self.lora_B_scale,
             self.level_low,
             self.level_high,
             self.eps,
@@ -1369,8 +1368,8 @@ class SymmetricLoraScaleQuantizer(SymmetricQuantizer, LoraMixin):
             self.lora_B,
             self.lora_col_scale,
             self.lora_row_scale,
-            self.lora_A_bias,
-            self.lora_B_bias,
+            self.lora_A_scale,
+            self.lora_B_scale,
             self.level_low,
             self.level_high,
             self.eps,
@@ -1447,7 +1446,14 @@ class SymmetricLoraScaleQuantizer(SymmetricQuantizer, LoraMixin):
 
     @property
     def signed(self):
-        return True
+        with no_jit_trace():
+            with DisableTorchFunction():
+                return self.signed_tensor.item() == 1
+
+    @signed.setter
+    def signed(self, signed: bool):
+        self.signed_tensor.fill_(int(signed))
+        self.set_levels()
 
 
 def get_per_channel_scale_shape(input_shape, is_weights, channel_idx: Optional[int] = None) -> List[int]:
