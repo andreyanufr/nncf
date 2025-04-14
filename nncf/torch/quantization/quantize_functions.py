@@ -400,16 +400,24 @@ def quantize_lora_scale(
             level_high,
             eps,
             skip,
+            return_quantization_params,
+            return_data_for_decompression,
         )
     if skip:
         return input_
 
-    input_ = input_ / (B_scale @ A_scale + col_scale + row_scale).exp() + B @ A
+    input_ = input_
+    w_scale = (B_scale @ A_scale + col_scale + row_scale).exp()
+    w_bias = B @ A
     orig_shape = input_.shape
     input_ = input_.reshape(input_shape)
+    w_scale = w_scale.reshape(input_shape)
+    w_bias = w_bias.reshape(input_shape)
 
     input_low = torch.amin(input_, dim=-1, keepdim=True).float()
     input_high = torch.amax(input_, dim=-1, keepdim=True).float()
+
+    input_ = input_ / w_scale + w_bias
 
     if level_low == 0:  # asymmetric quantization
         levels = level_high - level_low + 1

@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Union
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 import transformers
@@ -27,6 +28,7 @@ from lm_eval.models.optimum_lm import OptimumLM
 from optimum.exporters.openvino.convert import export_from_model
 from optimum.intel.openvino import OVModelForCausalLM
 from optimum.modeling_base import OptimizedModel
+from scipy.signal import savgol_filter
 from torch import Tensor
 from torch import nn
 from torch.utils.tensorboard import SummaryWriter
@@ -38,6 +40,7 @@ from whowhatbench import TextEvaluator
 
 import nncf
 from nncf.data.dataset import Dataset
+from nncf.parameters import BackupMode
 from nncf.parameters import CompressionFormat
 from nncf.parameters import CompressWeightsMode
 from nncf.parameters import StripFormat
@@ -91,6 +94,28 @@ def measure_perplexity(
     return results["results"]["wikitext"]["word_perplexity,none"]
 
 
+def measure_perplexity_pt(
+    optimum_model, max_length: Optional[int] = None, limit: Optional[Union[int, float]] = None
+) -> float:
+    """
+    Measure perplexity on the Wikitext dataset, via rolling loglikelihoods for a given model.
+
+    :param optimum_model: A model to be evaluated.
+    :param max_length: The maximum sequence length for evaluation.
+    :param limit: Limit the number of examples per task (only use this for testing).
+        If <1, limit is a percentage of the total number of examples.
+    :return: The similarity score as a float.
+    """
+    optimum_model.eval()
+    print("#" * 50 + " Evaluate via lm-eval-harness " + "#" * 50)
+    with torch.inference_mode():
+        lm_obj = OptimumLM(pretrained=optimum_model, max_length=max_length)
+        results = simple_evaluate(lm_obj, tasks=["wikitext"], limit=limit)
+    optimum_model.train()
+
+    return results["results"]["wikitext"]["word_perplexity,none"]
+
+
 @torch.no_grad()
 def save_wwb_ref(model: str, tokenizer: Any, wwb_ref_file: Path) -> None:
     """
@@ -102,7 +127,7 @@ def save_wwb_ref(model: str, tokenizer: Any, wwb_ref_file: Path) -> None:
     """
     if not wwb_ref_file.exists():
         print("#" * 50 + " Collect reference answers for WWB " + "#" * 50)
-        wwb_eval = TextEvaluator(base_model=model, tokenizer=tokenizer, use_chat_template=True)
+        wwb_eval = TextEvaluator(base_model=model, tokenizer=tokenizer, use_chat_template=False)
         wwb_eval.dump_gt(str(wwb_ref_file))
         torch.cuda.empty_cache()
 
@@ -274,8 +299,8 @@ def export_to_openvino(
 
 def limit_type(astr: str):
     value = int(astr)
-    if value < 0 or value > 1:
-        msg = "value not in range [0,1]"
+    if value <= 0:
+        msg = "value less than 1"
         raise argparse.ArgumentTypeError(msg)
     return value
 
@@ -304,16 +329,10 @@ def get_argument_parser() -> argparse.ArgumentParser:
     )
 
     # Data params
-    parser.add_argument("--nsamples", type=int, default=128, help="Number of training samples")
+    parser.add_argument("--nsamples", type=int, default=1024, help="Number of training samples")
     parser.add_argument("--seqlen", type=int, default=1024, help="Calibration data context length.")
     parser.add_argument("--eval_seqlen", type=int, default=2048, help="Evaluation data context length.")
-    parser.add_argument(
-        "--limit",
-        type=limit_type,
-        default=None,
-        help="A percentage of the total number of examples for evaluation. "
-        "Should be on the range [0,1]. If None, all samples will be used.",
-    )
+    parser.add_argument("--limit", type=limit_type, default=10, help=" Number of samples to use for evaluation.")
 
     # Training params
     parser.add_argument(
@@ -323,8 +342,8 @@ def get_argument_parser() -> argparse.ArgumentParser:
         help="Learning rate for fine-tuning. "
         "For larger models (over 2 billion parameters), a learning rate of 5e-4 is recommended.",
     )
-    parser.add_argument("--epochs", type=int, default=10, help="Number of epochs.")
-    parser.add_argument("--batch_size", type=int, default=32, help="Size of training batch.")
+    parser.add_argument("--epochs", type=int, default=32, help="Number of epochs.")
+    parser.add_argument("--batch_size", type=int, default=128, help="Size of training batch.")
     parser.add_argument(
         "--microbatch_size",
         type=int,
@@ -332,6 +351,96 @@ def get_argument_parser() -> argparse.ArgumentParser:
         help="Size of each training microbatch. Gradients will be accumulated until the batch size is reached.",
     )
     return parser
+
+
+# @torch.inference_mode()
+def smooth_down_proj(model):
+    layers = [layer for layer in model.model.layers]
+    for idx, layer in enumerate(tqdm(layers, unit="layer", desc="Smooth down_proj")):
+        A = layer.mlp.down_proj.weight.data  # .double().cpu().numpy()
+        s = torch.mean(torch.abs(A), dim=0)
+        s = torch.sqrt(s)
+        sd = 1.0 / s.unsqueeze(0)
+
+        if hasattr(layer.mlp, "up_proj"):  # llama
+            sug = s.unsqueeze(1).to(layer.mlp.up_proj.weight.data.device)
+            layer.mlp.up_proj.weight.data = layer.mlp.up_proj.weight.data * sug
+        elif hasattr(layer.mlp, "gate_up_proj"):  # phi
+            sug = s.unsqueeze(1).to(layer.mlp.gate_up_proj.weight.data.device)
+            sz = layer.mlp.gate_up_proj.weight.data.shape
+            layer.mlp.gate_up_proj.weight.data[sz[0] // 2 :, :] = (
+                layer.mlp.gate_up_proj.weight.data[sz[0] // 2 :, :] * sug
+            )
+        else:
+            continue
+        layer.mlp.down_proj.weight.data = layer.mlp.down_proj.weight.data * sd
+
+
+def ov_correction(module, head_dim, R2, output=True):
+    W_ = module.weight.data
+    dtype = W_.dtype
+    dev = W_.device
+    init_shape = W_.shape
+    W_ = W_.float().cuda()
+    R2 = R2.to(W_.device)
+    if output:
+        W_ = W_.t()
+        transposed_shape = W_.shape
+        temp = W_.reshape(-1, transposed_shape[-1] // head_dim, head_dim)
+        temp = temp.to(torch.float64) @ R2
+        W_ = temp.reshape(transposed_shape).t()
+    else:
+        init_shape = W_.shape
+        temp = W_.reshape(-1, init_shape[-1] // head_dim, head_dim)
+        temp = temp.to(torch.float64) @ R2
+        W_ = temp.reshape(init_shape)
+    module.weight.data = W_.to(device=dev, dtype=dtype)
+
+
+def rotate_model_R2(model):
+    config = model.config
+    num_heads = config.num_attention_heads
+    model_dim = config.hidden_size
+    head_dim = model_dim // num_heads
+
+    layers = [layer for layer in model.model.layers]
+    for idx, layer in enumerate(tqdm(layers, unit="layer", desc="Rotating v_proj-o_proj")):
+        A = layer.self_attn.v_proj.weight.data.T
+        B = 1.0 * A
+        B = B.double().cpu().numpy()
+        B = savgol_filter(B, 7, 3, axis=0)  # , mode='nearest')
+        B = torch.Tensor(B)
+
+        shape = A.shape
+        A = A.reshape(-1, shape[-1] // head_dim, head_dim)
+        A = A.reshape(-1, head_dim)
+        A = A.double().cpu().numpy()
+
+        B = B.reshape(-1, shape[-1] // head_dim, head_dim)
+        B = B.reshape(-1, head_dim)
+        B = B.double().cpu().numpy()
+
+        # B = savgol_filter(A, 7, 3, axis=0)
+        R2 = np.linalg.pinv(A) @ B
+        R2_inv = np.linalg.inv(R2)
+        # R2 = R1.cpu().numpy()
+        # R2_inv = R1.T.cpu().numpy()
+
+        print("A - B ", np.mean(np.abs(A - B)))
+        print("A @ R2 - B ", np.mean(np.abs(A @ R2 - B)))
+
+        R2 = torch.Tensor(R2).to(layer.self_attn.v_proj.weight.device).double()
+        R2_inv = torch.Tensor(R2_inv).to(layer.self_attn.o_proj.weight.device).double()
+
+        ov_correction(layer.self_attn.v_proj, head_dim, R2, True)
+        ov_correction(layer.self_attn.o_proj, head_dim, R2_inv, False)
+
+        A_ = layer.self_attn.v_proj.weight.data.T
+        shape = A_.shape
+        A_ = A_.reshape(-1, shape[-1] // head_dim, head_dim)
+        A_ = A_.reshape(-1, head_dim)
+        A_ = A_.double().cpu().numpy()
+        print("A @ R2 - A_ ", np.mean(np.abs(A @ R2.cpu().numpy() - A_)))
 
 
 def main(argv) -> float:
@@ -345,7 +454,10 @@ def main(argv) -> float:
     device = "cuda"
     torch_dtype = torch.bfloat16
     compression_config = dict(
-        mode=CompressWeightsMode.INT4_SYM, group_size=64, compression_format=CompressionFormat.FQ_LORA_SCALE
+        mode=CompressWeightsMode.INT4_SYM,
+        group_size=128,
+        compression_format=CompressionFormat.FQ_LORA_SCALE,
+        backup_mode=BackupMode.NONE,
     )
 
     # Configure output and log files.
@@ -366,12 +478,18 @@ def main(argv) -> float:
     model = AutoModelForCausalLM.from_pretrained(args.pretrained, torch_dtype=torch_dtype, device_map="auto")
     tokenizer = AutoTokenizer.from_pretrained(args.pretrained)
 
+    if model.config.tie_word_embeddings:
+        model.config.tie_word_embeddings = False
+        model.lm_head.weight.data = model.model.embed_tokens.weight.data.clone()
+
+    smooth_down_proj(model)
+
     # Use WhoWhatBench tool (WWB) is for validation during tuning. It estimates the similarity score between embedding
     # computed by for data generated by two models, original floating-point one and optimized.
     # TODO: (nlyalyus) Use original model for collecting reference, once the bug in WWB resolved.
-    wwb_ref_model = AutoModelForCausalLM.from_pretrained(args.pretrained, torch_dtype=torch_dtype, device_map="cpu")
-    save_wwb_ref(wwb_ref_model, tokenizer, wwb_ref_file)
-    del wwb_ref_model
+    # wwb_ref_model = AutoModelForCausalLM.from_pretrained(args.pretrained, torch_dtype=torch_dtype, device_map="cpu")
+    # save_wwb_ref(wwb_ref_model, tokenizer, wwb_ref_file)
+    # del wwb_ref_model
 
     # Prepare training data and pre-compute hiddens of teacher model for distillation loss.
     train_loader = get_wikitext2(nsamples=args.nsamples, seqlen=args.seqlen, tokenizer=tokenizer, device=device)
@@ -384,23 +502,25 @@ def main(argv) -> float:
     else:
         model = compress_weights(model, dataset=Dataset([example_input]), **compression_config)
         save_checkpoint(model, ckpt_file)
-    fq_lr = args.lr / 10
-    weight_decay = args.lr
+    fq_lr = args.lr
+    weight_decay = args.lr / 10
     param_to_train = set_trainable(model, lora_lr=args.lr, fq_lr=fq_lr)
     opt = torch.optim.AdamW(param_to_train, weight_decay=weight_decay)
 
     # Convert torch checkpoint to an OpenVINO model and evaluate it via WWB.
-    model_for_eval = export_to_openvino(args.pretrained, train_loader[0], ckpt_file, last_dir)
-    best_perplexity = measure_perplexity(model_for_eval, args.eval_seqlen, args.limit)
+    # model_for_eval = export_to_openvino(args.pretrained, train_loader[0], ckpt_file, last_dir)
+    best_perplexity = measure_perplexity_pt(model, args.eval_seqlen, args.limit)
     tb.add_scalar("perplexity", best_perplexity, 0)
     print(f"Initial perplexity on wikitext = {best_perplexity:.4f}")
-    del model_for_eval
+    # del model_for_eval
 
     # Run tuning with distillation loss and validation on WWB after each epoch.
     grad_accumulation_steps = args.batch_size // args.microbatch_size
     num_samples = len(train_loader)
     epoch_samples = num_samples - num_samples % args.microbatch_size
     microbatches_per_epoch = epoch_samples // args.microbatch_size
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs * num_samples // grad_accumulation_steps, eta_min=0.)
+    scheduler = torch.optim.lr_scheduler.StepLR(opt, step_size=10, gamma=0.5)
     aggregated_loss = float("nan")
     loss_numerator = grad_steps = total_microbatches = 0
     for epoch in range(args.epochs):
@@ -425,6 +545,7 @@ def main(argv) -> float:
                         targets = targets * fls
             outputs = model(**inputs).logits
             loss = kl_div(outputs, targets.to(dtype=torch_dtype))
+            tb.add_scalar("iter loss", loss.item(), total_microbatches)
 
             # Perform an optimization step after accumulating gradients over multiple minibatches.
             loss_numerator += loss.item()
@@ -436,22 +557,30 @@ def main(argv) -> float:
             if grad_steps == grad_accumulation_steps:
                 opt.step()
                 opt.zero_grad()
+                # scheduler.step()
                 aggregated_loss = loss_numerator / grad_steps
                 loss_numerator = grad_steps = 0
             tb.add_scalar("loss", aggregated_loss, total_microbatches)
-
+        scheduler.step()
         # Export tuned model to OpenVINO and evaluate it using WWB.
         # Save the best checkpoint and OpenVINO IR for the highest similarity score obtained from WWB.
         save_checkpoint(model, ckpt_file)
-        model_for_eval = export_to_openvino(args.pretrained, train_loader[0], ckpt_file, last_dir)
-        perplexity = measure_perplexity(model_for_eval, args.eval_seqlen, args.limit)
+        # model_for_eval = export_to_openvino(args.pretrained, train_loader[0], ckpt_file, last_dir)
+        perplexity = measure_perplexity_pt(model, args.eval_seqlen, args.limit)
         tb.add_scalar("perplexity", perplexity, total_microbatches)
         print(f"[Epoch {epoch}], perplexity on wikitext = {perplexity:.4f}")
-        del model_for_eval
+        # del model_for_eval
         if perplexity < best_perplexity:
             print(f"New best perplexity = {perplexity:.4f}")
             best_perplexity = perplexity
             shutil.copytree(last_dir, best_dir, dirs_exist_ok=True)
+
+    perplexity = measure_perplexity_pt(model, args.eval_seqlen, None)
+    print(f"Final PT perplexity on wikitext = {perplexity:.4f}")
+
+    model_for_eval = export_to_openvino(args.pretrained, train_loader[0], ckpt_file, best_dir)
+    perplexity = measure_perplexity(model_for_eval, args.eval_seqlen, None)
+    print(f"Final OV perplexity on wikitext = {perplexity:.4f}")
 
     print(f"The finetuned OV model with the best perplexity={best_perplexity} saved to: {best_dir}")
     return best_perplexity

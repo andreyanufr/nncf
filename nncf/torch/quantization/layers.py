@@ -1079,14 +1079,15 @@ class LoraMixin(nn.Module):
         if rank > out_features or rank > in_features:
             msg = f"Specified LoRA rank={rank} cannot exceed any dimension of the weight tensor"
             raise nncf.ValidationError(msg)
-        self.lora_A = torch.nn.Parameter(torch.ones((rank, in_features), dtype=default_lora_dtype))
+        self.lora_A = torch.nn.Parameter(torch.zeros((rank, in_features), dtype=default_lora_dtype))
         self.lora_B = torch.nn.Parameter(torch.zeros((out_features, rank), dtype=default_lora_dtype))
         if use_scale:
             self.lora_col_scale = torch.nn.Parameter(torch.zeros((out_features, 1), dtype=default_lora_dtype))
             self.lora_row_scale = torch.nn.Parameter(torch.zeros((1, in_features), dtype=default_lora_dtype))
-            self.lora_A_scale = torch.nn.Parameter(torch.ones((rank, in_features), dtype=default_lora_dtype))
+            self.lora_A_scale = torch.nn.Parameter(torch.zeros((rank, in_features), dtype=default_lora_dtype))
             self.lora_B_scale = torch.nn.Parameter(torch.zeros((out_features, rank), dtype=default_lora_dtype))
-            torch.nn.init.kaiming_uniform_(self.lora_A_scale, a=0.25)
+            torch.nn.init.kaiming_uniform_(self.lora_B_scale, a=3.25)
+            # torch.nn.init.kaiming_uniform_(self.lora_B, a=3.25)
 
     def enable_gradients(self):
         for name, p in self.named_parameters():
