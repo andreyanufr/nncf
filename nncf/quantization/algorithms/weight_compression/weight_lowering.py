@@ -382,8 +382,9 @@ def compress_weight(
     :return: The compressed weight and decompression parameters as instance of CompressedWeight
     """
     if config.mode == CompressWeightsMode.CBF4:
-        data = np.array([-8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7], dtype=np.float32) / 8.0
-        data = NF4_QUANTILES
+        # data = np.array([-8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7], dtype=np.float32) / 8.0
+        # data = NF4_QUANTILES
+        data = np.array([-1., -0.6875, -0.5, -0.40625, -0.28125, -0.1875, -0.09375, 0., 0.078125, 0.15625, 0.25, 0.34375, 0.4375, 0.5625, 0.75, 1.])
         return weights_clusterization_k_means(weight, n_init=data)
     if not config.is_integer:
         if weight.backend == TensorBackend.ov:

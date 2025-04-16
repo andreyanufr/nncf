@@ -165,6 +165,10 @@ class KMeansHist:
         return res
         
     def fit(self, X_train, init, fixed=[]):
+        if self.max_iter == 1:
+            self.centroids = deepcopy(init)
+            return
+
         self.hist = self.create_histogramm(X_train)
         
         init_by_hist = self.get_init(self.hist[0], self.hist[2], self.n_clusters)
@@ -223,7 +227,7 @@ def weights_clusterization_k_means(weight, n_centroids=2**4, n_init="auto"):
     n_init[0] = weight.min()
     n_init[-1] = weight.max()
     
-    kmeans = KMeansHist(n_centroids)
+    kmeans = KMeansHist(n_centroids, max_iter=1)
     kmeans.fit(weight.reshape(-1, 1), n_init.reshape(1, -1), fixed=[0, 7, 15])
     
     codebook, indexes = kmeans.evaluate(weight.reshape(-1, 1))
