@@ -19,8 +19,8 @@ from nncf.common.logging.logger import nncf_logger
 from nncf.common.utils.backend import is_openvino_at_least
 from nncf.common.utils.backend import is_openvino_available
 from nncf.parameters import CompressWeightsMode
-from nncf.quantization.algorithms.weight_compression.config import WeightCompressionConfig
 from nncf.quantization.algorithms.weight_compression.codebook import weights_clusterization_k_means
+from nncf.quantization.algorithms.weight_compression.config import WeightCompressionConfig
 from nncf.quantization.fake_quantize import calculate_scale_zero_point
 from nncf.tensor import Tensor
 from nncf.tensor import functions as fns
@@ -384,7 +384,26 @@ def compress_weight(
     if config.mode == CompressWeightsMode.CBF4:
         # data = np.array([-8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7], dtype=np.float32) / 8.0
         # data = NF4_QUANTILES
-        data = np.array([-1., -0.6875, -0.5, -0.40625, -0.28125, -0.1875, -0.09375, 0., 0.078125, 0.15625, 0.25, 0.34375, 0.4375, 0.5625, 0.75, 1.])
+        data = np.array(
+            [
+                -1.0,
+                -0.6875,
+                -0.5,
+                -0.40625,
+                -0.28125,
+                -0.1875,
+                -0.09375,
+                0.0,
+                0.078125,
+                0.15625,
+                0.25,
+                0.34375,
+                0.4375,
+                0.5625,
+                0.75,
+                1.0,
+            ]
+        )
         return weights_clusterization_k_means(weight, n_init=data)
     if not config.is_integer:
         if weight.backend == TensorBackend.ov:

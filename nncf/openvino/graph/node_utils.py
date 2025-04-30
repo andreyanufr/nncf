@@ -687,7 +687,9 @@ def create_ov_const_from_tensor(x: Tensor, dtype: ov.Type, name: Optional[str] =
     return const
 
 
-def create_ov_codebook_unpacking_tensor(codebook: Tensor, indexes: Tensor, dtype: ov.Type, name: Optional[str] = None) -> op.Constant:
+def create_ov_codebook_unpacking_tensor(
+    codebook: Tensor, indexes: Tensor, dtype: ov.Type, name: Optional[str] = None
+) -> op.Constant:
     """
     Create an OpenVINO Constant node from the given tensor.
     :param x: Data tensor. Supports NumPy and OV tensor backends. If x backend is OV, the constant node is created
@@ -700,6 +702,6 @@ def create_ov_codebook_unpacking_tensor(codebook: Tensor, indexes: Tensor, dtype
     codebook_indexes = opset.constant(indexes.data, dtype=dtype)
     if dtype == ov.Type.u4:
         codebook_indexes = opset.convert(codebook_indexes, destination_type=ov.Type.u8)
-    
+
     const = opset.gather(cobebook_const, codebook_indexes, 0, name=name)
     return const

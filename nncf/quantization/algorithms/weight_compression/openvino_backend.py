@@ -32,7 +32,8 @@ from nncf.openvino.graph.metatypes import openvino_metatypes as om
 from nncf.openvino.graph.metatypes.groups import ATOMIC_ACTIVATIONS_OPERATIONS
 from nncf.openvino.graph.model_transformer import OVModelTransformer
 from nncf.openvino.graph.node_utils import convert_op
-from nncf.openvino.graph.node_utils import create_ov_const_from_tensor, create_ov_codebook_unpacking_tensor
+from nncf.openvino.graph.node_utils import create_ov_codebook_unpacking_tensor
+from nncf.openvino.graph.node_utils import create_ov_const_from_tensor
 from nncf.openvino.graph.node_utils import get_const_value_as_numpy_tensor
 from nncf.openvino.graph.node_utils import get_const_value_as_ov_tensor
 from nncf.openvino.graph.node_utils import get_weight_channel_axes

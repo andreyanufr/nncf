@@ -1,10 +1,12 @@
-#from sklearn.cluster import KMeans
-import numpy as np
+# from sklearn.cluster import KMeans
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Optional
-from copy import deepcopy
-from nncf.tensor import functions as fns
+
+import numpy as np
+
 from nncf.tensor import Tensor
+
 
 @dataclass
 class CodebookWeight:
@@ -34,13 +36,14 @@ def euclidean_(point, data):
     """
     Return euclidean distances between a point & a dataset
     """
-    return np.sqrt(np.sum((point - data)**2, axis=1))
+    return np.sqrt(np.sum((point - data) ** 2, axis=1))
+
 
 def euclidean(point, data):
     """
     Return euclidean distances between a point & a dataset
     """
-    return (point - data)**2
+    return (point - data) ** 2
 
 
 class KMeans:
@@ -49,7 +52,6 @@ class KMeans:
         self.max_iter = max_iter
 
     def fit(self, X_train, init, fixed=[]):
-
         # Initialize the centroids, using the "k-means++" method, where a random datapoint is selected as the first,
         # then the rest are initialized w/ probabilities proportional to their distances to the first
         # Pick a random point from train data for first centroid
@@ -72,7 +74,7 @@ class KMeans:
         # Iterate, adjusting centroids until converged or until passed max_iter
         iteration = 0
         prev_centroids = self.centroids
-        while  iteration < self.max_iter:
+        while iteration < self.max_iter:
             # Sort each datapoint, assigning to nearest centroid
             # sorted_points = [[] for _ in range(self.n_clusters)]
             # for x in X_train:
@@ -83,13 +85,13 @@ class KMeans:
             # # Push current centroids to previous, reassign centroids as mean of the points belonging to them
             prev_centroids = deepcopy(self.centroids)
             # self.centroids = [np.mean(cluster, axis=0) for cluster in sorted_points]
-            
+
             dists = euclidean(X_train, self.centroids)
             centroid_idxs = np.argmin(dists, axis=1)
             for i in range(self.n_clusters):
                 idxs = np.where(centroid_idxs == i)
                 self.centroids[:, i] = np.mean(X_train[idxs, :])
-            
+
             for i, centroid in enumerate(self.centroids):
                 if np.isnan(centroid).any():  # Catch any np.nans, resulting from a centroid having no points
                     self.centroids[i] = prev_centroids[i]
@@ -104,7 +106,6 @@ class KMeans:
         centroid_idxs = np.argmin(dists, axis=1)
 
         return deepcopy(self.centroids).flatten(), centroid_idxs
-
 
 
 class KMeansHist:
@@ -130,7 +131,7 @@ class KMeansHist:
                 prev = values[np.where(n_frequencies <= quants[i])[0][-1]]
                 next_ = values[np.where(n_frequencies <= quants[i + 1])[0][-1]]
                 res.append((prev + next_) / 2)
-        
+
         res = np.array(res).reshape(1, -1)
         return res
 
@@ -139,16 +140,16 @@ class KMeansHist:
         centers = []
         step = granularity
         prev = data_range[0]
-        
+
         while prev < data_range[1]:
             centers.append(prev + step / 2)
             prev += step
-        
+
         centers = np.array(centers).reshape(1, -1)
-        
+
         dists = euclidean(data, centers)
         centroid_idxs = np.argmin(dists, axis=1)
-        
+
         res = [[], [], []]
         for i in range(centers.shape[1]):
             idxs = np.where(centroid_idxs == i)
@@ -157,20 +158,20 @@ class KMeansHist:
             res[0].append(centers[:, i])
             res[1].append(np.sum(data[idxs, :]))
             res[2].append(len(idxs[0]))
-        
+
         res[0] = np.array(res[0]).reshape(-1, 1)
         res[1] = np.array(res[1])
         res[2] = np.array(res[2])
-        
+
         return res
-        
+
     def fit(self, X_train, init, fixed=[]):
         if self.max_iter == 1:
             self.centroids = deepcopy(init)
             return
 
         self.hist = self.create_histogramm(X_train)
-        
+
         init_by_hist = self.get_init(self.hist[0], self.hist[2], self.n_clusters)
         init_by_hist[0, 0] = -1.0
         init_by_hist[0, -1] = 1.0
@@ -178,12 +179,12 @@ class KMeansHist:
         init_by_hist[0, zero_idx] = init[0, zero_idx]
         fixed[1] = zero_idx
         init = init_by_hist
-        
+
         self.centroids = deepcopy(init)
 
         iteration = 0
         prev_centroids = self.centroids
-        while  iteration < self.max_iter:
+        while iteration < self.max_iter:
             # Sort each datapoint, assigning to nearest centroid
             # sorted_points = [[] for _ in range(self.n_clusters)]
             # for x in X_train:
@@ -194,13 +195,13 @@ class KMeansHist:
             # # Push current centroids to previous, reassign centroids as mean of the points belonging to them
             prev_centroids = deepcopy(self.centroids)
             # self.centroids = [np.mean(cluster, axis=0) for cluster in sorted_points]
-            
+
             dists = euclidean(self.hist[0], self.centroids)
             centroid_idxs = np.argmin(dists, axis=1)
             for i in range(self.n_clusters):
                 idxs = np.where(centroid_idxs == i)
                 self.centroids[:, i] = np.sum(self.hist[1][idxs]) / np.sum(self.hist[2][idxs])
-            
+
             for i, centroid in enumerate(self.centroids):
                 if np.isnan(centroid).any():  # Catch any np.nans, resulting from a centroid having no points
                     self.centroids[i] = prev_centroids[i]
@@ -221,21 +222,23 @@ class KMeansHist:
 def weights_clusterization_k_means(weight, n_centroids=2**4, n_init="auto"):
     weight = weight.as_numpy_tensor().data
     scale = np.max(np.abs(weight), axis=-1, keepdims=True)
+    scale = np.where(scale == 0.0, 1, scale)
+    ow = deepcopy(weight)
     weight = weight / scale
     orig_shape = weight.shape
     weight = weight.flatten()
     n_init[0] = weight.min()
     n_init[-1] = weight.max()
-    
+
     kmeans = KMeansHist(n_centroids, max_iter=1)
     kmeans.fit(weight.reshape(-1, 1), n_init.reshape(1, -1), fixed=[0, 7, 15])
-    
+
     codebook, indexes = kmeans.evaluate(weight.reshape(-1, 1))
     # codebook = kmeans.cluster_centers_.flatten()
     # indexes  = kmeans.labels_
-    
+
     indexes = np.reshape(indexes, orig_shape)
 
+    print(orig_shape, np.mean(np.abs(ow - codebook[indexes] * scale)))
+
     return CodebookWeight(Tensor(indexes), Tensor(scale), Tensor(codebook))
-    
-    
