@@ -220,6 +220,7 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         should_add_convert_node: bool,
         layer_scales: Optional[Tensor] = None,
         layer_zero_points: Optional[Tensor] = None,
+        advanced_parameters: AdvancedCompressionParameters = AdvancedCompressionParameters()
     ):
         scale_dtype = ov.Type.f16
         if compression_config.mode == CompressWeightsMode.NF4:
@@ -247,6 +248,7 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
                 compression_config,
                 layer_scales,
                 layer_zero_points,
+                advanced_parameters
             )
         if compression_config.mode != CompressWeightsMode.CBF4:
             compressed_const = create_ov_const_from_tensor(
@@ -330,6 +332,7 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
                     should_add_convert_node=should_add_convert_node,
                     layer_scales=layer_scales,
                     layer_zero_points=layer_zero_points,
+                    advanced_parameters=advanced_parameters,
                 )
             except nncf.InvalidGroupSizeError as error:
                 first_caught_error = error

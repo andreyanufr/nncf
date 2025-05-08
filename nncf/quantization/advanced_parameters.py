@@ -28,6 +28,7 @@ from nncf.parameters import StrEnum
 from nncf.quantization.range_estimator import AggregatorType
 from nncf.quantization.range_estimator import RangeEstimatorParameters
 from nncf.quantization.range_estimator import StatisticsType
+import openvino.runtime as ov
 
 
 @api(canonical_alias="nncf.OverflowFix")
@@ -357,6 +358,15 @@ class AdvancedLoraCorrectionParameters:
 
 @api()
 @dataclass
+class AdvancedCodebookParameters:
+    """
+    """
+    codebook: list[Any] = [-3.5, -2.5, -1.875, -1.375, -1., -0.625, -0.3125, 0., 0.2812, 0.5625, 0.875, 1.125, 1.5, 2., 2.5, 3.5]
+    dts_type: Any = ov.Type.f16
+
+
+@api()
+@dataclass
 class AdvancedCompressionParameters:
     """
     Contains advanced parameters for compression algorithms.
@@ -383,6 +393,7 @@ class AdvancedCompressionParameters:
     gptq_params: AdvancedGPTQParameters = field(default_factory=AdvancedGPTQParameters)
     lora_correction_params: AdvancedLoraCorrectionParameters = field(default_factory=AdvancedLoraCorrectionParameters)
     lora_adapter_rank: int = 256
+    codebook_params: AdvancedCodebookParameters = field(default_factory=AdvancedCodebookParameters)
 
 
 @api()
