@@ -1086,6 +1086,7 @@ class LoraMixin:
             raise nncf.ValidationError(msg)
         self.lora_A = torch.nn.Parameter(torch.ones((rank, in_features), dtype=default_lora_dtype))
         self.lora_B = torch.nn.Parameter(torch.zeros((out_features, rank), dtype=default_lora_dtype))
+        self.mask_zeros = None
 
     def enable_gradients(self):
         self.lora_A.requires_grad = True
@@ -1129,6 +1130,7 @@ class AsymmetricLoraQuantizer(AsymmetricQuantizer, LoraMixin):
             self.levels,
             self.eps,
             skip=execute_traced_op_as_identity,
+            mask_zeros=self.mask_zeros,
         )
 
     def enable_gradients(self) -> None:
@@ -1177,6 +1179,7 @@ class SymmetricLoraQuantizer(SymmetricQuantizer, LoraMixin):
             self.levels,
             self.eps,
             skip=execute_traced_op_as_identity,
+            mask_zeros=self.mask_zeros,
         )
 
     def enable_gradients(self) -> None:

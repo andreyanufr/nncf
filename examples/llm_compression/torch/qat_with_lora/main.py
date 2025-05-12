@@ -185,6 +185,17 @@ def kl_div(student_hiddens: torch.Tensor, teacher_hiddens: torch.Tensor) -> torc
     )
 
 
+def set_zero_mask_for_super_weights(model: nn.Module) -> None:
+    # computed using https://github.com/mengxiayu/LLMSuperWeight
+    mask_zeros = [(1, 5601, 408), (2, 2417, 408), (3, 4157, 408), (4, 610, 408), (5, 8729, 408), (26, 2908, 408), (27, 2646, 1424)]
+    
+    hook_storage = get_hook_storage(model)
+    for mask_zero in mask_zeros:
+        pattern = f":{mask_zero[0]}:mlp:down_proj"
+        for name, module in hook_storage.named_hooks():
+            if isinstance(module, (AsymmetricLoraQuantizer, SymmetricLoraQuantizer)) and pattern in name:
+                module.mask_zeros = [[mask_zero[1], mask_zero[2]]]
+
 def set_trainable(model: nn.Module, lora_lr: float, fq_lr: float) -> list[dict[str, Any]]:
     """
     Sets the trainable parameters of the model for quantization-aware training with LoRA (Low-Rank Adaptation).
@@ -314,6 +325,10 @@ def get_argument_parser() -> argparse.ArgumentParser:
         "This method uses additional GPU memory for memory copying. By default, evaluation is slower "
         "but conserves GPU memory.",
     )
+    parser.add_argument(
+        "--zero_mask",
+        action="store_true",
+    )
 
     # Data params
     parser.add_argument("--num_train_samples", type=int, default=1024, help="Number of training samples")
@@ -396,6 +411,10 @@ def main(argv) -> float:
     else:
         model = compress_weights(model, dataset=Dataset([example_input]), **compression_config)
         save_checkpoint(model, ckpt_file)
+
+    if args.zero_mask:
+        set_zero_mask_for_super_weights(model)
+
     fq_lr = args.lr / 10
     weight_decay = args.lr
     param_to_train = set_trainable(model, lora_lr=args.lr, fq_lr=fq_lr)
