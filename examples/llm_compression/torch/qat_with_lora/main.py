@@ -232,7 +232,7 @@ def set_trainable(model: nn.Module, lora_lr: float, fq_lr: float) -> list[dict[s
         f"trainable%: {100 * trainable_params / all_param:.4f}"
     )
     model.train()
-    return [{"params": adapters_to_train, "lr": lora_lr}, {"params": scales_to_train, "lr": fq_lr}]
+    return [{"params": adapters_to_train, "lr": lora_lr}] #, {"params": scales_to_train, "lr": fq_lr}]
 
 
 def save_checkpoint(model: nn.Module, ckpt_file: Path) -> None:
