@@ -976,8 +976,8 @@ class AsymmetricQuantizer(BaseQuantizer):
 
     def get_trainable_params(self) -> dict[str, torch.Tensor]:
         return {
-            # self.INPUT_LOW_PARAM_NAME: self.input_low,
-            # self.INPUT_RANGE_PARAM_NAME: self.input_range,
+            self.INPUT_LOW_PARAM_NAME: self.input_low,
+            self.INPUT_RANGE_PARAM_NAME: self.input_range,
         }
 
     def _apply_minmax_init(self, min_values, max_values, log_module_name: str = None):

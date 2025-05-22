@@ -231,8 +231,10 @@ def set_trainable(model: nn.Module, lora_lr: float, fq_lr: float) -> list[dict[s
         f"all params: {all_param:,d} || "
         f"trainable%: {100 * trainable_params / all_param:.4f}"
     )
+    print("Adapters to train: ", len(adapters_to_train))
+    print("Scales to train: ", len(scales_to_train))
     model.train()
-    return [{"params": adapters_to_train, "lr": lora_lr}] #, {"params": scales_to_train, "lr": fq_lr}]
+    return [{"params": adapters_to_train, "lr": lora_lr}, {"params": scales_to_train, "lr": fq_lr}]
 
 
 def save_checkpoint(model: nn.Module, ckpt_file: Path) -> None:
@@ -374,8 +376,8 @@ def main(argv) -> float:
     device = "cuda"
     torch_dtype = torch.bfloat16
     compression_config = dict(
-        mode=CompressWeightsMode.INT4_ASYM,
-        group_size=64,
+        mode=CompressWeightsMode.INT4_SYM,
+        group_size=128,
         compression_format=CompressionFormat.FQ_LORA,
         advanced_parameters=AdvancedCompressionParameters(lora_adapter_rank=args.lora_rank),
     )
