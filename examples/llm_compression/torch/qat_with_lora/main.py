@@ -359,8 +359,8 @@ def main(argv) -> float:
     device = "cuda"
     torch_dtype = torch.bfloat16
     compression_config = dict(
-        mode=CompressWeightsMode.INT4_ASYM,
-        group_size=64,
+        mode=CompressWeightsMode.INT4_SYM,
+        group_size=128,
         compression_format=CompressionFormat.FQ_LORA,
         advanced_parameters=AdvancedCompressionParameters(lora_adapter_rank=args.lora_rank),
     )

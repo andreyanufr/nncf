@@ -53,7 +53,7 @@ from nncf.torch.quantization.quantize_functions import get_scale_zp_from_input_l
 from nncf.torch.quantization.quantize_functions import pack_int4
 from nncf.torch.quantization.quantize_functions import pack_uint4
 from nncf.torch.quantization.quantize_functions import symmetric_quantize
-from nncf.torch.quantization.quantize_functions import symmetric_quantize_lora
+from nncf.torch.quantization.quantize_functions import symmetric_quantize_lora, symmetric_quantize_lora_adaptive
 from nncf.torch.quantization.quantize_functions import unpack_int4
 from nncf.torch.quantization.quantize_functions import unpack_uint4
 from nncf.torch.return_types import maybe_get_values_from_torch_return_type
@@ -1250,7 +1250,7 @@ class SymmetricLoraQuantizer(SymmetricQuantizer, LoraMixin):
         with DisableTorchFunction():
             # in multi-device case after loading nncf checkpoint, quantizers have a different device.
             self.to(x.device)
-        return symmetric_quantize_lora(
+        return symmetric_quantize_lora_adaptive(
             x,
             self._lspec.weight_shape,
             self.lora_A,

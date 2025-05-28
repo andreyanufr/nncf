@@ -350,6 +350,58 @@ def symmetric_quantize_lora(input_, input_shape, A, B, scale, level_low, level_h
         levels,
     )
 
+@register_operator()
+def symmetric_quantize_lora_adaptive(input_, input_shape, A, B, scale, level_low, level_high, levels, eps, skip: bool = False):
+    if has_torch_function_unary(input_):
+        return handle_torch_function(
+            symmetric_quantize_lora_adaptive,
+            (input_,),
+            input_,
+            input_shape,
+            A,
+            B,
+            scale,
+            level_low,
+            level_high,
+            levels,
+            eps,
+            skip,
+        )
+    if skip:
+        return input_
+    scale_safe = torch.where(torch.abs(scale) < eps, eps, scale)
+    original_shape = input_.shape
+    #input_ = (input_ + B @ A).type(input_.dtype)  # input(float16) + lora(bfloat16) = float32, need a cast to float16
+
+    with torch.no_grad():
+        input_low = torch.where(scale > 0, -scale_safe, -scale_safe / level_low * level_high)
+        # 15/8 * scale or (2-1/8) * scale
+        input_range = torch.abs((2 + 1 / level_low) * scale_safe)
+        dtype = input_.dtype
+        original_shape = input_.shape
+        input_ = input_.reshape(input_shape)
+        # Ensure that the input is in the correct dtype for quantization
+        scale_ = (levels - 1) / input_range
+        output = input_.clip(min=input_low, max=input_low + input_range)
+        zero_point = (-input_low * scale_).round()
+        output -= input_low
+        output *= scale_
+        output -= zero_point
+        # output = output.round()
+        # output = output / scale_
+        # return output
+
+    BA = torch.nn.functional.hardtanh(B @ A)
+    BA = BA.reshape(input_shape)
+    output_ = torch.clamp(output + BA, level_low, level_high)
+
+    output = output_ + output_.round().detach() - output_.detach()
+    
+    output = output / scale_
+    output = output.reshape(original_shape).type(dtype)
+
+    return output
+
 
 class TuneRange(torch.autograd.Function):
     """
