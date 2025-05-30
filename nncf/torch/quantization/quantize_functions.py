@@ -391,7 +391,7 @@ def symmetric_quantize_lora_adaptive(input_, input_shape, A, B, scale, level_low
         # output = output / scale_
         # return output
 
-    BA = torch.nn.functional.hardtanh(B @ A)
+    BA = torch.nn.functional.tanh(B @ A)
     BA = BA.reshape(input_shape)
     output_ = torch.clamp(output + BA, level_low, level_high)
 
