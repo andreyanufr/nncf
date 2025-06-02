@@ -370,9 +370,12 @@ def symmetric_quantize_lora_adaptive(input_, input_shape, A, B, scale, level_low
     if skip:
         return input_
     #scale_safe = -level_low / torch.where(torch.abs(scale) < eps, eps, scale)
-    scale_safe = torch.where(torch.abs(scale) < eps, eps, scale)
+    scale_safe = scale #torch.where(torch.abs(scale) < eps, eps, scale)
     original_shape = input_.shape
     #input_ = (input_ + B @ A).type(input_.dtype)  # input(float16) + lora(bfloat16) = float32, need a cast to float16
+    
+    input_range = torch.abs((2 + 1 / level_low) * scale_safe)
+    scale_ = (levels - 1) / input_range
 
     with torch.no_grad():
         dtype = input_.dtype
@@ -381,12 +384,9 @@ def symmetric_quantize_lora_adaptive(input_, input_shape, A, B, scale, level_low
         # output = torch.clamp(output, level_low, level_high)
         input_low = torch.where(scale > 0, -scale_safe, -scale_safe / level_low * level_high)
         # 15/8 * scale or (2-1/8) * scale
-        input_range = torch.abs((2 + 1 / level_low) * scale_safe)
-        
         original_shape = input_.shape
         input_ = input_.reshape(input_shape)
         # Ensure that the input is in the correct dtype for quantization
-        scale_ = (levels - 1) / input_range
         output = input_.clip(min=input_low, max=input_low + input_range)
         zero_point = (-input_low * scale_).round()
         output -= input_low
