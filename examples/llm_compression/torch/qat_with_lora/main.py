@@ -415,6 +415,8 @@ def main(argv) -> float:
     microbatches_per_epoch = epoch_samples // args.microbatch_size
     aggregated_loss = float("nan")
     loss_numerator = grad_steps = total_steps = 0
+    scheduler = torch.optim.lr_scheduler.StepLR(opt, step_size=8, gamma=0.1)
+
     for epoch in range(args.epochs):
         batch_indices_epoch = torch.randperm(num_samples)[:epoch_samples].chunk(microbatches_per_epoch)
         for indices in track(batch_indices_epoch, description=f"Train epoch {epoch}"):
@@ -452,6 +454,7 @@ def main(argv) -> float:
                 total_steps += 1
                 tb.add_scalar("loss", aggregated_loss, total_steps)
 
+        scheduler.step()
         # Keep the best checkpoint with the lowest perplexity.
         save_checkpoint(model, ckpt_file)
         with create_eval_model(model, args.fast_eval, args.pretrained, torch_dtype, ckpt_file) as eval_model:
