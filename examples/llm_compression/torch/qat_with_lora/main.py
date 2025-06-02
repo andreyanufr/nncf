@@ -133,7 +133,7 @@ def measure_perplexity(
     """
     print("#" * 50 + " Evaluate via lm-eval-harness " + "#" * 50)
     lm_obj = OptimumLM(pretrained=optimum_model, max_length=max_length)
-    results = simple_evaluate(lm_obj, tasks=[task], limit=limit, task_manager=task_manager, log_samples=False)
+    results = simple_evaluate(lm_obj, tasks=[task], limit=limit, task_manager=task_manager, log_samples=False, batch_size=8)
     return results["results"][task]["word_perplexity,none"]
 
 
