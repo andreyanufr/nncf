@@ -47,6 +47,7 @@ from nncf.quantization.algorithms.weight_compression.gptq import GPTQ
 from nncf.quantization.algorithms.weight_compression.lora_correction import LoraCorrectionAlgorithm
 from nncf.quantization.algorithms.weight_compression.mixed_precision import MIXED_PRECISION_CRITERIA
 from nncf.quantization.algorithms.weight_compression.scale_estimation import ScaleEstimation
+from nncf.quantization.algorithms.weight_compression.hadamard import Hadamart
 from nncf.quantization.algorithms.weight_compression.weight_lowering import WeightCompressionConfig
 from nncf.quantization.algorithms.weight_compression.weight_lowering import get_reduction_channel_size
 from nncf.scopes import IgnoredScope
@@ -85,6 +86,7 @@ def get_weight_compression_configuration(
     scale_estimation: Optional[bool] = None,
     gptq: Optional[bool] = None,
     lora_correction: Optional[bool] = None,
+    hadamard: Optional[bool] = None,
     ignored_scope: Optional[IgnoredScope] = None,
     sensitivity_metric: Optional[SensitivityMetric] = None,
     backup_mode: Optional[BackupMode] = None,
@@ -110,6 +112,7 @@ def get_weight_compression_configuration(
         "scale_estimation": scale_estimation or False,
         "gptq": gptq or False,
         "lora_correction": lora_correction or False,
+        "hadamard": hadamard or False,
         "ignored_scope": ignored_scope or IgnoredScope(),
         "sensitivity_metric": (
             (
@@ -267,6 +270,7 @@ class WeightCompression(Algorithm):
         scale_estimation: bool,
         gptq: bool,
         lora_correction: bool,
+        hadamard: bool,
         backup_mode: BackupMode = BackupMode.INT8_ASYM,
         compression_format: CompressionFormat = CompressionFormat.DQ,
         advanced_parameters: Optional[AdvancedCompressionParameters] = None,
@@ -321,6 +325,7 @@ class WeightCompression(Algorithm):
         self._all_layers = all_layers
         self._sensitivity_metric = sensitivity_metric
         self._awq = awq
+        self._hadamard = hadamard
         self._subset_size = subset_size
         self._scale_estimation = scale_estimation
         self._gptq = gptq
@@ -364,6 +369,8 @@ class WeightCompression(Algorithm):
                 scale_estimation_params.scale_steps,
                 scale_estimation_params.weight_penalty,
             )
+        if self._hadamard:
+            self._hadamard_algo = Hadamart()
 
         self._data_aware_mixed_precision = (
             self._sensitivity_metric != SensitivityMetric.WEIGHT_QUANTIZATION_ERROR and self._ratio != 1.0
@@ -894,6 +901,10 @@ class WeightCompression(Algorithm):
         precomputed_compressed_weights = None
         lora_correction_algo = None
         description = "Applying Weight Compression"
+        
+        if self._hadamard:
+            model = self._hadamard_algo.apply(model, graph, all_weight_params, statistics, self._backend_entity)
+            statistics = self._hadamard_algo.update_statistics(statistics)
 
         if self._gptq:
             del statistics
