@@ -29,8 +29,8 @@ logging.set_verbosity_error()
 warnings.filterwarnings("ignore", category=TracerWarning)
 
 
-MODEL_ID = "meta-llama/Llama-3.1-8B-Instruct"
-COMPRESSED_MODEL_ID = "Llama-3.1-8B-Instruct_hadamard"
+MODEL_ID = "meta-llama/Llama-3.2-1B-Instruct"
+COMPRESSED_MODEL_ID = "Llama-3.2-1B-Instruct"
 
 
 def generate_answers(
@@ -129,7 +129,7 @@ def default_example(model_id: str, compressed_model_id: str) -> list[str]:
 
 
 # example to prove that hadamard transform does not change inference results
-def example_hadamard(model_id: str, compressed_model_id: str, hadamard: bool=False) -> list[str]:
+def example_hadamard(model_id: str, compressed_model_id: str, hadamard: bool=False, data_aware: bool=True) -> list[str]:
     """
     Example of using the default codebook compression.
 
@@ -142,17 +142,16 @@ def example_hadamard(model_id: str, compressed_model_id: str, hadamard: bool=Fal
 
     gs = 128
     r = 1.0
-    compressed_model_id = compressed_model_id + f"int4_had_{hadamard}_gs{gs}"
+    compressed_model_id = compressed_model_id + f"_int4_had_{hadamard}_gs{gs}_data_aware_"
 
     model.model = nncf.compress_weights(
         model.model,
         mode=nncf.CompressWeightsMode.INT4_SYM,
         ratio=r,
         group_size=gs,
-        dataset=nncf_dataset,
-        scale_estimation = True,
+        dataset=nncf_dataset if data_aware else None,
+        scale_estimation=data_aware,
         hadamard=hadamard,
-        subset_size=8,
     )
     
     model.save_pretrained(compressed_model_id)
@@ -224,9 +223,10 @@ def get_nncf_dataset(model, tokenizer):
     return nncf_dataset
 
 def main():
-    #default_example(MODEL_ID, COMPRESSED_MODEL_ID)
+    default_example(MODEL_ID, COMPRESSED_MODEL_ID + "_int8")
     example_hadamard(MODEL_ID, COMPRESSED_MODEL_ID, hadamard=True)
     example_hadamard(MODEL_ID, COMPRESSED_MODEL_ID, hadamard=False)
+    example_hadamard(MODEL_ID, COMPRESSED_MODEL_ID, hadamard=False, data_aware=False)
 
 
 if __name__ == "__main__":
