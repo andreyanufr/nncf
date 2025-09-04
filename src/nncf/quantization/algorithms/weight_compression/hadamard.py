@@ -195,53 +195,119 @@ class Hadamart(Algorithm):
                 weight = fns.transpose(weight)
                 reduction_axis = 1
             
-            in_features = weight.shape[-1]
-            hadK, K, H = hadamard_utils.get_hadK(in_features)
-            
-            H = H.to(torch.float32)
-
-            h_weight = hadamard_utils.apply_exact_had_to_tensor(torch.tensor(weight.data)) #hadamard_utils.matmul_had_cuda_H(torch.tensor(weight.data), hadK, H, K)
-
-            h_weight = h_weight.cpu().numpy()
-            weight = fns.zeros_like(weight) + h_weight
-            self._backend_entity.set_weight(wp.node_with_weight, weight_port_id, model, graph, weight)
-
-
-            next_node = [node for node in graph.get_previous_nodes(target_node) if node.node_type != 'Convert'][0]
-            next_node = self._backend_entity.name_to_node_mapping[next_node.node_name]
-
-            if K == 1:
-                H_pow2 = opset.constant(H.cpu().numpy())
-                out = opset.matmul(next_node, H_pow2, transpose_a=False, transpose_b=False, name=wp.node_with_weight.node_name+"_H_pow2")
-                input = out
-            else:
-                input = opset.reshape(next_node, (-1, K, in_features // K), False)
-                H_pow2 = opset.constant(H.cpu().numpy())
-                mm_h_pow2 = opset.matmul(input, H_pow2, transpose_a=False, transpose_b=False, name=wp.node_with_weight.node_name+"_H_pow2")
-                
-                H_K = opset.constant(hadK.cpu().numpy())
-                mm_k = opset.matmul(H_K, mm_h_pow2, transpose_a=False, transpose_b=False, name=wp.node_with_weight.node_name+"_H_K")
-                out = opset.reshape(mm_k, (-1, in_features), False)
-
-
-            # node_input = node.input_value(0)
-
-            # for node_output in node.outputs():
-            #     for target_input in node_output.get_target_inputs():
-            #         target_input.replace_source_output(node_input)
-        
-            node_output_port = next_node.output(0)
-            node_output_source_ports = node_output_port.get_target_inputs()
-
-            for node_output_source_port in node_output_source_ports:
-                if node_output_source_port.get_node().friendly_name == input.friendly_name:
-                    continue
-                node_output_source_port.replace_source_output(out.output(0))
-            
-            self._had_per_target_node[k] = (hadK, K, H)
+            #self._hadamard_left(weight, k, weight_port_id, target_node, wp, model, graph)
+            self._hadamard(weight, k, weight_port_id, target_node, wp, model, graph)
 
         return model
 
+    # hadamard transform in the left side of MatMul (QuaROT, SpinQUant)
+    def _hadamard_left(self, weight, node_k, weight_port_id, target_node, wp, model, graph):
+        in_features = weight.shape[-1]
+        hadK, K, H = hadamard_utils.get_hadK(in_features)
+        
+        H = H.to(torch.float32)
+
+        h_weight = hadamard_utils.apply_exact_had_to_tensor(torch.tensor(weight.data))
+
+        h_weight = h_weight.cpu().numpy()
+        weight = fns.zeros_like(weight) + h_weight
+        self._backend_entity.set_weight(wp.node_with_weight, weight_port_id, model, graph, weight)
+
+
+        prev_node = [node for node in graph.get_previous_nodes(target_node) if node.node_type != 'Convert'][0]
+        prev_node = self._backend_entity.name_to_node_mapping[prev_node.node_name]
+
+        if K == 1:
+            H_pow2 = opset.constant(H.cpu().numpy())
+            out = opset.matmul(prev_node, H_pow2, transpose_a=False, transpose_b=False, name=wp.node_with_weight.node_name+"_H_pow2")
+            input = out
+        else:
+            input = opset.reshape(prev_node, (-1, K, in_features // K), False)
+            H_pow2 = opset.constant(H.cpu().numpy())
+            mm_h_pow2 = opset.matmul(input, H_pow2, transpose_a=False, transpose_b=False, name=wp.node_with_weight.node_name+"_H_pow2")
+            
+            H_K = opset.constant(hadK.cpu().numpy())
+            mm_k = opset.matmul(H_K, mm_h_pow2, transpose_a=False, transpose_b=False, name=wp.node_with_weight.node_name+"_H_K")
+            out = opset.reshape(mm_k, (-1, in_features), False)
+    
+        prev_output_port = prev_node.output(0)
+        node_output_source_ports = prev_output_port.get_target_inputs()
+
+        for node_output_source_port in node_output_source_ports:
+            if node_output_source_port.get_node().friendly_name == input.friendly_name:
+                continue
+            node_output_source_port.replace_source_output(out.output(0))
+
+        self._had_per_target_node[node_k] = (hadK, K, H)
+
+    
+    # hadamard transform in the both sides of MatMul (QuIP#)
+    def _hadamard(self, weight, node_k, weight_port_id, target_node, wp, model, graph):
+        in_features, out_features = weight.shape[-1], weight.shape[-2]
+        hadK_left, K_left, H_left = hadamard_utils.get_hadK(in_features)
+        hadK_right, K_right, H_right = hadamard_utils.get_hadK(out_features)
+
+        H_left  = H_left.to(torch.float32)
+        H_right = H_right.to(torch.float32)
+
+        h_weight = hadamard_utils.apply_exact_had_to_tensor(torch.tensor(weight.data))
+        h_weight = hadamard_utils.apply_exact_had_to_tensor(h_weight.t()).t()
+
+        h_weight = h_weight.cpu().numpy()
+        weight = fns.zeros_like(weight) + h_weight
+        self._backend_entity.set_weight(wp.node_with_weight, weight_port_id, model, graph, weight)
+
+        # left
+        prev_node = [node for node in graph.get_previous_nodes(target_node) if node.node_type != 'Convert'][0]
+        prev_node = self._backend_entity.name_to_node_mapping[prev_node.node_name]
+
+        if K_left == 1:
+            H_pow2 = opset.constant(H_left.cpu().numpy())
+            out = opset.matmul(prev_node, H_pow2, transpose_a=False, transpose_b=False, name=wp.node_with_weight.node_name+"_H_pow2")
+            input = out
+        else:
+            input = opset.reshape(prev_node, (-1, K_left, in_features // K_left), False)
+            H_pow2 = opset.constant(H_left.cpu().numpy())
+            mm_h_pow2 = opset.matmul(input, H_pow2, transpose_a=False, transpose_b=False, name=wp.node_with_weight.node_name+"_H_pow2")
+            
+            H_K = opset.constant(hadK_left.cpu().numpy())
+            mm_k = opset.matmul(H_K, mm_h_pow2, transpose_a=False, transpose_b=False, name=wp.node_with_weight.node_name+"_H_K")
+            out = opset.reshape(mm_k, (-1, in_features), False)
+    
+        prev_output_port = prev_node.output(0)
+        node_output_source_ports = prev_output_port.get_target_inputs()
+
+        for node_output_source_port in node_output_source_ports:
+            if node_output_source_port.get_node().friendly_name == input.friendly_name:
+                continue
+            node_output_source_port.replace_source_output(out.output(0))
+
+        # right
+        next_node = self._backend_entity.name_to_node_mapping[target_node.node_name]
+        if K_right == 1:
+            H_pow2 = opset.constant(H_right.cpu().numpy())
+            out = opset.matmul(next_node, H_pow2, transpose_a=False, transpose_b=False, name=wp.node_with_weight.node_name+"_Hr_pow2")
+            input = out
+        else:
+            input = opset.reshape(next_node, (-1, K_right, out_features // K_right), False)
+            H_pow2 = opset.constant(H_right.cpu().numpy())
+            mm_h_pow2 = opset.matmul(input, H_pow2, transpose_a=False, transpose_b=False, name=wp.node_with_weight.node_name+"_Hr_pow2")
+
+            H_K = opset.constant(hadK_right.cpu().numpy())
+            mm_k = opset.matmul(H_K, mm_h_pow2, transpose_a=False, transpose_b=False, name=wp.node_with_weight.node_name+"_Hr_K")
+            out = opset.reshape(mm_k, (-1, out_features), False)
+
+        next_output_port = next_node.output(0)
+        node_output_source_ports = next_output_port.get_target_inputs()
+
+        for node_output_source_port in node_output_source_ports:
+            if node_output_source_port.get_node().friendly_name == input.friendly_name:
+                continue
+            node_output_source_port.replace_source_output(out.output(0))
+
+        self._had_per_target_node[node_k] = (hadK_left, K_left, H_left)
+
+    
     def update_statistics(self, statistics):
         if not statistics:
             return statistics

@@ -185,7 +185,7 @@ def apply_exact_had_to_tensor(W, had_dim=-1, output=False, R2=None):
 
     if had_dim == -1:
         if output:
-            had_K, K = get_hadK(out_features)
+            had_K, K, H = get_hadK(out_features)
             W_ = matmul_hadU_cuda(W_.t(), had_K, K).t()
         if not output:
             had_K, K, H = get_hadK(in_features)
@@ -99567,7 +99567,7 @@ def get_had172():
     )
 
 
-def create_ov_model(input_shape, weigths, in_features=-1, use_hadamart=False):
+def create_ov_model(input_shape, weigths, in_features=-1, use_hadamart=False, output=False):
     import numpy as np
     import openvino as ov
     from openvino.runtime import opset13 as opset
@@ -99576,21 +99576,41 @@ def create_ov_model(input_shape, weigths, in_features=-1, use_hadamart=False):
 
     if use_hadamart:
         hadK, K, H = get_hadK(in_features)
-        weigths = matmul_had_cuda_H(torch.tensor(weigths).float(), hadK, H, K).cpu().numpy()
-        mm_weigths = opset.constant(weigths, dtype=np.float32, name="mm_weights")
-
-        if K == 1:
-            H_pow2 = opset.constant(H.cpu().numpy())
-            had_t = opset.matmul(input_node, H_pow2, transpose_a=False, transpose_b=False, name="H_pow2")
-        else:
-            input_reshaped = opset.reshape(input_node, (-1, K, in_features // K), False)
-            H_pow2 = opset.constant(H.cpu().numpy())
-            mm_h_pow2 = opset.matmul(input_reshaped, H_pow2, transpose_a=False, transpose_b=False, name="H_pow2")
+        
+        if output:
+            weigths = matmul_had_cuda_H(torch.tensor(weigths).float().t(), hadK, H, K).t().cpu().numpy()
+            mm_weigths = opset.constant(weigths, dtype=np.float32, name="mm_weights")
             
-            H_K = opset.constant(hadK.cpu().numpy())
-            mm_k = opset.matmul(H_K, mm_h_pow2, transpose_a=False, transpose_b=False, name="H_K")
-            had_t = opset.reshape(mm_k, (-1, in_features), False)
-        mm = opset.matmul(had_t, mm_weigths, transpose_a=False, transpose_b=True, name="MatMul")
+            mm = opset.matmul(input_node, mm_weigths, transpose_a=False, transpose_b=True, name="MatMul")
+
+            if K == 1:
+                H_pow2 = opset.constant(H.cpu().numpy())
+                had_t = opset.matmul(mm, H_pow2, transpose_a=False, transpose_b=False, name="H_pow2")
+            else:
+                input_reshaped = opset.reshape(input_node, (-1, K, in_features // K), False)
+                H_pow2 = opset.constant(H.cpu().numpy())
+                mm_h_pow2 = opset.matmul(input_reshaped, H_pow2, transpose_a=False, transpose_b=False, name="H_pow2")
+                
+                H_K = opset.constant(hadK.cpu().numpy())
+                mm_k = opset.matmul(H_K, mm_h_pow2, transpose_a=False, transpose_b=False, name="H_K")
+                had_t = opset.reshape(mm_k, (-1, in_features), False)
+            mm = had_t
+        else:
+            weigths = matmul_had_cuda_H(torch.tensor(weigths).float(), hadK, H, K).cpu().numpy()
+            mm_weigths = opset.constant(weigths, dtype=np.float32, name="mm_weights")
+
+            if K == 1:
+                H_pow2 = opset.constant(H.cpu().numpy())
+                had_t = opset.matmul(input_node, H_pow2, transpose_a=False, transpose_b=False, name="H_pow2")
+            else:
+                input_reshaped = opset.reshape(input_node, (-1, K, in_features // K), False)
+                H_pow2 = opset.constant(H.cpu().numpy())
+                mm_h_pow2 = opset.matmul(input_reshaped, H_pow2, transpose_a=False, transpose_b=False, name="H_pow2")
+                
+                H_K = opset.constant(hadK.cpu().numpy())
+                mm_k = opset.matmul(H_K, mm_h_pow2, transpose_a=False, transpose_b=False, name="H_K")
+                had_t = opset.reshape(mm_k, (-1, in_features), False)
+            mm = opset.matmul(had_t, mm_weigths, transpose_a=False, transpose_b=True, name="MatMul")
     else:
         mm_weigths = opset.constant(weigths, dtype=np.float32, name="mm_weights")
         mm = opset.matmul(input_node, mm_weigths, transpose_a=False, transpose_b=True, name="MatMul")
@@ -99600,15 +99620,15 @@ def create_ov_model(input_shape, weigths, in_features=-1, use_hadamart=False):
     compiled_model = ov.compile_model(model)
     return compiled_model
 
-def test_ov_hadamard(module, module_hadamard):
+def test_ov_hadamard(module, module_hadamard, output=False):
     in_features, out_features = module.in_features, module.out_features
     input_data = torch.randn([1, in_features]).to(module.weight.data.dtype)
     
     ov_module = create_ov_model(input_data.shape, module.weight.cpu().numpy())
     
     ov_module_hadamard = create_ov_model(input_data.shape, module.weight.cpu().numpy(),
-                                         in_features, True)
-    
+                                         out_features if output else in_features, True, output)
+
     out = module(input_data.to(module.weight.device)).cpu().numpy()
     denum = np.mean(out**2)
 
@@ -99634,7 +99654,7 @@ if __name__ == "__main__":
     import torch
     
     
-    class HTLinear(torch.nn.Module):
+    class HTLinearLeft(torch.nn.Module):
         def __init__(self, modul):
             super().__init__()
             self.modul = modul
@@ -99648,16 +99668,35 @@ if __name__ == "__main__":
             self.K = K
             self.H = H.to(modul.weight.data.dtype).to(modul.weight.data.device)
             
-            self.modul.weight.data = matmul_had_cuda_H(self.modul.weight.data, self.hadK, self.H, K)
-            #self.modul.weight.data = matmul_hadU_cuda(self.modul.weight.data, self.hadK, K)
+            #self.modul.weight.data = matmul_had_cuda_H(self.modul.weight.data, self.hadK, self.H, K)
+            self.modul.weight.data = apply_exact_had_to_tensor(self.modul.weight.data, -1, False).to(modul.weight.data.dtype)
             
-            
-        
         def forward(self, x):
             x_had = matmul_had_cuda_H(x, self.hadK, self.H, self.K)
-            #x_had = matmul_hadU_cuda(x, self.hadK, self.K)
             return self.modul(x_had)
 
+    class HTLinearRight(torch.nn.Module):
+        def __init__(self, modul):
+            super().__init__()
+            self.modul = modul
+            out_features = modul.out_features
+            
+            hadK, K, H = get_hadK(out_features)
+            if K == 1:
+                self.hadK = hadK
+            else:
+                self.hadK = hadK.to(modul.weight.data.dtype).to(modul.weight.data.device)
+            self.K = K
+            self.H = H.to(modul.weight.data.dtype).to(modul.weight.data.device)
+            
+            self.modul.weight.data = apply_exact_had_to_tensor(self.modul.weight.data, -1, True).to(modul.weight.data.dtype)
+            
+        def forward(self, x):
+            x = self.modul(x)
+            return matmul_had_cuda_H(x, self.hadK, self.H, self.K) 
+
+    
+    
     
     model_id = "meta-llama/Llama-3.1-8B-Instruct"
     
@@ -99668,7 +99707,9 @@ if __name__ == "__main__":
     
     
     with torch.inference_mode():
-        test_ov_hadamard(model.model.layers[0].mlp.down_proj, HTLinear(deepcopy(model.model.layers[0].mlp.down_proj)))
+        test_ov_hadamard(model.model.layers[0].mlp.down_proj, HTLinearLeft(deepcopy(model.model.layers[0].mlp.down_proj)))
+        
+        test_ov_hadamard(model.model.layers[0].mlp.down_proj, HTLinearRight(deepcopy(model.model.layers[0].mlp.down_proj)), output=True)
 
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     
@@ -99679,7 +99720,7 @@ if __name__ == "__main__":
     print("Before hadamart: ", tokenizer.decode(output[0], skip_special_tokens=True))
     
     for layer in model.model.layers:
-        layer.mlp.down_proj = HTLinear(layer.mlp.down_proj)
+        layer.mlp.down_proj = HTLinearLeft(layer.mlp.down_proj)
 
     output = model.generate(**input_ids, max_new_tokens=128, temperature=0.0, do_sample=False)
     print("After hadamart: ", tokenizer.decode(output[0], skip_special_tokens=True))
