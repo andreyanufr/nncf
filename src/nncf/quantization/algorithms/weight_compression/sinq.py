@@ -25,6 +25,7 @@ from nncf.common.tensor_statistics.statistic_point import StatisticPointsContain
 from nncf.common.utils.backend import BackendType
 from nncf.common.utils.backend import get_backend
 from nncf.experimental.common.tensor_statistics.statistics import WCTensorStatistic
+from nncf.quantization.algorithms.weight_compression.config import WeightCompressionConfig
 from nncf.quantization.algorithms.algorithm import Algorithm
 from nncf.quantization.algorithms.weight_compression.activation_stats import process_stats
 from nncf.quantization.algorithms.weight_compression.backend import WeightCompressionAlgoBackend
@@ -32,6 +33,7 @@ from nncf.quantization.algorithms.weight_compression.config import WeightCompres
 from nncf.quantization.algorithms.weight_compression.weight_lowering import float_quantize_dequantize_weight
 from nncf.quantization.algorithms.weight_compression.weight_lowering import integer_quantize_dequantize_weight
 from nncf.quantization.passes import transform_to_inference_graph
+from nncf.quantization.algorithms.weight_compression.weight_lowering import reshape_weight_for_grouped_quantization
 from nncf.tensor import TensorDataType
 from nncf.tensor import functions as fns
 
@@ -158,6 +160,31 @@ class SINQ(Algorithm):
         transformed_model = model_transformer.transform(transformation_layout)
 
         return transformed_model
+
+    def _step_(self, weight: TTensor, reduction_axes: list[int], config: WeightCompressionConfig):
+        reduction_axis = reduction_axes[0]
+        weight = weight.astype(TensorDataType.float32)
+        eps = fns.finfo(weight).eps
+
+        was_transposed = False
+        if reduction_axis == 0:
+            weight = fns.transpose(weight)
+            reduction_axis = 1
+            was_transposed = True
+
+        original_weight, _ = reshape_weight_for_grouped_quantization(original_weight, reduction_axis, config.group_size)
+        original_weight = fns.transpose(original_weight, (1, 0, 2))
+        
+        s1 = []
+        s2 = []
+        scales_weight = []
+        for i in range(original_weight.shape[0]):
+            w = original_weight[i, :, :]
+            scaled_w, scale1, scale2 = self._step(w, order=self._steps)
+            s1.append(scale1)
+            s2.append(scale2)
+            scales_weight.append(scaled_w)
+
 
     def _step(self, matrix: TTensor, order=8,
                  clip_min=1e-3,
