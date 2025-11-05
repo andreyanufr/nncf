@@ -225,6 +225,16 @@ def _(
     pt_dtype = convert_to_torch_dtype(dtype)
     return torch.mean(a, dim=axis, keepdim=keepdims, dtype=pt_dtype)
 
+@numeric.std.register
+def _(
+    a: torch.Tensor,
+    axis: T_AXIS = None,
+    keepdims: bool = False,
+    dtype: Optional[TensorDataType] = None,
+) -> torch.Tensor:
+    pt_dtype = convert_to_torch_dtype(dtype)
+    return torch.std(a, dim=axis, keepdim=keepdims, dtype=pt_dtype)
+
 
 @numeric.median.register
 def median(

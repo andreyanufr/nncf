@@ -209,6 +209,17 @@ def _(
     return np.array(np.mean(a, axis=axis, keepdims=keepdims, dtype=np_dtype))  # type: ignore [arg-type]
 
 
+@numeric.std.register
+def _(
+    a: T_NUMPY,
+    axis: T_AXIS = None,
+    keepdims: bool = False,
+    dtype: Optional[TensorDataType] = None,
+) -> T_NUMPY_ARRAY:
+    np_dtype = convert_to_numpy_dtype(dtype)
+    return np.array(np.std(a, axis=axis, keepdims=keepdims, dtype=np_dtype))  # type: ignore [arg-type]
+
+
 @numeric.median.register
 def _(
     a: T_NUMPY,

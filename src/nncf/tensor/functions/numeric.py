@@ -342,6 +342,19 @@ def mean(a: Tensor, axis: T_AXIS = None, keepdims: bool = False, dtype: Optional
 
 
 @tensor_dispatcher
+def std(a: Tensor, axis: T_AXIS = None, keepdims: bool = False, dtype: Optional[TensorDataType] = None) -> Tensor:
+    """
+    Compute the standard deviation along the specified axis.
+
+    :param a: Array containing numbers whose standard deviation is desired.
+    :param axis: Axis or axes along which the standard deviation is computed.
+    :param keepdims: Destination positions for each of the original axes. These must also be unique.
+    :param dtype: Type to use in computing the standard deviation.
+    :return: Array with moved axes.
+    """
+
+
+@tensor_dispatcher
 def median(a: Tensor, axis: T_AXIS = None, keepdims: bool = False) -> Tensor:
     """
     Compute the arithmetic median along the specified axis.

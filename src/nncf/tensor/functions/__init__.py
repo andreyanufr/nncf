@@ -57,6 +57,7 @@ from nncf.tensor.functions.numeric import round as round
 from nncf.tensor.functions.numeric import searchsorted as searchsorted
 from nncf.tensor.functions.numeric import squeeze as squeeze
 from nncf.tensor.functions.numeric import stack as stack
+from nncf.tensor.functions.numeric import std as std
 from nncf.tensor.functions.numeric import sum as sum
 from nncf.tensor.functions.numeric import tensor as tensor
 from nncf.tensor.functions.numeric import transpose as transpose
