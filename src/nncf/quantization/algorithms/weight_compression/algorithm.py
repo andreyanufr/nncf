@@ -47,6 +47,7 @@ from nncf.quantization.algorithms.weight_compression.gptq import GPTQ
 from nncf.quantization.algorithms.weight_compression.lora_correction import LoraCorrectionAlgorithm
 from nncf.quantization.algorithms.weight_compression.mixed_precision import MIXED_PRECISION_CRITERIA
 from nncf.quantization.algorithms.weight_compression.scale_estimation import ScaleEstimation
+from nncf.quantization.algorithms.weight_compression.sinq import SINQ
 from nncf.quantization.algorithms.weight_compression.weight_lowering import WeightCompressionConfig
 from nncf.quantization.algorithms.weight_compression.weight_lowering import get_reduction_channel_size
 from nncf.scopes import IgnoredScope
@@ -364,6 +365,8 @@ class WeightCompression(Algorithm):
                 scale_estimation_params.scale_steps,
                 scale_estimation_params.weight_penalty,
             )
+            
+            self._sinq = SINQ(16)
 
         self._data_aware_mixed_precision = (
             self._sensitivity_metric != SensitivityMetric.WEIGHT_QUANTIZATION_ERROR and self._ratio != 1.0
@@ -935,13 +938,22 @@ class WeightCompression(Algorithm):
             )
         else:
             if self._scale_estimation:
-                precomputed_compressed_weights = self._scale_estimation_algo.apply(
+                # precomputed_compressed_weights = self._scale_estimation_algo.apply(
+                #     model=model,
+                #     graph=graph,
+                #     all_weight_params=all_weight_params,
+                #     statistics=statistics,
+                #     backend_entity=self._backend_entity,
+                # )
+                self._sinq.apply(
                     model=model,
                     graph=graph,
                     all_weight_params=all_weight_params,
                     statistics=statistics,
-                    backend_entity=self._backend_entity,
+                    wc_backend_entity=self._backend_entity,
                 )
+                statistics = self._sinq.update_statistics(statistics)
+                
 
             if self._lora_correction:
                 lora_correction_params = self._advanced_parameters.lora_correction_params

@@ -221,6 +221,7 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         const_dtype,
         should_add_convert_node: bool,
         precomputed_compressed_weight: Optional[CompressedWeight] = None,
+        sinq_scale: Optional[Tensor] = None,
     ):
         scale_dtype = ov.Type.f16
         if compression_config.mode == CompressWeightsMode.NF4:
@@ -277,6 +278,9 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
                 converted_const = opset.subtract(
                     converted_const, zero_point_const, name=f"{const_node_name}/zero_point/subtract"
                 )
+
+        if sinq_scale is not None:
+            compressed_weight.scale = sinq_scale * compressed_weight.scale
 
         scale_const = create_ov_const_from_tensor(compressed_weight.scale, scale_dtype, name=f"{const_node_name}/scale")
         scale_const = convert_op(scale_const, ov.Type.f16)
@@ -350,6 +354,7 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
                 precomputed_compressed_weight=None
                 if precomputed_compressed_weights is None
                 else precomputed_compressed_weights.get(wc_params.weight_name),
+                sinq_scale=wc_params.sinq_scales,
             )
 
             self._replace_node(const_node, mul)

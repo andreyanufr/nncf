@@ -102,6 +102,7 @@ class WeightCompressionParameters:
     weight_shape: tuple[int, ...]
     reduction_axes: tuple[int, ...]
     compression_config: Optional[WeightCompressionConfig] = field(default_factory=WeightCompressionConfig)
+    sinq_scales: Optional[TTensor] = None
 
     @property
     def num_weights(self) -> np.uint64:

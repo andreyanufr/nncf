@@ -141,27 +141,31 @@ class SINQ(Algorithm):
             weight_dtype = weight.dtype
             weight = weight.astype(TensorDataType.float32)
 
-            weight, scale1, scale2 = self._step(wp, weight)
+            weight, scale1, scale2 = self._step(weight, wp.reduction_axes, wp.compression_config)
 
-            scaled_weight = (weight * scale1 / scale2).astype(weight_dtype)
+            scaled_weight = weight.astype(weight_dtype)
             self._backend_entity.set_weight(wp.node_with_weight, weight_port_id, model, graph, scaled_weight)
 
 
-            a_scale = fns.transpose(a_scale).astype(weight_dtype)
-            prev_nodes = graph.get_previous_nodes(wp.node_with_weight)
-            source_node_output_port = graph.get_output_edges(prev_nodes)[0].output_port_id
+            a_scale = scale1.astype(weight_dtype)
+            prev_nodes = graph.get_previous_nodes(wp.node_with_weight)[0]
+            edge = graph._get_edges(prev_nodes, wp.node_with_weight)
+
+            source_node_output_port = edge[0].output_port_id
             scale_insertion_command = self._backend_entity.scale_insertion_command(
-                prev_nodes, wp.node_with_weight, source_node_output_port, a_scale.data
+                prev_nodes, [wp.node_with_weight], source_node_output_port, a_scale.data
             )
             transformation_layout.register(scale_insertion_command)
 
-            self._scale_per_target_node[wp.weight_name] = a_scale
+            self._scale_per_target_node[wp.node_with_weight.node_name] = a_scale
+
+            wp.sinq_scales = scale2.astype(weight_dtype)
 
         transformed_model = model_transformer.transform(transformation_layout)
 
         return transformed_model
 
-    def _step_(self, weight: TTensor, reduction_axes: list[int], config: WeightCompressionConfig):
+    def _step(self, weight: TTensor, reduction_axes: list[int], config: WeightCompressionConfig):
         reduction_axis = reduction_axes[0]
         weight = weight.astype(TensorDataType.float32)
         eps = fns.finfo(weight).eps
@@ -172,7 +176,7 @@ class SINQ(Algorithm):
             reduction_axis = 1
             was_transposed = True
 
-        original_weight, _ = reshape_weight_for_grouped_quantization(original_weight, reduction_axis, config.group_size)
+        original_weight, _ = reshape_weight_for_grouped_quantization(weight, reduction_axis, config.group_size)
         original_weight = fns.transpose(original_weight, (1, 0, 2))
         
         s1 = []
@@ -180,13 +184,19 @@ class SINQ(Algorithm):
         scales_weight = []
         for i in range(original_weight.shape[0]):
             w = original_weight[i, :, :]
-            scaled_w, scale1, scale2 = self._step(w, order=self._steps)
+            scaled_w, scale1, scale2 = self._sinkhorn(w, order=self._steps)
             s1.append(scale1)
             s2.append(scale2)
             scales_weight.append(scaled_w)
+        
+        res_s1 = fns.concatenate(s1, axis=1)
+        res_s2 = fns.expand_dims(fns.concatenate(s2, axis=1), -1)
+        scales_weight = fns.concatenate(scales_weight, axis=1)
+
+        return scales_weight, res_s1, res_s2
 
 
-    def _step(self, matrix: TTensor, order=8,
+    def _sinkhorn(self, matrix: TTensor, order=8,
                  clip_min=1e-3,
                  clip_max=1e3,
                  eps=1e-6,
@@ -202,11 +212,11 @@ class SINQ(Algorithm):
         measure = fns.std
         dtype = TensorDataType.float32
         backend = matrix.backend
-        m = matrix.
+        m = matrix.astype(dtype)
 
         def imbalance(mat):
             s1, s2 = measure(mat, 1), measure(mat, 0)
-            s_min = fns.minimum(s1.min(), s2.min()).clamp_min(1e-12)
+            s_min = fns.clip(fns.minimum(s1.min(), s2.min()), a_min=1e-12, a_max=None)
             s_max = fns.maximum(s1.max(), s2.max())
             return s_max / s_min          # scalar
 
@@ -214,46 +224,50 @@ class SINQ(Algorithm):
         gate    = fns.tensor(0.0, dtype=TensorDataType.float32, backend=backend)
 
         tgt_small = fns.minimum(
-            fns.std(m, 1).clamp(clip_min, clip_max).min(),
-            fns.std(m, 0).clamp(clip_min, clip_max).min()
+            fns.clip(fns.std(m, 1), clip_min, clip_max).min(),
+            fns.clip(fns.std(m, 0), clip_min, clip_max).min()
         ) + eps
 
-        log_mu1 = fns.zeros(m.shape[1], dtype=TensorDataType.float32, backend=backend)
-        log_mu2 = fns.zeros(m.shape[0], 1, dtype=TensorDataType.float32, backend=backend)
+        log_mu1 = fns.zeros((1, m.shape[1]), dtype=TensorDataType.float32, backend=backend)
+        log_mu2 = fns.zeros((m.shape[0], 1), dtype=TensorDataType.float32, backend=backend)
 
         # Known-good candidates for the step k=0
         cur0          = m
         ib0           = imbalance(cur0)
         imb_min       = fns.minimum(imb_min, ib0)
-        mu1_star      = log_mu1.exp().clone()
-        mu2_star      = log_mu2.exp().clone()
+
+        mu1_star      = fns.exp(log_mu1)#.clone()
+        mu2_star      = fns.exp(log_mu2)#.clone()
+
 
         for _ in range(order):
-            cur       = (m / log_mu1.exp()) / log_mu2.exp()
+            cur       = (m / fns.exp(log_mu1)) / fns.exp(log_mu2)
             ib        = imbalance(cur)
 
             # update the best-so-far candidates
-            better    = (ib <= imb_min).to(dtype)   # 1 if new best
+            better    = (ib <= imb_min).item()#astype(dtype)   # 1 if new best
             imb_min   = min(imb_min, ib)
-            mu1_star  = fns.where(better.bool(), log_mu1.exp(), mu1_star)
-            mu2_star  = fns.where(better.bool(), log_mu2.exp(), mu2_star)
+            mu1_star  = fns.exp(log_mu1) if better else mu1_star
+            mu2_star  = fns.exp(log_mu2) if better else mu2_star
 
             # early-exit condition
             if stop_on_increasing_imbalance:
-                rising = (ib > imb_min).to(dtype)
-                gate   = fns.clip(gate + rising, max=1.0)   # once 1 → always 1
+                rising = (ib > imb_min).astype(dtype)
+                gate   = fns.clip(gate + rising, a_min=None, a_max=1.0)   # once 1 → always 1
 
             # still-running samples update the dual variables
             g  = 1.0 - gate
 
-            std_r  = measure(cur, 1).clamp(clip_min, clip_max)
-            std_c  = measure(cur,0).clamp(clip_min, clip_max)
+            std_r  = fns.clip(measure(cur, 1), clip_min, clip_max)
+            std_c  = fns.clip(measure(cur, 0), clip_min, clip_max)
 
-            sal_col = (std_c / tgt_small).clamp(0.7, 2.0).log()
-            sal_row = (std_r[:, None] / tgt_small).clamp(0.7, 2.0).log()
+            sal_col = fns.clip((std_c / tgt_small), 0.7, 2.0)
+            sal_col = fns.log(sal_col)
+            
+            sal_row = fns.log(fns.clip((std_r[:, None] / tgt_small), 0.7, 2.0))
 
-            log_mu1 = (log_mu1 + (sal_col * g)).clip(-.3, 10.)
-            log_mu2 = (log_mu2 + (sal_row * g)).clip(-.3, 10.)
+            log_mu1 = fns.clip((log_mu1 + (sal_col * g)), -.3, 10.)
+            log_mu2 = fns.clip((log_mu2 + (sal_row * g)), -.3, 10.)
 
         # final scaled matrix and the recorded best scaling vectors
         scaled = m / mu1_star / mu2_star

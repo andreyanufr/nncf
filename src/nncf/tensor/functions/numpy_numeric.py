@@ -239,6 +239,16 @@ def _(a: T_NUMPY, exponent: Union[T_NUMPY, float]) -> T_NUMPY:
     return np.power(a, exponent)
 
 
+@numeric.exp.register
+def _(a: T_NUMPY) -> T_NUMPY:
+    return np.exp(a)
+
+
+@numeric.log.register
+def _(a: T_NUMPY) -> T_NUMPY:
+    return np.log(a)
+
+
 @numeric.quantile.register
 def _(
     a: T_NUMPY,

@@ -260,6 +260,16 @@ def _(a: torch.Tensor, exponent: Union[torch.Tensor, float]) -> torch.Tensor:
     return torch.pow(a, exponent=exponent)
 
 
+@numeric.exp.register
+def _(a: torch.Tensor) -> torch.Tensor:
+    return torch.exp(a)
+
+
+@numeric.log.register
+def _(a: torch.Tensor) -> torch.Tensor:
+    return torch.log(a)
+
+
 @numeric.quantile.register
 def quantile(
     a: torch.Tensor,

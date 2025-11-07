@@ -393,6 +393,24 @@ def power(a: Tensor, exponent: Union[Tensor, float]) -> Tensor:
 
 
 @tensor_dispatcher
+def exp(a: Tensor) -> Tensor:
+    """
+    Takes the exponential of each element in input and returns a tensor with the result.
+    :param a: Input data.
+    :return: The result of the exponential of each element in input.
+    """
+
+
+@tensor_dispatcher
+def log(a: Tensor) -> Tensor:
+    """
+    Takes the logarithm of each element in input and returns a tensor with the result.
+    :param a: Input data.
+    :return: The result of the logarithm of each element in input.
+    """
+
+
+@tensor_dispatcher
 def quantile(
     a: Tensor,
     q: Union[float, list[float]],

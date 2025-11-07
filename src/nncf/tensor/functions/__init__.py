@@ -28,6 +28,7 @@ from nncf.tensor.functions.numeric import device as device
 from nncf.tensor.functions.numeric import diag as diag
 from nncf.tensor.functions.numeric import dtype as dtype
 from nncf.tensor.functions.numeric import expand_dims as expand_dims
+from nncf.tensor.functions.numeric import exp as exp
 from nncf.tensor.functions.numeric import eye as eye
 from nncf.tensor.functions.numeric import finfo as finfo
 from nncf.tensor.functions.numeric import flatten as flatten
@@ -35,6 +36,7 @@ from nncf.tensor.functions.numeric import from_numpy as from_numpy
 from nncf.tensor.functions.numeric import isclose as isclose
 from nncf.tensor.functions.numeric import isempty as isempty
 from nncf.tensor.functions.numeric import item as item
+from nncf.tensor.functions.numeric import log as log
 from nncf.tensor.functions.numeric import log2 as log2
 from nncf.tensor.functions.numeric import logical_or as logical_or
 from nncf.tensor.functions.numeric import masked_mean as masked_mean
