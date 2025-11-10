@@ -148,7 +148,7 @@ class SINQ(Algorithm):
 
 
             a_scale = scale1.astype(weight_dtype)
-            prev_nodes = graph.get_previous_nodes(wp.node_with_weight)[0]
+            prev_nodes = [pn for pn in graph.get_previous_nodes(wp.node_with_weight) if pn.node_type != 'Convert'][0]
             edge = graph._get_edges(prev_nodes, wp.node_with_weight)
 
             source_node_output_port = edge[0].output_port_id
