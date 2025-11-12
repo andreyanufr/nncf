@@ -20,7 +20,9 @@ SINQ_PATTERNS = Registry("sinq")
 @SINQ_PATTERNS.register("Mul_MatMul")
 def create_mul_matmul(matmul_metatype, multiply_metatype, constant_metatype) -> GraphPattern:
     pattern = GraphPattern()
-    const_node = pattern.add_node(**{GraphPattern.LABEL_ATTR: "CONSTANT", GraphPattern.METATYPE_ATTR: constant_metatype})
+    const_node = pattern.add_node(
+        **{GraphPattern.LABEL_ATTR: "CONSTANT", GraphPattern.METATYPE_ATTR: constant_metatype}
+    )
     mul_node = pattern.add_node(**{GraphPattern.LABEL_ATTR: "MULTIPLY", GraphPattern.METATYPE_ATTR: multiply_metatype})
     linear_node = pattern.add_node(**{GraphPattern.LABEL_ATTR: "LINEAR", GraphPattern.METATYPE_ATTR: matmul_metatype})
 
@@ -32,7 +34,9 @@ def create_mul_matmul(matmul_metatype, multiply_metatype, constant_metatype) -> 
 @SINQ_PATTERNS.register("Mul_2MatMu")
 def create_mul_2matmul(matmul_metatype, multiply_metatype, constant_metatype) -> GraphPattern:
     pattern = GraphPattern()
-    const_node = pattern.add_node(**{GraphPattern.LABEL_ATTR: "CONSTANT", GraphPattern.METATYPE_ATTR: constant_metatype})
+    const_node = pattern.add_node(
+        **{GraphPattern.LABEL_ATTR: "CONSTANT", GraphPattern.METATYPE_ATTR: constant_metatype}
+    )
     mul_node = pattern.add_node(**{GraphPattern.LABEL_ATTR: "MULTIPLY", GraphPattern.METATYPE_ATTR: multiply_metatype})
     linear_node1 = pattern.add_node(**{GraphPattern.LABEL_ATTR: "LINEAR", GraphPattern.METATYPE_ATTR: matmul_metatype})
     linear_node2 = pattern.add_node(**{GraphPattern.LABEL_ATTR: "LINEAR", GraphPattern.METATYPE_ATTR: matmul_metatype})
@@ -46,7 +50,9 @@ def create_mul_2matmul(matmul_metatype, multiply_metatype, constant_metatype) ->
 @SINQ_PATTERNS.register("Mul_3MatMu")
 def create_mul_3matmul(matmul_metatype, multiply_metatype, constant_metatype) -> GraphPattern:
     pattern = GraphPattern()
-    const_node = pattern.add_node(**{GraphPattern.LABEL_ATTR: "CONSTANT", GraphPattern.METATYPE_ATTR: constant_metatype})
+    const_node = pattern.add_node(
+        **{GraphPattern.LABEL_ATTR: "CONSTANT", GraphPattern.METATYPE_ATTR: constant_metatype}
+    )
     mul_node = pattern.add_node(**{GraphPattern.LABEL_ATTR: "MULTIPLY", GraphPattern.METATYPE_ATTR: multiply_metatype})
     linear_node1 = pattern.add_node(**{GraphPattern.LABEL_ATTR: "LINEAR", GraphPattern.METATYPE_ATTR: matmul_metatype})
     linear_node2 = pattern.add_node(**{GraphPattern.LABEL_ATTR: "LINEAR", GraphPattern.METATYPE_ATTR: matmul_metatype})
@@ -57,7 +63,6 @@ def create_mul_3matmul(matmul_metatype, multiply_metatype, constant_metatype) ->
     pattern.add_edge(mul_node, linear_node2)
     pattern.add_edge(mul_node, linear_node3)
     return pattern
-
 
 
 def get_sinq_patterns(matmul_metatype, multiply_metatype, constant_metatype):
