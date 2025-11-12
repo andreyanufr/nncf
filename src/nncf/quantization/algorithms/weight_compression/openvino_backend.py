@@ -60,6 +60,7 @@ from nncf.quantization.algorithms.weight_compression.config import WeightCompres
 from nncf.quantization.algorithms.weight_compression.config import WeightCompressionParameters
 from nncf.quantization.algorithms.weight_compression.lora_correction import LoraCorrectionAlgorithm
 from nncf.quantization.algorithms.weight_compression.parameters import CompressedWeight
+from nncf.quantization.algorithms.weight_compression.sinq_patterns import get_sinq_patterns
 from nncf.quantization.algorithms.weight_compression.weight_lowering import compress_weight
 from nncf.tensor import Tensor
 from nncf.tensor.definitions import TensorDataType
@@ -162,6 +163,21 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         name = const_op.get_friendly_name()
         new_const_op = create_ov_const_from_tensor(weight, dtype, name)
         self.name_to_node_mapping[const_op_friendly_name] = new_const_op
+
+        new_output = new_const_op.output(0)
+        for target_input in const_op.output(0).get_target_inputs():
+            target_input.replace_source_output(new_output)
+
+        del const_op
+
+    def scale_constant(self, const_op_node: NNCFNode, model: ov.Model, graph: NNCFGraph, scale: Tensor):
+        const_op = self.name_to_node_mapping[const_op_node.node_name]
+        dtype = const_op.get_element_type()
+        name = const_op.get_friendly_name()
+        prev_scale = const_op.data
+        weight = Tensor(prev_scale.data * scale.data)
+        new_const_op = create_ov_const_from_tensor(weight, dtype, name)
+        self.name_to_node_mapping[const_op.friendly_name] = new_const_op
 
         new_output = new_const_op.output(0)
         for target_input in const_op.output(0).get_target_inputs():
@@ -412,6 +428,10 @@ class OVAWQAlgoAlgoBackend(AWQAlgoBackend, OVWeightCompressionAlgoBackend):
     @staticmethod
     def get_awq_patterns():
         return get_awq_patterns(om.OVMatMulMetatype, om.OVMultiplyMetatype, ATOMIC_ACTIVATIONS_OPERATIONS)
+
+    @staticmethod
+    def get_sinq_patterns():
+        return get_sinq_patterns(om.OVMatMulMetatype, om.OVMultiplyMetatype, om.OVConstantMetatype)
 
     @staticmethod
     def scale_insertion_command(source_node, next_nodes, source_node_output_port, scale):

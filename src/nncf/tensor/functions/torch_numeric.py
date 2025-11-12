@@ -203,6 +203,11 @@ def _(x: list[torch.Tensor], axis: int = 0) -> torch.Tensor:
     return torch.concatenate(x, dim=axis)
 
 
+@numeric.split.register
+def _(x: list[torch.Tensor], indices_or_sections: Union[int, list[int]], axis: int = 0) -> torch.Tensor:
+    return torch.split(x, split_size_or_sections=indices_or_sections, dim=axis)
+
+
 @numeric.unstack.register
 def _(x: torch.Tensor, axis: int = 0) -> list[torch.Tensor]:
     if not list(x.shape):
@@ -224,6 +229,7 @@ def _(
 ) -> torch.Tensor:
     pt_dtype = convert_to_torch_dtype(dtype)
     return torch.mean(a, dim=axis, keepdim=keepdims, dtype=pt_dtype)
+
 
 @numeric.std.register
 def _(

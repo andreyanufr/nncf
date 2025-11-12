@@ -188,6 +188,11 @@ def _(x: T_NUMPY, axis: int = 0) -> T_NUMPY_ARRAY:
     return np.concatenate(x, axis=axis)
 
 
+@numeric.split.register
+def _(x: T_NUMPY, indices_or_sections: Union[int, list[int]], axis: int = 0) -> T_NUMPY_ARRAY:
+    return np.split(x, indices_or_sections, axis=axis)
+
+
 @numeric.unstack.register
 def _(x: T_NUMPY, axis: int = 0) -> list[T_NUMPY_ARRAY]:
     return [np.squeeze(e, axis) for e in np.split(x, x.shape[axis], axis=axis)]

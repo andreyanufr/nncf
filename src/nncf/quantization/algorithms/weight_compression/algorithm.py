@@ -365,7 +365,7 @@ class WeightCompression(Algorithm):
                 scale_estimation_params.scale_steps,
                 scale_estimation_params.weight_penalty,
             )
-            
+
             self._sinq = SINQ(16)
 
         self._data_aware_mixed_precision = (
@@ -953,7 +953,6 @@ class WeightCompression(Algorithm):
                     wc_backend_entity=self._backend_entity,
                 )
                 statistics = self._sinq.update_statistics(statistics)
-                
 
             if self._lora_correction:
                 lora_correction_params = self._advanced_parameters.lora_correction_params

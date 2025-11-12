@@ -306,6 +306,19 @@ def concatenate(x: list[Tensor], axis: int = 0) -> Tensor:
 
 
 @tensor_dispatcher
+def split(x: list[Tensor], indices_or_sections: Union[int, list[int]], axis: int = 0) -> Tensor:
+    """
+    Split an array into multiple sub-arrays along an existing axis.
+
+    :param x: The array to split.
+    :param indices_or_sections: If int, the number of equal sections to split into.
+                                If list of ints, the indices at which to split.
+    :param axis: The axis along which to split the array. Default is 0.
+    :return: A list of sub-arrays.
+    """
+
+
+@tensor_dispatcher
 def unstack(x: Tensor, axis: int = 0) -> list[Tensor]:
     """
     Unstack a Tensor into list.

@@ -10,7 +10,6 @@
 # limitations under the License.
 
 from copy import deepcopy
-from dataclasses import dataclass
 from typing import Optional, TypeVar
 
 import nncf
@@ -25,15 +24,12 @@ from nncf.common.tensor_statistics.statistic_point import StatisticPointsContain
 from nncf.common.utils.backend import BackendType
 from nncf.common.utils.backend import get_backend
 from nncf.experimental.common.tensor_statistics.statistics import WCTensorStatistic
-from nncf.quantization.algorithms.weight_compression.config import WeightCompressionConfig
 from nncf.quantization.algorithms.algorithm import Algorithm
-from nncf.quantization.algorithms.weight_compression.activation_stats import process_stats
 from nncf.quantization.algorithms.weight_compression.backend import WeightCompressionAlgoBackend
+from nncf.quantization.algorithms.weight_compression.config import WeightCompressionConfig
 from nncf.quantization.algorithms.weight_compression.config import WeightCompressionParameters
-from nncf.quantization.algorithms.weight_compression.weight_lowering import float_quantize_dequantize_weight
-from nncf.quantization.algorithms.weight_compression.weight_lowering import integer_quantize_dequantize_weight
-from nncf.quantization.passes import transform_to_inference_graph
 from nncf.quantization.algorithms.weight_compression.weight_lowering import reshape_weight_for_grouped_quantization
+from nncf.quantization.passes import transform_to_inference_graph
 from nncf.tensor import TensorDataType
 from nncf.tensor import functions as fns
 
@@ -44,7 +40,6 @@ TWeightType = TypeVar("TWeightType")
 
 FP16_MAX_VALUE = 65504.0
 FP16_OVERFLOW_MARGIN = 0.25
-
 
 
 class SINQ(Algorithm):
@@ -101,7 +96,7 @@ class SINQ(Algorithm):
         else:
             msg = f"Cannot return backend-specific AWQ entity because {model_backend.value} is not supported!"
             raise nncf.UnsupportedBackendError(msg)
-        self._patterns = self._backend_entity.get_awq_patterns()
+        self._patterns = self._backend_entity.get_sinq_patterns()
 
     def apply(
         self,
@@ -127,39 +122,86 @@ class SINQ(Algorithm):
 
         description = "Applying SINQ"
 
-        for wp in track(all_weight_params, description=description):
-            weight_data = self._backend_entity.get_weight_names_and_port_ids(wp.node_with_weight, graph)
-            if len(weight_data) != 1:  # not supported by the algorithm
-                continue
+        sinq_data = self._get_sinq_data(graph, all_weight_params)
 
-            nncf_logger.debug(f"{description} for: {wp.node_with_weight.node_name}")
+        if not len(sinq_data) == 0:
+            for ln_node, mm_nodes in track(sinq_data.items(), description=description):
+                if len(mm_nodes) == 1:
+                    continue
+                weight_datas = [
+                    self._backend_entity.get_weight_names_and_port_ids(mm_node, graph) for mm_node in mm_nodes
+                ]
 
-            _, weight_port_id = weight_data[0]
-            weight = self._backend_entity.get_weight(
-                wp.node_with_weight, weight_port_id, model, graph
-            )  # get_const_value(wp.weight_node)
-            weight_dtype = weight.dtype
-            weight = weight.astype(TensorDataType.float32)
+                nncf_logger.debug(f"{description} for: {ln_node.node_name}")
 
-            weight, scale1, scale2 = self._step(weight, wp.reduction_axes, wp.compression_config)
+                weight_port_id = [weight_data[0][1] for weight_data in weight_datas]
+                weights = [
+                    self._backend_entity.get_weight(mm_node, wp_id, model, graph)
+                    for mm_node, wp_id in zip(mm_nodes, weight_port_id)
+                ]
+                weight_dtypes = [weight.dtype for weight in weights]
+                weights = [weight.astype(TensorDataType.float32) for weight in weights]
 
-            scaled_weight = weight.astype(weight_dtype)
-            self._backend_entity.set_weight(wp.node_with_weight, weight_port_id, model, graph, scaled_weight)
+                wps = [wp for mm in mm_nodes for wp in all_weight_params if wp.node_with_weight == mm]
 
+                split_sizes = [w.shape[0] for w in weights]
+                for i in range(len(split_sizes) - 1):
+                    split_sizes[i + 1] += split_sizes[i]
 
-            a_scale = scale1.astype(weight_dtype)
-            prev_nodes = [pn for pn in graph.get_previous_nodes(wp.node_with_weight) if pn.node_type != 'Convert'][0]
-            edge = graph._get_edges(prev_nodes, wp.node_with_weight)
+                combined_weights = fns.concatenate(weights, axis=0)
+                scaled_weight, scale1, scale2 = self._step(
+                    combined_weights, wps[0].reduction_axes, wps[0].compression_config
+                )
+                split_scaled_weights = fns.split(scaled_weight, split_sizes, axis=0)
+                split_scale2 = fns.split(scale2, split_sizes, axis=0)
 
-            source_node_output_port = edge[0].output_port_id
-            scale_insertion_command = self._backend_entity.scale_insertion_command(
-                prev_nodes, [wp.node_with_weight], source_node_output_port, a_scale.data
-            )
-            transformation_layout.register(scale_insertion_command)
+                self._backend_entity.scale_constant(ln_node, model, graph, scale1)
 
-            self._scale_per_target_node[wp.node_with_weight.node_name] = a_scale
+                for i, wp in enumerate(wps):
+                    scaled_weight = split_scaled_weights[i]
+                    sinq_scale2 = split_scale2[i]
+                    scaled_weight = scaled_weight.astype(weight_dtypes[i])
+                    self._backend_entity.set_weight(wp.node_with_weight, weight_port_id[i], model, graph, scaled_weight)
+                    a_scale = scale1.astype(weight_dtypes[i])
 
-            wp.sinq_scales = scale2.astype(weight_dtype)
+                    self._scale_per_target_node[wp.node_with_weight.node_name] = a_scale
+
+                    wp.sinq_scales = sinq_scale2.astype(weight_dtypes[i])
+        else:
+            for wp in track(all_weight_params, description=description):
+                weight_data = self._backend_entity.get_weight_names_and_port_ids(wp.node_with_weight, graph)
+                if len(weight_data) != 1:  # not supported by the algorithm
+                    continue
+
+                nncf_logger.debug(f"{description} for: {wp.node_with_weight.node_name}")
+
+                _, weight_port_id = weight_data[0]
+                weight = self._backend_entity.get_weight(
+                    wp.node_with_weight, weight_port_id, model, graph
+                )  # get_const_value(wp.weight_node)
+                weight_dtype = weight.dtype
+                weight = weight.astype(TensorDataType.float32)
+
+                weight, scale1, scale2 = self._step(weight, wp.reduction_axes, wp.compression_config)
+
+                scaled_weight = weight.astype(weight_dtype)
+                self._backend_entity.set_weight(wp.node_with_weight, weight_port_id, model, graph, scaled_weight)
+
+                a_scale = scale1.astype(weight_dtype)
+                prev_nodes = [pn for pn in graph.get_previous_nodes(wp.node_with_weight) if pn.node_type != "Convert"][
+                    0
+                ]
+                edge = graph._get_edges(prev_nodes, wp.node_with_weight)
+
+                source_node_output_port = edge[0].output_port_id
+                scale_insertion_command = self._backend_entity.scale_insertion_command(
+                    prev_nodes, [wp.node_with_weight], source_node_output_port, a_scale.data
+                )
+                transformation_layout.register(scale_insertion_command)
+
+                self._scale_per_target_node[wp.node_with_weight.node_name] = a_scale
+
+                wp.sinq_scales = scale2.astype(weight_dtype)
 
         transformed_model = model_transformer.transform(transformation_layout)
 
@@ -178,7 +220,7 @@ class SINQ(Algorithm):
 
         original_weight, _ = reshape_weight_for_grouped_quantization(weight, reduction_axis, config.group_size)
         original_weight = fns.transpose(original_weight, (1, 0, 2))
-        
+
         s1 = []
         s2 = []
         scales_weight = []
@@ -188,19 +230,16 @@ class SINQ(Algorithm):
             s1.append(scale1)
             s2.append(scale2)
             scales_weight.append(scaled_w)
-        
+
         res_s1 = fns.concatenate(s1, axis=1)
         res_s2 = fns.expand_dims(fns.concatenate(s2, axis=1), -1)
         scales_weight = fns.concatenate(scales_weight, axis=1)
 
         return scales_weight, res_s1, res_s2
 
-
-    def _sinkhorn(self, matrix: TTensor, order=8,
-                 clip_min=1e-3,
-                 clip_max=1e3,
-                 eps=1e-6,
-                 stop_on_increasing_imbalance=True):
+    def _sinkhorn(
+        self, matrix: TTensor, order=8, clip_min=1e-3, clip_max=1e3, eps=1e-6, stop_on_increasing_imbalance=True
+    ):
         """
         vmap-friendly Sinkhorn that returns *the* mu1 / mu2 corresponding
         to the matrix with the minimal imbalance encountered during the
@@ -218,56 +257,57 @@ class SINQ(Algorithm):
             s1, s2 = measure(mat, 1), measure(mat, 0)
             s_min = fns.clip(fns.minimum(s1.min(), s2.min()), a_min=1e-12, a_max=None)
             s_max = fns.maximum(s1.max(), s2.max())
-            return s_max / s_min          # scalar
+            return s_max / s_min  # scalar
 
-        imb_min = fns.tensor(float('inf'), dtype=TensorDataType.float32, backend=backend)
-        gate    = fns.tensor(0.0, dtype=TensorDataType.float32, backend=backend)
+        imb_min = fns.tensor(float("inf"), dtype=TensorDataType.float32, backend=backend)
+        gate = fns.tensor(0.0, dtype=TensorDataType.float32, backend=backend)
 
-        tgt_small = fns.minimum(
-            fns.clip(fns.std(m, 1), clip_min, clip_max).min(),
-            fns.clip(fns.std(m, 0), clip_min, clip_max).min()
-        ) + eps
+        tgt_small = (
+            fns.minimum(
+                fns.clip(fns.std(m, 1), clip_min, clip_max).min(), fns.clip(fns.std(m, 0), clip_min, clip_max).min()
+            )
+            + eps
+        )
 
         log_mu1 = fns.zeros((1, m.shape[1]), dtype=TensorDataType.float32, backend=backend)
         log_mu2 = fns.zeros((m.shape[0], 1), dtype=TensorDataType.float32, backend=backend)
 
         # Known-good candidates for the step k=0
-        cur0          = m
-        ib0           = imbalance(cur0)
-        imb_min       = fns.minimum(imb_min, ib0)
+        cur0 = m
+        ib0 = imbalance(cur0)
+        imb_min = fns.minimum(imb_min, ib0)
 
-        mu1_star      = fns.exp(log_mu1)#.clone()
-        mu2_star      = fns.exp(log_mu2)#.clone()
-
+        mu1_star = fns.exp(log_mu1)  # .clone()
+        mu2_star = fns.exp(log_mu2)  # .clone()
 
         for _ in range(order):
-            cur       = (m / fns.exp(log_mu1)) / fns.exp(log_mu2)
-            ib        = imbalance(cur)
+            cur = (m / fns.exp(log_mu1)) / fns.exp(log_mu2)
+            ib = imbalance(cur)
 
             # update the best-so-far candidates
-            better    = (ib <= imb_min).item()#astype(dtype)   # 1 if new best
-            imb_min   = min(imb_min, ib)
-            mu1_star  = fns.exp(log_mu1) if better else mu1_star
-            mu2_star  = fns.exp(log_mu2) if better else mu2_star
+            better = (ib <= imb_min).item()  # astype(dtype)   # 1 if new best
+            imb_min = min(imb_min, ib)
+            mu1_star = fns.exp(log_mu1) if better else mu1_star
+            mu2_star = fns.exp(log_mu2) if better else mu2_star
 
             # early-exit condition
             if stop_on_increasing_imbalance:
                 rising = (ib > imb_min).astype(dtype)
-                gate   = fns.clip(gate + rising, a_min=None, a_max=1.0)   # once 1 → always 1
+                gate = fns.clip(gate + rising, a_min=None, a_max=1.0)  # once 1 → always 1
 
             # still-running samples update the dual variables
-            g  = 1.0 - gate
+            g = 1.0 - gate
 
-            std_r  = fns.clip(measure(cur, 1), clip_min, clip_max)
-            std_c  = fns.clip(measure(cur, 0), clip_min, clip_max)
+            std_r = fns.clip(measure(cur, 1), clip_min, clip_max)
+            std_c = fns.clip(measure(cur, 0), clip_min, clip_max)
 
             sal_col = fns.clip((std_c / tgt_small), 0.7, 2.0)
             sal_col = fns.log(sal_col)
-            
+
             sal_row = fns.log(fns.clip((std_r[:, None] / tgt_small), 0.7, 2.0))
 
-            log_mu1 = fns.clip((log_mu1 + (sal_col * g)), -.3, 10.)
-            log_mu2 = fns.clip((log_mu2 + (sal_row * g)), -.3, 10.)
+            log_mu1 = fns.clip((log_mu1 + (sal_col * g)), -0.3, 10.0)
+            log_mu2 = fns.clip((log_mu2 + (sal_row * g)), -0.3, 10.0)
 
         # final scaled matrix and the recorded best scaling vectors
         scaled = m / mu1_star / mu2_star
@@ -281,7 +321,6 @@ class SINQ(Algorithm):
         eps = fns.finfo(weight).eps
         scale = fns.maximum(fns.mean(fns.abs(weight), axis=axis), eps)
         return 1 / scale
-
 
     def update_statistics(self, statistics):
         if not statistics:
@@ -302,3 +341,50 @@ class SINQ(Algorithm):
         :return: Statistic points, for which StatisticsCollector should collect statistics.
         """
         return StatisticPointsContainer()
+
+    def _get_sinq_data(
+        self, graph: NNCFGraph, all_weight_params: list[WeightCompressionParameters]
+    ) -> dict[NNCFNode, list[NNCFNode]]:
+        """
+        Finds sinq patterns in graph and returns it.
+        :param graph: Model graph.
+        :param all_weight_params: list of all weight parameters.
+        :return: A dict with node names and matched sinq patterns.
+        """
+        matches = []
+        inference_nncf_graph = transform_to_inference_graph(deepcopy(graph), [], [], [], [])
+        nx_graph = inference_nncf_graph.get_nx_graph_copy()
+        for pattern_graph in self._patterns.values():
+            matches.extend(find_subgraphs_matching_pattern(nx_graph, pattern_graph(), strict=False))
+
+        if len(matches) == 0:
+            nncf_logger.info("No matching patterns were found for applying AWQ algorithm, it will be skipped.")
+            return {}
+
+        sinq_data = {}
+        processed_names = {wp.node_with_weight.node_name for wp in all_weight_params}
+
+        for match in matches:
+            mm_nodes = [graph.get_node_by_key(m) for m in match[2:]]
+            if any(not self._backend_entity.is_node_with_weights(node, graph) for node in mm_nodes):
+                continue
+            ln_node = graph.get_node_by_key(match[0])
+
+            # if ln_node in sinq_data:
+            #     sinq_data[ln_node].append(mm_nodes[0])
+            # else:
+            #     sinq_data[ln_node] = [mm_nodes[0]]
+
+            if ln_node in sinq_data:
+                if len(mm_nodes) > len(sinq_data[ln_node]):
+                    sinq_data[ln_node] = mm_nodes
+            else:
+                sinq_data[ln_node] = mm_nodes
+
+        res = {}
+        for k, v in sinq_data.items():
+            if any(n.node_name not in processed_names for n in v):
+                continue
+            res[k] = v
+
+        return res

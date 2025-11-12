@@ -27,8 +27,8 @@ from nncf.tensor.functions.numeric import count_nonzero as count_nonzero
 from nncf.tensor.functions.numeric import device as device
 from nncf.tensor.functions.numeric import diag as diag
 from nncf.tensor.functions.numeric import dtype as dtype
-from nncf.tensor.functions.numeric import expand_dims as expand_dims
 from nncf.tensor.functions.numeric import exp as exp
+from nncf.tensor.functions.numeric import expand_dims as expand_dims
 from nncf.tensor.functions.numeric import eye as eye
 from nncf.tensor.functions.numeric import finfo as finfo
 from nncf.tensor.functions.numeric import flatten as flatten
@@ -57,6 +57,7 @@ from nncf.tensor.functions.numeric import quantile as quantile
 from nncf.tensor.functions.numeric import reshape as reshape
 from nncf.tensor.functions.numeric import round as round
 from nncf.tensor.functions.numeric import searchsorted as searchsorted
+from nncf.tensor.functions.numeric import split as split
 from nncf.tensor.functions.numeric import squeeze as squeeze
 from nncf.tensor.functions.numeric import stack as stack
 from nncf.tensor.functions.numeric import std as std
