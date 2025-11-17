@@ -164,6 +164,8 @@ class SINQ(Algorithm):
                     self._backend_entity.set_weight(wp.node_with_weight, weight_port_id[i], model, graph, scaled_weight)
                     a_scale = scale1.astype(weight_dtypes[i])
 
+                    if sinq_scale2.shape[1] == 1 and sinq_scale2.shape[2] == 1:
+                        sinq_scale2 = sinq_scale2[:, 0, :]
                     self._scale_per_target_node[wp.node_with_weight.node_name] = a_scale
 
                     wp.sinq_scales = sinq_scale2.astype(weight_dtypes[i])
@@ -218,7 +220,8 @@ class SINQ(Algorithm):
             reduction_axis = 1
             was_transposed = True
 
-        original_weight, _ = reshape_weight_for_grouped_quantization(weight, reduction_axis, config.group_size)
+        group_size = config.group_size if config.group_size != -1 else weight.shape[reduction_axis]
+        original_weight, _ = reshape_weight_for_grouped_quantization(weight, reduction_axis, group_size)
         original_weight = fns.transpose(original_weight, (1, 0, 2))
 
         s1 = []
@@ -252,6 +255,12 @@ class SINQ(Algorithm):
         dtype = TensorDataType.float32
         backend = matrix.backend
         m = matrix.astype(dtype)
+        
+        mu1_star = fns.mean(fns.abs(m), axis=0, keepdims=True)
+        mu2_star = fns.zeros((m.shape[0], 1), dtype=TensorDataType.float32, backend=backend) + 1.0
+        
+        # scaled = m / mu1_star / mu2_star
+        # return scaled, mu1_star, mu2_star
 
         def imbalance(mat):
             s1, s2 = measure(mat, 1), measure(mat, 0)

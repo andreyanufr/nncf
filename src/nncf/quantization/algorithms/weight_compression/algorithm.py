@@ -86,6 +86,7 @@ def get_weight_compression_configuration(
     scale_estimation: Optional[bool] = None,
     gptq: Optional[bool] = None,
     lora_correction: Optional[bool] = None,
+    sinq: Optional[bool] = None,
     ignored_scope: Optional[IgnoredScope] = None,
     sensitivity_metric: Optional[SensitivityMetric] = None,
     backup_mode: Optional[BackupMode] = None,
@@ -111,6 +112,7 @@ def get_weight_compression_configuration(
         "scale_estimation": scale_estimation or False,
         "gptq": gptq or False,
         "lora_correction": lora_correction or False,
+        "sinq": sinq or False,
         "ignored_scope": ignored_scope or IgnoredScope(),
         "sensitivity_metric": (
             (
@@ -268,6 +270,7 @@ class WeightCompression(Algorithm):
         scale_estimation: bool,
         gptq: bool,
         lora_correction: bool,
+        sinq: bool,
         backup_mode: BackupMode = BackupMode.INT8_ASYM,
         compression_format: CompressionFormat = CompressionFormat.DQ,
         advanced_parameters: Optional[AdvancedCompressionParameters] = None,
@@ -326,6 +329,7 @@ class WeightCompression(Algorithm):
         self._scale_estimation = scale_estimation
         self._gptq = gptq
         self._lora_correction = lora_correction
+        self._sinq = sinq
         self._backup_mode = backup_mode
         self._compression_format = compression_format
         self._advanced_parameters = (
@@ -365,8 +369,8 @@ class WeightCompression(Algorithm):
                 scale_estimation_params.scale_steps,
                 scale_estimation_params.weight_penalty,
             )
-
-            self._sinq = SINQ(16)
+        if self._sinq:
+            self._sinq_algo = SINQ(16)
 
         self._data_aware_mixed_precision = (
             self._sensitivity_metric != SensitivityMetric.WEIGHT_QUANTIZATION_ERROR and self._ratio != 1.0
@@ -937,22 +941,24 @@ class WeightCompression(Algorithm):
                 backend_entity=self._backend_entity,
             )
         else:
-            if self._scale_estimation:
-                # precomputed_compressed_weights = self._scale_estimation_algo.apply(
-                #     model=model,
-                #     graph=graph,
-                #     all_weight_params=all_weight_params,
-                #     statistics=statistics,
-                #     backend_entity=self._backend_entity,
-                # )
-                self._sinq.apply(
+            if self._sinq:
+                self._sinq_algo.apply(
                     model=model,
                     graph=graph,
                     all_weight_params=all_weight_params,
                     statistics=statistics,
                     wc_backend_entity=self._backend_entity,
                 )
-                statistics = self._sinq.update_statistics(statistics)
+                statistics = self._sinq_algo.update_statistics(statistics)
+
+            if self._scale_estimation:
+                precomputed_compressed_weights = self._scale_estimation_algo.apply(
+                    model=model,
+                    graph=graph,
+                    all_weight_params=all_weight_params,
+                    statistics=statistics,
+                    backend_entity=self._backend_entity,
+                )
 
             if self._lora_correction:
                 lora_correction_params = self._advanced_parameters.lora_correction_params
