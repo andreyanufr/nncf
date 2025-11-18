@@ -22,6 +22,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from quantizer import Quantizer, QuantizationConfig
 from eval import evaluate_model
 
+import gc
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -121,7 +123,7 @@ def parse_args():
     parser.add_argument(
         "--dataset_name",
         type=str,
-        default="wikitext2",
+        default="gsm8k_cot_llama",#"wikitext2",
         help="Name of the dataset for evaluation"
     )
     
@@ -158,8 +160,16 @@ def load_model(args):
         torch_dtype=dtype,
         #device_map=args.device if args.device == "cuda" else None,
         trust_remote_code=args.trust_remote_code,
-        token=args.token
-    ).to(args.device)
+        token=args.token,
+        use_cache=True,
+    )#.to(args.device)
+    
+    print(
+        "CUDA memory allocated and reserved (GB):",
+        torch.cuda.memory_allocated() / 1e9, torch.cuda.memory_reserved() / 1e9  # in GB
+    )
+    memory_alloc = torch.cuda.memory_allocated() / 1e9
+    print("Memory allocated after model loading (GB):", memory_alloc)
     
     # if args.device == "cpu":
     #     model = model.to(args.device)
@@ -168,6 +178,18 @@ def load_model(args):
     logger.info(f"Model size: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B parameters")
     
     return model, tokenizer
+
+def cleanup():
+    torch.cuda.empty_cache()
+    gc.collect()
+
+def print_tensor_memory_usage():
+    for obj in gc.get_objects():
+        try:
+            if torch.is_tensor(obj) or (hasattr(obj, 'data') and torch.is_tensor(obj.data)):
+                print(type(obj), obj.size(), obj.dtype, obj.device, obj.shape)
+        except:
+            pass
 
 
 def quantize_model(model, args):
@@ -194,6 +216,13 @@ def quantize_model(model, args):
     
     model = model.to(args.device)
     
+    cleanup()
+    #print_tensor_memory_usage()
+    cleanup()
+
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
     logger.info(f"Quantization completed in {elapsed_time:.2f} seconds")
     
     print(
@@ -270,8 +299,8 @@ def main():
     # Load model and tokenizer
     model, tokenizer = load_model(args)
     
-    # Quantize model
-    #model = quantize_model(model, args)
+    #Quantize model
+    model = quantize_model(model, args)
     
     # Save quantized model
     # save_model(model, tokenizer, args.output_dir)

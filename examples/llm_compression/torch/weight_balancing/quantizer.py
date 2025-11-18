@@ -155,7 +155,9 @@ class WeightsBalancer():
         def process_block(mat):
             return q(mat, method) 
         Q, s1, s2 = vmap(process_block, randomness='different')(M_batched)
-
+        
+        del M_batched
+        torch.cuda.empty_cache()
 
         Q = Q.permute(1,0,2).reshape(-1, block)
         s2 = s2.permute(1,0,2).reshape(-1,1)
@@ -202,7 +204,11 @@ class Quantizer:
             zero = -_min / scale
             zero = torch.round(zero)
             
-            q_weight = torch.clamp(torch.round(weight / scale) + zero, 0, 2 ** quant_config['nbits'] - 1).to(torch.uint8)
+            q_weight = torch.clamp(torch.round(weight / scale) + zero, min_v, max_v).to(torch.uint8)
+            
+            del _min, _max, denom
+            torch.cuda.empty_cache()
+
         return q_weight, scale, zero
     
     def quantize_linear_layers(self, linear_layers: list[torch.nn.Linear], quant_config: dict):
@@ -239,6 +245,23 @@ class Quantizer:
 
             # self attention
             self_attn = module.self_attn
+            dtype = module.input_layernorm.weight.data.dtype
+            
+            
+            # w_quantized, wscale, zero, mu1, mu2 = self.quantize_linear_layers(
+            #     [self_attn.o_proj],
+            #     self.quant_config
+            # )
+            # self_attn.o_proj = QLinear(
+            #     self_attn.o_proj,
+            #     quant_config=self.quant_config,
+            #     w_quantized=w_quantized[0],
+            #     wscale=wscale[0],
+            #     zero=zero[0],
+            #     ascale=mu1.unsqueeze(0).to(dtype)
+            # ).to(device)
+            #self_attn.v_proj.weight.data = self_attn.v_proj.weight.data * mu1.view(-1, 1).to(device).to(dtype)
+            
             w_quantized, wscale, zero, mu1, mu2 = self.quantize_linear_layers(
                 [self_attn.q_proj, self_attn.k_proj, self_attn.v_proj],
                 self.quant_config
@@ -276,8 +299,8 @@ class Quantizer:
                 zero=zero[2],
             ).to(device)
             
-            dtype = module.input_layernorm.weight.data.dtype
             module.input_layernorm.weight.data = module.input_layernorm.weight.data * mu1.view(-1).to(device).to(dtype)
+            
             
             mlp = module.mlp
             

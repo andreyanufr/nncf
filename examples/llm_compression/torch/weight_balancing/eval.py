@@ -517,6 +517,12 @@ def evaluate_model(
         tasks = eval_ppl
         eval_ppl = None
         lm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=1)
+    elif 'gsm8k' in eval_ppl:
+        tasks = eval_ppl
+        eval_ppl = None
+        lm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=4, max_length=4096)
+        num_fewshot = 8
+        # --apply_chat_template --fewshot_as_multiturn --log_samples --output_path eval_results --tasks gsm8k_cot_llama --batch_size 4
     else:
         lm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=batch_size)
         lm.seqlen = 2048
@@ -553,6 +559,9 @@ def evaluate_model(
             batch_size=batch_size,
             num_fewshot=num_fewshot,
             limit=None if limit == -1 else limit,
+            apply_chat_template=True,
+            fewshot_as_multiturn=True,
+            
         )
 
         csr_results = csr_results["results"]

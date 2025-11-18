@@ -61,17 +61,18 @@ class QLinear(nn.Module):
         self.gemlite_linear.pack(self.w_quantized.to(torch.uint8), self.wscale, self.zero, bias)
         
         
-        for name, param in self.linear_layer.named_parameters():
-            setattr(self.linear_layer, name, None)
-        # del self.linear_layer
+        # for name, param in self.linear_layer.named_parameters():
+        #     setattr(self.linear_layer, name, None)
+        del self.linear_layer.weight
+        del self.linear_layer
         # torch.cuda.empty_cache()
             
-        del self.linear_layer
+        #del self.linear_layer
         torch.cuda.empty_cache()
 
 
     def forward(self, x:Tensor) -> Tensor:
-        out = self.gemlite_linear(x)
+        out = self.gemlite_linear(self.ascale * x)
         return out
 
     
