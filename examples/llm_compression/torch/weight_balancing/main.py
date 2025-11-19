@@ -67,7 +67,7 @@ def parse_args():
     parser.add_argument(
         "--balancing_method",
         type=str,
-        default="sinq",
+        default="absmean",
         choices=["sinq", "absmean"],
         help="Weight balancing method: 'sinq' (Sinkhorn) or 'absmean' (absolute mean)"
     )
@@ -92,6 +92,13 @@ def parse_args():
         default="float16",
         choices=["float32", "float16", "bfloat16"],
         help="Data type for model loading"
+    )
+    
+    parser.add_argument(
+        "--per_layer",
+        action="store_true",
+        #default=True,
+        help="Per layer quantization with not mergable scales."
     )
     
     # Evaluation arguments
@@ -123,7 +130,7 @@ def parse_args():
     parser.add_argument(
         "--dataset_name",
         type=str,
-        default="gsm8k_cot_llama",#"wikitext2",
+        default="wikitext2",
         help="Name of the dataset for evaluation"
     )
     
@@ -211,11 +218,16 @@ def quantize_model(model, args):
     
     # Quantize the model
     start_time = time.time()
-    quantizer.quantize_llama(model)
+    if args.per_layer:
+        quantizer.quantize_per_layer(model)
+    else:
+        quantizer.quantize_llama(model)
     elapsed_time = time.time() - start_time
     
     model = model.to(args.device)
     
+    model = torch.compile(model)
+
     cleanup()
     #print_tensor_memory_usage()
     cleanup()

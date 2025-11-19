@@ -4,6 +4,26 @@ from typing import Literal, Optional
 from qlinear import QLinear
 from tqdm import tqdm
 from torch import vmap
+import torch.nn as nn
+import gc
+
+
+
+def remove_non_model_tensors(model):
+    keys = set()
+    for name, param in model.named_parameters():
+        keys.add(param.data_ptr())
+
+    for obj in gc.get_objects():
+        try:
+            if torch.is_tensor(obj) or (hasattr(obj, 'data') and torch.is_tensor(obj.data)):
+                if obj.data_ptr() not in keys:
+                    del obj
+        except:
+            pass
+    gc.collect()
+    torch.cuda.empty_cache()
+
 
 @dataclass
 class QuantizationConfig:
@@ -120,7 +140,7 @@ class WeightsBalancer():
         dev = m.device
         
         mu1_star = m.abs().mean(0) + eps
-        mu2_star = torch.ones(m.shape[0], 1, dtype=torch.dtype, device=dev)
+        mu2_star = torch.ones(m.shape[0], 1, dtype=dtype, device=dev)
 
         # final scaled matrix and the recorded best scaling vectors
         scaled = m / mu1_star / mu2_star
@@ -164,6 +184,13 @@ class WeightsBalancer():
         s1 = s1.permute(1,0,2).view(1, -1)
         return Q, s1, s2
 
+# Finds the parent of a node module named "name"
+def find_parent(model, name: str) -> nn.Module:
+    module_tree = name.split(".")[:-1]
+    parent = model
+    for m in module_tree:
+        parent = parent._modules[m]
+    return parent
 
 class Quantizer:
     SUPPORTED_BITS = [2, 4, 8]
@@ -216,6 +243,8 @@ class Quantizer:
         split_dims = [layer.out_features for layer in linear_layers]
         mul = super_weighst[0].shape[1] // quant_config['group_size']
         split_dims = [s * mul for s in split_dims]
+        
+        dtype = super_weighst[0].dtype
         # for i in range(1, len(split_dims)):
         #     split_dims[i] += split_dims[i - 1]
         # split_dims = split_dims[:-1]
@@ -224,17 +253,24 @@ class Quantizer:
         super_weights, mu1, mu2 = self.balancer.balance_groupped(super_weights, method=self.quant_config.get('balancing_method', 'sinq'), block=self.quant_config.get('group_size', 64))
         
         w_quantized, wscale, zero = Quantizer.quantize(super_weights, quant_config)
-        
+        w_quantized = w_quantized
+
         del super_weighst
         torch.cuda.empty_cache()
 
         wscale = wscale * mu2
         
+        wscale = wscale.to(dtype)
+        zero = zero.to(dtype)
+        
         w_quantized = torch.split(w_quantized, split_dims, dim=0)
         wscale = torch.split(wscale, split_dims, dim=0)
         zero = torch.split(zero, split_dims, dim=0)
         
-        return w_quantized, wscale, zero, mu1, mu2
+        del mu2
+        torch.cuda.empty_cache()
+        
+        return w_quantized, wscale, zero, mu1, None
 
 
     def quantize_llama(self, model):
@@ -248,32 +284,26 @@ class Quantizer:
             dtype = module.input_layernorm.weight.data.dtype
             
             
-            # w_quantized, wscale, zero, mu1, mu2 = self.quantize_linear_layers(
-            #     [self_attn.o_proj],
-            #     self.quant_config
-            # )
-            # self_attn.o_proj = QLinear(
-            #     self_attn.o_proj,
-            #     quant_config=self.quant_config,
-            #     w_quantized=w_quantized[0],
-            #     wscale=wscale[0],
-            #     zero=zero[0],
-            #     ascale=mu1.unsqueeze(0).to(dtype)
-            # ).to(device)
-            #self_attn.v_proj.weight.data = self_attn.v_proj.weight.data * mu1.view(-1, 1).to(device).to(dtype)
+            w_quantized, wscale, zero, mu1, _ = self.quantize_linear_layers(
+                [self_attn.o_proj],
+                self.quant_config
+            )
+            # no place to merge scale, so we add it as ascale
+            self_attn.o_proj = QLinear(
+                self_attn.o_proj,
+                quant_config=self.quant_config,
+                w_quantized=w_quantized[0],
+                wscale=wscale[0],
+                zero=zero[0],
+                ascale=mu1.unsqueeze(0).to(dtype)
+            ).to(device)
+
             
-            w_quantized, wscale, zero, mu1, mu2 = self.quantize_linear_layers(
+            w_quantized, wscale, zero, mu1, _ = self.quantize_linear_layers(
                 [self_attn.q_proj, self_attn.k_proj, self_attn.v_proj],
                 self.quant_config
             )
-            
-            # linear_layer: Union[nn.Module, None],
-            # quant_config: Optional[dict] = None,
-            # compute_dtype: torch.dtype = torch.float16,
-            # w_quantized: Optional[Tensor] = None,
-            # wscale: Optional[Tensor] = None,
-            # zero: Optional[Tensor] = None,
-            # ascale: Optional[Tensor] = torch.tensor(1.0),
+
         
             self_attn.q_proj = QLinear(
                 self_attn.q_proj,
@@ -304,7 +334,7 @@ class Quantizer:
             
             mlp = module.mlp
             
-            w_quantized, wscale, zero, mu1, mu2 = self.quantize_linear_layers(
+            w_quantized, wscale, zero, mu1, _ = self.quantize_linear_layers(
                 [mlp.down_proj],
                 self.quant_config
             )
@@ -321,7 +351,7 @@ class Quantizer:
             mlp.up_proj.weight.data = mlp.up_proj.weight.data * mu1.view(-1, 1).to(device).to(dtype)
             
             
-            w_quantized, wscale, zero, mu1, mu2 = self.quantize_linear_layers(
+            w_quantized, wscale, zero, mu1, _ = self.quantize_linear_layers(
                 [mlp.up_proj, mlp.gate_proj],
                 self.quant_config
             )
@@ -345,6 +375,44 @@ class Quantizer:
             module.post_attention_layernorm.weight.data = module.post_attention_layernorm.weight.data * mu1.view(-1).to(device).to(dtype)
 
             torch.cuda.empty_cache()
+        self.cleanup(model)
+
+
+    def quantize_per_layer(self, model):
+        tmp_mapping = {}
+        for name, module in model.model.named_modules():
+            if (type(module) is torch.nn.Linear) and ('lm_head' not in name):
+                tmp_mapping[name] = module
+        
+        device = next(model.model.parameters()).device
+
+        for name in tqdm(tmp_mapping.keys(), desc="Quantizing per-layer"):
+            dtype = tmp_mapping[name].weight.data.dtype
+            w_quantized, wscale, zero, mu1, _ = self.quantize_linear_layers(
+                [tmp_mapping[name]],
+                self.quant_config
+            )
+            
+            qlinear = QLinear(
+                tmp_mapping[name],
+                quant_config=self.quant_config,
+                w_quantized=w_quantized[0],
+                wscale=wscale[0],
+                zero=zero[0],
+                ascale=mu1.unsqueeze(0).to(dtype)
+            ).to(device)
+            
+            setattr(
+                find_parent(model.model, name),
+                name.split(".")[-1],
+                qlinear,
+            )
+            
+            torch.cuda.empty_cache()
+        self.cleanup(model)
+    
+    def cleanup(self, model):
+        remove_non_model_tensors(model)
             
             
             

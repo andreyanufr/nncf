@@ -38,9 +38,9 @@ class QLinear(nn.Module):
         self.quant_config = copy.deepcopy(quant_config) if quant_config is not None else None
 
         self.linear_layer = linear_layer
-        self.w_quantized = w_quantized
-        self.wscale = wscale
-        self.zero = zero
+        # self.w_quantized = w_quantized
+        # self.wscale = wscale
+        # self.zero = zero
         self.ascale = ascale
         
         if self.quant_config["group_size"] == None:
@@ -58,7 +58,7 @@ class QLinear(nn.Module):
 
         bias = None if self.linear_layer.bias is None else self.linear_layer.bias.clone().to(device=self.device, dtype=self.compute_dtype)  
         # print(W_q.shape, self.linear_layer.weight.data.shape)
-        self.gemlite_linear.pack(self.w_quantized.to(torch.uint8), self.wscale, self.zero, bias)
+        self.gemlite_linear.pack(w_quantized.to(torch.uint8), wscale, zero, bias)
         
         
         # for name, param in self.linear_layer.named_parameters():
