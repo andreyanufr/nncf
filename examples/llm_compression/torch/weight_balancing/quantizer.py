@@ -30,14 +30,14 @@ class QuantizationConfig:
     """Configuration for weight quantization."""
     nbits: int = 8
     sym: bool = True
-    balancing_method: Literal['sinq', 'absmean'] = 'sinq'
+    balancing_method: Literal['sinq', 'absmean', 'none'] = 'sinq'
     group_size: Optional[int] = 64
 
     def __post_init__(self):
         if self.nbits not in Quantizer.SUPPORTED_BITS:
             raise ValueError(f"nbits must be one of {Quantizer.SUPPORTED_BITS}, got {self.nbits}")
-        if self.balancing_method not in ['sinq', 'absmean']:
-            raise ValueError(f"balancing_method must be 'sinq' or 'absmean', got {self.balancing_method}")
+        if self.balancing_method not in ['sinq', 'absmean', 'none']:
+            raise ValueError(f"balancing_method must be 'sinq', 'absmean', or 'none', got {self.balancing_method}")
     
     def to_dict(self):
         """Convert config to dictionary format for backward compatibility."""
@@ -155,6 +155,9 @@ class WeightsBalancer():
             matrix, mu1, mu2 = self.sinkhorn_log(matrix, 16)
         elif method == 'absmean':
             matrix, mu1, mu2 = self.abs_mean(matrix)
+        elif method == 'none':
+            mu1 = torch.ones(1, matrix.shape[1], device=dev, dtype = torch.float32)
+            mu2 = torch.ones(matrix.shape[0], 1, device=dev, dtype = torch.float32)
         else:
             raise NotImplementedError(f'Unknown balancing method: {method}')
 
@@ -181,7 +184,7 @@ class WeightsBalancer():
 
         Q = Q.permute(1,0,2).reshape(-1, block)
         s2 = s2.permute(1,0,2).reshape(-1,1)
-        s1 = s1.permute(1,0,2).view(1, -1)
+        s1 = s1.permute(1,0,2).contiguous().view(1, -1)
         return Q, s1, s2
 
 # Finds the parent of a node module named "name"
@@ -213,9 +216,12 @@ class Quantizer:
             weight = weight.view(-1, quant_config['group_size'])
 
         if quant_config['sym']:
-            scale = torch.max(torch.abs(weight)) / (2 ** (quant_config['nbits'] - 1) - 1)
-            zero = torch.zeros(1, device=weight.device)
-            q_weight = torch.clamp(torch.round(weight / scale), -(2 ** (quant_config['nbits'] - 1)), 2 ** (quant_config['nbits'] - 1) - 1).to(torch.int8)
+            min_v = -(2 ** (quant_config['nbits'] - 1))
+            max_v = 2 ** (quant_config['nbits'] - 1) - 1
+            scale = torch.abs(weight).max(dim=1, keepdim=True)[0] / (-min_v)
+            zero = None #torch.zeros(1, device=weight.device)
+            zero = torch.zeros_like(scale) - min_v
+            q_weight = (torch.clamp(torch.round(weight / scale), min_v, max_v) + zero).to(torch.uint8)
         else:
             _min = weight.min(axis=1, keepdim=True)[0]
             _max = weight.max(axis=1, keepdim=True)[0]
@@ -238,7 +244,7 @@ class Quantizer:
 
         return q_weight, scale, zero
     
-    def quantize_linear_layers(self, linear_layers: list[torch.nn.Linear], quant_config: dict):
+    def quantize_linear_layers(self, linear_layers: list[torch.nn.Linear], quant_config: dict, activations: torch.Tensor = None):
         super_weighst = [layer.weight.data for layer in linear_layers]
         split_dims = [layer.out_features for layer in linear_layers]
         mul = super_weighst[0].shape[1] // quant_config['group_size']
@@ -261,11 +267,14 @@ class Quantizer:
         wscale = wscale * mu2
         
         wscale = wscale.to(dtype)
-        zero = zero.to(dtype)
         
         w_quantized = torch.split(w_quantized, split_dims, dim=0)
         wscale = torch.split(wscale, split_dims, dim=0)
-        zero = torch.split(zero, split_dims, dim=0)
+        if zero is not None:
+            zero = zero.to(dtype)
+            zero = torch.split(zero, split_dims, dim=0)
+        else:
+            zero = [None] * len(w_quantized)
         
         del mu2
         torch.cuda.empty_cache()

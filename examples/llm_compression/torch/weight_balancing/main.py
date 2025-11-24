@@ -19,6 +19,7 @@ import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from stat_collector import collect_activations
 from quantizer import Quantizer, QuantizationConfig
 from eval import evaluate_model
 
@@ -68,7 +69,7 @@ def parse_args():
         "--balancing_method",
         type=str,
         default="absmean",
-        choices=["sinq", "absmean"],
+        choices=["sinq", "absmean", "none"],
         help="Weight balancing method: 'sinq' (Sinkhorn) or 'absmean' (absolute mean)"
     )
     parser.add_argument(
@@ -119,6 +120,11 @@ def parse_args():
         "--trust_remote_code",
         action="store_true",
         help="Trust remote code when loading model"
+    )
+    parser.add_argument(
+        "--use_calibration",
+        action="store_true",
+        help="Use calibration data for quantization"
     )
     parser.add_argument(
         "--token",
@@ -199,7 +205,7 @@ def print_tensor_memory_usage():
             pass
 
 
-def quantize_model(model, args):
+def quantize_model(model, tokenizer, args):
     """Quantize the model using the specified configuration."""
     logger.info("Starting model quantization...")
     logger.info(f"Configuration: nbits={args.nbits}, sym={args.sym}, "
@@ -212,6 +218,21 @@ def quantize_model(model, args):
         balancing_method=args.balancing_method,
         group_size=args.group_size
     )
+    
+    if args.use_calibration:
+        logger.info("Collecting calibration data for quantization...")
+        
+        # Collect activations
+        activations = collect_activations(
+            model=model,
+            tokenizer=tokenizer,
+            device=args.device,
+            apply_chat_template=True,
+            subset_size=128
+        )
+        
+        quant_config.calibration_activations = activations
+        logger.info("Calibration data collected.")
     
     # Create quantizer
     quantizer = Quantizer(quant_config)
@@ -312,7 +333,7 @@ def main():
     model, tokenizer = load_model(args)
     
     #Quantize model
-    model = quantize_model(model, args)
+    model = quantize_model(model, tokenizer, args)
     
     # Save quantized model
     # save_model(model, tokenizer, args.output_dir)
