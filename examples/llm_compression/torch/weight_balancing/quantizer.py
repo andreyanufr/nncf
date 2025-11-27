@@ -1,12 +1,16 @@
 import torch
 from dataclasses import dataclass
 from typing import Literal, Optional
-from qlinear import QLinear
 from tqdm import tqdm
 from torch import vmap
 import torch.nn as nn
 import gc
+from compressed_tensors.utils import match_named_modules
 
+
+
+from qlinear import QLinear
+from fusing_patterns import FUSING_PATTERN_REGISTRY
 
 
 def remove_non_model_tensors(model):
@@ -196,7 +200,7 @@ def find_parent(model, name: str) -> nn.Module:
     return parent
 
 class Quantizer:
-    SUPPORTED_BITS = [2, 4, 8]
+    SUPPORTED_BITS = [2, 4, 8, 16]
     
     def __init__(self, quant_config):
         if isinstance(quant_config, QuantizationConfig):
@@ -420,6 +424,88 @@ class Quantizer:
             torch.cuda.empty_cache()
         self.cleanup(model)
     
+    
+    
+    def quantize_by_patterns(self, model):
+        class_name = model.__class__.__name__
+        if class_name not in FUSING_PATTERN_REGISTRY:
+            raise ValueError(f"No fusing patterns registered for model class {class_name}")
+        
+        patterns = FUSING_PATTERN_REGISTRY[class_name]  
+        
+        for pattern in tqdm(patterns, desc="Quantizing by patterns"):
+            layers_for_fusing = [[layer_for_fusing_name, layer_for_fusing] for layer_for_fusing_name, layer_for_fusing in match_named_modules(model, [pattern.layer_for_fusing])]
+            scaled_layers = [[scaled_layer_names, layers] for scaled_layer_names, layers in match_named_modules(model, pattern.scaled_layers)]
+            
+            step = len(pattern.scaled_layers)
+            scaled_layers = [scaled_layers[x:x+step] for x,_ in list(enumerate(scaled_layers))[::step]]
+            
+            for layer_for_fusing, scaled_layer_group in zip(layers_for_fusing, scaled_layers):
+                print(f"Fusing {layer_for_fusing[0]} with {[name for name, _ in scaled_layer_group]}")
+                
+                
+                w_quantized, wscale, zero, mu1, _ = self.quantize_linear_layers(
+                    [layer for _, layer in scaled_layer_group],
+                    self.quant_config
+                )
+                dtype = layer_for_fusing[1].weight.data.dtype
+                device = next(layer_for_fusing[1].parameters()).device
+                
+                if type(layer_for_fusing[1]) is not torch.nn.Linear: # probably layer norm
+                    layer_for_fusing[1].weight.data = layer_for_fusing[1].weight.data * mu1.view(-1).to(device).to(dtype)
+                else:
+                    mu1 = mu1.view(-1, 1)
+                    if 'Phi' in class_name:
+                        # merge scale to half of previsous matmul (up_proj in MLP)
+                        sz = mu1.shape[0]
+                        layer_for_fusing[1].weight.data[sz:, :] = layer_for_fusing[1].weight.data[sz:, :] * mu1.to(device).to(dtype)
+                    else:
+                        sz = mu1.shape[0]
+                        if sz != layer_for_fusing[1].weight.data.shape[0]:
+                            print(f"Warning: size mismatch in fusing pattern for {layer_for_fusing[0]}, skipping scale merge. Shapes: mu1 {mu1.shape}, weight {layer_for_fusing[1].weight.data.shape}")
+                            continue
+                        layer_for_fusing[1].weight.data = layer_for_fusing[1].weight.data * mu1.to(device).to(dtype)
+                
+                for i, (scaled_layer_name, scaled_layer) in enumerate(scaled_layer_group):
+                    qlinear = QLinear(
+                        scaled_layer,
+                        quant_config=self.quant_config,
+                        w_quantized=w_quantized[i],
+                        wscale=wscale[i],
+                        zero=zero[i],
+                    ).to(device)
+                    
+                    setattr(
+                        find_parent(model, scaled_layer_name),
+                        scaled_layer_name.split(".")[-1],
+                        qlinear,
+                    )
+        for name, layer in model.model.named_modules():
+            if isinstance(layer, nn.Linear):
+                print(f"Quantized layer with extra scale: {name}")
+                w_quantized, wscale, zero, mu1, _ = self.quantize_linear_layers(
+                    [layer],
+                    self.quant_config
+                )
+                # no place to merge scale, so we add it as ascale
+                qlinear = QLinear(
+                    layer,
+                    quant_config=self.quant_config,
+                    w_quantized=w_quantized[0],
+                    wscale=wscale[0],
+                    zero=zero[0],
+                    ascale=mu1.unsqueeze(0).to(dtype)
+                ).to(device)
+                setattr(
+                    find_parent(model.model, name),
+                    name.split(".")[-1],
+                    qlinear,
+                )
+
+        torch.cuda.empty_cache()
+        self.cleanup(model)
+            
+        
     def cleanup(self, model):
         remove_non_model_tensors(model)
             

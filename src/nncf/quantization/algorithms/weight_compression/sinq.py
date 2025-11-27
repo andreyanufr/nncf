@@ -126,8 +126,8 @@ class SINQ(Algorithm):
 
         if not len(sinq_data) == 0:
             for ln_node, mm_nodes in track(sinq_data.items(), description=description):
-                if len(mm_nodes) == 1:
-                    continue
+                # if len(mm_nodes) == 1:
+                #     continue
                 weight_datas = [
                     self._backend_entity.get_weight_names_and_port_ids(mm_node, graph) for mm_node in mm_nodes
                 ]

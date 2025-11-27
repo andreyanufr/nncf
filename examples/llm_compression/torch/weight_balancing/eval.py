@@ -520,8 +520,8 @@ def evaluate_model(
     elif 'gsm8k' in eval_ppl:
         tasks = eval_ppl
         eval_ppl = None
-        lm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=32, max_length=4096)
-        num_fewshot = 8
+        lm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=16, max_length=4096)
+        num_fewshot = 5
         # --apply_chat_template --fewshot_as_multiturn --log_samples --output_path eval_results --tasks gsm8k_cot_llama --batch_size 4
     elif 'hellaswag' in eval_ppl:
         tasks = eval_ppl
@@ -564,7 +564,7 @@ def evaluate_model(
             batch_size=batch_size,
             num_fewshot=num_fewshot,
             limit=None if limit == -1 else limit,
-            apply_chat_template=True,
+            #apply_chat_template=True,
             #fewshot_as_multiturn=True,
         )
 

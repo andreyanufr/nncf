@@ -22,6 +22,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from stat_collector import collect_activations
 from quantizer import Quantizer, QuantizationConfig
 from eval import evaluate_model
+from torch.utils._triton import has_triton
+from hqq.utils.generation_hf import patch_model_for_compiled_runtime
+
+
+if not has_triton():
+    raise ImportError("Triton is required for this script to run. Please install it from")
 
 import gc
 
@@ -57,8 +63,8 @@ def parse_args():
         "--nbits",
         type=int,
         default=4,
-        choices=[2, 4, 8],
-        help="Number of bits for quantization (2, 4, or 8)"
+        choices=[2, 4, 8, 16, 32],
+        help="Number of bits for quantization (2, 4, 8, 16, or 32)"
     )
     parser.add_argument(
         "--sym",
@@ -239,19 +245,23 @@ def quantize_model(model, tokenizer, args):
     
     # Quantize the model
     start_time = time.time()
-    if args.per_layer:
-        quantizer.quantize_per_layer(model)
-    else:
-        quantizer.quantize_llama(model)
+    if args.nbits < 16:
+        if args.per_layer:
+            quantizer.quantize_per_layer(model)
+        else:
+            quantizer.quantize_by_patterns(model)
     elapsed_time = time.time() - start_time
     
     model = model.to(args.device)
     
+    if args.nbits < 16:
+        patch_model_for_compiled_runtime(model, tokenizer, warmup=False, max_new_tokens=1000, patch_accelerate=True, pre_compile=None)
+
     model = torch.compile(model)
 
-    cleanup()
+    #cleanup()
     #print_tensor_memory_usage()
-    cleanup()
+    #cleanup()
 
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
