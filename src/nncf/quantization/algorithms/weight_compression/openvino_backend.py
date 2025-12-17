@@ -416,7 +416,7 @@ class OVTensorWeightCompressionAlgoBackend(OVWeightCompressionAlgoBackend):
 class OVAWQAlgoAlgoBackend(AWQAlgoBackend, OVWeightCompressionAlgoBackend):
     @staticmethod
     def get_awq_patterns():
-        return get_awq_patterns(om.OVMatMulMetatype, om.OVMultiplyMetatype, ATOMIC_ACTIVATIONS_OPERATIONS)
+        return get_awq_patterns(om.OVMatMulMetatype, om.OVMultiplyMetatype, ATOMIC_ACTIVATIONS_OPERATIONS, om.OVConstantMetatype)
 
     @staticmethod
     def scale_insertion_command(source_node, next_nodes, source_node_output_port, scale):

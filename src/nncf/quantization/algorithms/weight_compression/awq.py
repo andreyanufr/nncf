@@ -51,7 +51,7 @@ class AWQCompressionInfo:
     """
 
     weight_params: WeightCompressionParameters = None
-    target_node: NNCFNode = None
+    target_nodes: list[NNCFNode] = None
     merge_node: NNCFNode = None
 
 
@@ -153,22 +153,30 @@ class AWQ(Algorithm):
 
         description = "Applying data-free AWQ" if is_data_free else "Applying data-aware AWQ"
 
-        for k, awq_data_item in track(awq_data.items(), description=description):
-            wp = awq_data_item.weight_params
+        for awq_data_item in track(awq_data, description=description):
+            wps = awq_data_item.weight_params
             merge_node = awq_data_item.merge_node
-            weight_data = self._backend_entity.get_weight_names_and_port_ids(wp.node_with_weight, graph)
-            if len(weight_data) != 1:  # not supported by the algorithm
-                continue
-            is_mergeable = self._backend_entity.is_node_with_weights(merge_node, graph)
+            weights = []
+            
+            for wp in wps:
+                weight_data = self._backend_entity.get_weight_names_and_port_ids(wp.node_with_weight, graph)
+                if len(weight_data) != 1:  # not supported by the algorithm
+                    continue
+                is_mergeable = self._backend_entity.is_node_with_weights(merge_node, graph)
 
-            nncf_logger.debug(f"{description} for: {wp.node_with_weight.node_name}")
+                nncf_logger.debug(f"{description} for: {wp.node_with_weight.node_name}")
 
-            _, weight_port_id = weight_data[0]
-            weight = self._backend_entity.get_weight(
-                wp.node_with_weight, weight_port_id, model, graph
-            )  # get_const_value(wp.weight_node)
-            weight_dtype = weight.dtype
-            weight = weight.astype(TensorDataType.float32)
+                _, weight_port_id = weight_data[0]
+                weight = self._backend_entity.get_weight(
+                    wp.node_with_weight, weight_port_id, model, graph
+                )  # get_const_value(wp.weight_node)
+                weight_dtype = weight.dtype
+                weight = weight.astype(TensorDataType.float32)
+                weights.append(weight)
+            shapes = [w.shape for w in weights]
+            weight = fns.concatenate(weights, axis=0)
+            wp = wps[0]
+            k = wp.node_with_weight.node_name # all weight for awq have the same input
 
             if is_data_free:
                 scale = self._data_free_step(weight, 1 - wp.reduction_axes[0])
@@ -187,7 +195,18 @@ class AWQ(Algorithm):
             a_scale = fns.unsqueeze(1.0 / scale, wp.reduction_axes[0])
 
             scaled_weight = (weight * w_scale).astype(weight_dtype)
-            self._backend_entity.set_weight(wp.node_with_weight, weight_port_id, model, graph, scaled_weight)
+            
+            if len(shapes) > 1:
+                print("AWQ applied to multiple weights in one pattern, which is not fully supported yet.")
+            
+            offset = 0
+            for wp, shape in zip(awq_data_item.weight_params, shapes):
+                size = shape[0]
+                wp_weight = scaled_weight[offset : offset + size, :]
+                offset += size
+                weight_data = self._backend_entity.get_weight_names_and_port_ids(wp.node_with_weight, graph)
+                _, weight_port_id = weight_data[0]
+                self._backend_entity.set_weight(wp.node_with_weight, weight_port_id, model, graph, wp_weight)
 
             if is_mergeable:  # for MatMul->Multiply->MatMul pattern the scale is merged to the first MatMul
                 for _, port_id in self._backend_entity.get_weight_names_and_port_ids(merge_node, graph):
@@ -204,7 +223,9 @@ class AWQ(Algorithm):
                 )
                 transformation_layout.register(scale_insertion_command)
 
-            self._scale_per_target_node[k] = a_scale
+            for wp in wps:
+                k = wp.node_with_weight.node_name 
+                self._scale_per_target_node[k] = a_scale
 
         transformed_model = model_transformer.transform(transformation_layout)
 
@@ -322,7 +343,7 @@ class AWQ(Algorithm):
 
     def _get_awq_data(
         self, graph: NNCFGraph, all_weight_params: list[WeightCompressionParameters]
-    ) -> dict[str, AWQCompressionInfo]:
+    ) -> list[AWQCompressionInfo]:
         """
         Finds awq patterns in graph and returns it.
         :param graph: Model graph.
@@ -339,35 +360,60 @@ class AWQ(Algorithm):
             nncf_logger.info("No matching patterns were found for applying AWQ algorithm, it will be skipped.")
             return {}
 
-        awq_data = {}
+        awq_data = []
+        used_nodes = set()
+
         name_mapping = {wp.weight_name: idx for idx, wp in enumerate(all_weight_params)}
 
         for match in matches:
-            nncf_node = graph.get_node_by_key(match[-1])
-            if not self._backend_entity.is_node_with_weights(nncf_node, graph):
-                continue
+            nncf_nodes = []
+            for i in reversed(range(len(match))):
+                nncf_node = graph.get_node_by_key(match[i])
+                if not self._backend_entity.is_node_with_weights(nncf_node, graph):
+                    break            
+                nncf_nodes.append(nncf_node)
+            
+            target_nodes = []
 
             target_node_names = []
-            for weight_op_friendly_name, _ in self._backend_entity.get_weight_names_and_port_ids(nncf_node, graph):
-                target_node_names.append(weight_op_friendly_name)
+            
+            for nncf_node in nncf_nodes:
+                for weight_op_friendly_name, _ in self._backend_entity.get_weight_names_and_port_ids(nncf_node, graph):
+                    target_node_names.append(weight_op_friendly_name)
 
             # skip node if it is in IgnoredScope or should not be compressed
-            if target_node_names[-1] not in name_mapping:
+            if True not in [name in name_mapping for name in target_node_names]:
                 continue
 
-            weight_params = all_weight_params[name_mapping[target_node_names[-1]]]
+            weight_params = [all_weight_params[name_mapping[name]] for name in target_node_names]
 
-            if weight_params.compression_config.num_bits != 4:
+            if False in [wp.compression_config.num_bits == 4 for wp in weight_params]:
                 continue
-            target_node = weight_params.node_with_weight
-
-            # avoid matching different patterns for the same node
-            if target_node.node_name in awq_data:
+            
+            
+            target_nodes = [wp.node_with_weight for wp in weight_params]
+            
+            used = False
+            for target_node in target_nodes:
+                used = used or (target_node.node_name in used_nodes)
+            
+            if used:
                 continue
+            for target_node in target_nodes:
+                used_nodes.add(target_node.node_name)
 
             merge_node = graph.get_node_by_key(match[0])
+            intermdeiate_node = graph.get_node_by_key(match[len(match) - len(nncf_nodes) - 1])  # node after the last nncf_node
+            outputs = graph.get_output_edges(intermdeiate_node)
 
-            awq_data[target_node.node_name] = AWQCompressionInfo(weight_params, target_node, merge_node)
+            if len(outputs) != len(target_nodes):
+                continue
+
+            awq_data.append(AWQCompressionInfo(weight_params, target_nodes, merge_node))
+        
+        # first process patterns with one target node    
+        awq_data = sorted(awq_data, key=lambda x: len(x.target_nodes))
+        
         return awq_data
 
     def update_statistics(self, statistics):
