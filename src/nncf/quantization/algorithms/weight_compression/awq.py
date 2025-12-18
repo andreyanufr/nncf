@@ -247,8 +247,11 @@ class AWQ(Algorithm):
             prev_s = prev_s.astype(TensorDataType.float32).max().item()
             prev_w = fns.mean(fns.abs(prev_weight), axis=reduction_axis)
 
-        top_k = max(int(s.shape[0] * self._percent_to_apply), 1)
-        topk_idxs = fns.argsort(-s)[:top_k]
+        s_per_goup = fns.reshape(s, (-1, config.group_size))
+        s_per_goup = fns.mean(s_per_goup, axis=1)
+        
+        top_k = max(int(s_per_goup.shape[0] * self._percent_to_apply), 1)
+        topk_idxs = fns.argsort(-s_per_goup)[:top_k]
 
         group_size = config.group_size
         if group_size == -1:
@@ -256,7 +259,7 @@ class AWQ(Algorithm):
 
         groups_to_correct = set()
         for idx in topk_idxs:
-            groups_to_correct.add(idx.data // group_size)
+            groups_to_correct.add(idx.data)
 
         groups_to_correct = list(groups_to_correct)
 
@@ -396,11 +399,8 @@ class AWQ(Algorithm):
             used = False
             for target_node in target_nodes:
                 used = used or (target_node.node_name in used_nodes)
-            
             if used:
                 continue
-            for target_node in target_nodes:
-                used_nodes.add(target_node.node_name)
 
             merge_node = graph.get_node_by_key(match[0])
             intermdeiate_node = graph.get_node_by_key(match[len(match) - len(nncf_nodes) - 1])  # node after the last nncf_node
@@ -409,6 +409,9 @@ class AWQ(Algorithm):
             if len(outputs) != len(target_nodes):
                 continue
 
+            for target_node in target_nodes:
+                used_nodes.add(target_node.node_name)
+                
             awq_data.append(AWQCompressionInfo(weight_params, target_nodes, merge_node))
         
         # first process patterns with one target node    

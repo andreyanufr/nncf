@@ -85,10 +85,31 @@ def create_mul_2matmul(matmul_metatype, multiply_metatype, _atomic_activations_o
     pattern.add_edge(mul_node, linear_node2)
     return pattern
 
+@AWQ_PATTERNS.register("Mul_3MatMu")
+def create_mul_3matmul(matmul_metatype, multiply_metatype, _atomic_activations_operations, constant_metatype) -> GraphPattern:
+    # pattern for gate_proj and up_proj
+    pattern = GraphPattern()
+    const_node = pattern.add_node(
+        **{GraphPattern.LABEL_ATTR: "CONSTANT", GraphPattern.METATYPE_ATTR: constant_metatype}
+    )
+    mul_node = pattern.add_node(**{GraphPattern.LABEL_ATTR: "MULTIPLY", GraphPattern.METATYPE_ATTR: multiply_metatype})
+    linear_node1 = pattern.add_node(**{GraphPattern.LABEL_ATTR: "LINEAR", GraphPattern.METATYPE_ATTR: matmul_metatype})
+    linear_node2 = pattern.add_node(**{GraphPattern.LABEL_ATTR: "LINEAR", GraphPattern.METATYPE_ATTR: matmul_metatype})
+    linear_node3 = pattern.add_node(**{GraphPattern.LABEL_ATTR: "LINEAR", GraphPattern.METATYPE_ATTR: matmul_metatype})
+
+    pattern.add_edge(const_node, mul_node)
+    pattern.add_edge(mul_node, linear_node1)
+    pattern.add_edge(mul_node, linear_node2)
+    pattern.add_edge(mul_node, linear_node3)
+    
+    return pattern
+
 
 def get_awq_patterns(matmul_metatype, multiply_metatype, atomic_activations_operations, const_metatype):
     res = Registry("awq")
     for k, v in AWQ_PATTERNS.registry_dict.items():
+        # if not '3MatMu' in k:
+        #     continue
         res.registry_dict[k] = partial(v, matmul_metatype, multiply_metatype, atomic_activations_operations, const_metatype)
 
     return res.registry_dict
