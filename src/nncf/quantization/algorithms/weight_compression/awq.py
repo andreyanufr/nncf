@@ -341,7 +341,31 @@ class AWQ(Algorithm):
 
     def _data_free_step(self, weight, axis):
         eps = fns.finfo(weight).eps
-        scale = fns.maximum(fns.mean(fns.abs(weight), axis=axis), eps)
+        
+        # dtype = torch.float32
+        # m = matrix.to(dtype)
+        # dev = m.device
+        
+        # mu2_star = m.abs().max(1, keepdim=True)[0] + eps
+        # mu2_star = mu2_star / mu2_star.max()
+        # mu2_star = mu2_star.sqrt()
+
+        # m = m / mu2_star
+        
+        # mu1_star = m.abs().mean(0) + eps
+        # mu1_star = mu1_star / mu1_star.max()
+        # mu1_star = mu1_star.sqrt()
+        
+        o_axis = (axis + 1) % 2
+        out_scale = fns.max(fns.abs(weight), axis=o_axis) + eps
+        out_scale = out_scale / fns.max(out_scale)
+        out_scale = fns.power(out_scale, 0.5)
+        
+        weight = weight / fns.unsqueeze(out_scale, o_axis)        
+        scale = fns.mean(fns.abs(weight), axis=axis) + eps
+        scale = scale / fns.max(scale)
+        scale = fns.power(scale, 0.5)
+        
         return 1 / scale
 
     def _get_awq_data(
