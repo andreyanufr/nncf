@@ -399,6 +399,21 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         pattern.add_pattern_alternative(create_sam_pe())
         return pattern
 
+    def scale_constant(self, const_op_node: NNCFNode, model: ov.Model, graph: NNCFGraph, scale: Tensor):
+        const_op = self.name_to_node_mapping[const_op_node.node_name]
+        dtype = const_op.get_element_type()
+        name = const_op.get_friendly_name()
+        prev_scale = const_op.data
+        weight = Tensor(prev_scale.astype(TensorDataType.float32).data * scale.astype(TensorDataType.float32).data)
+        new_const_op = create_ov_const_from_tensor(weight, dtype, name)
+        self.name_to_node_mapping[const_op.friendly_name] = new_const_op
+
+        new_output = new_const_op.output(0)
+        for target_input in const_op.output(0).get_target_inputs():
+            target_input.replace_source_output(new_output)
+
+        del const_op
+
 
 class OVTensorWeightCompressionAlgoBackend(OVWeightCompressionAlgoBackend):
     """

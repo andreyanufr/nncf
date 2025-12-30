@@ -152,6 +152,9 @@ class AWQ(Algorithm):
         is_data_free = statistics is None or not self._prefer_data_aware_scaling
 
         description = "Applying data-free AWQ" if is_data_free else "Applying data-aware AWQ"
+        
+        if is_data_free:
+            self.op_to_vp(all_weight_params, graph, model, statistics)
 
         for awq_data_item in track(awq_data, description=description):
             wps = awq_data_item.weight_params
@@ -179,6 +182,10 @@ class AWQ(Algorithm):
             k = wp.node_with_weight.node_name # all weight for awq have the same input
 
             if is_data_free:
+                a_scale = None
+                if statistics is not None:
+                    stats = statistics[k]
+                    a_scale, _ = process_stats(stats, -1)
                 scale = self._data_free_step(weight, 1 - wp.reduction_axes[0])
             else:
                 prev_weight, prev_statistics = None, None
@@ -214,6 +221,9 @@ class AWQ(Algorithm):
                     merge_weight = (merge_weight * a_scale).astype(weight_dtype)
                     self._backend_entity.set_weight(merge_node, port_id, model, graph, merge_weight)
                 a_scale = fns.transpose(a_scale)
+            elif merge_node.node_type == "Constant":  # for Multiply->MatMul pattern scale is merged to the Constant node
+                a_scale = fns.transpose(a_scale).astype(weight_dtype)
+                self._backend_entity.scale_constant(merge_node, model, graph, a_scale)
             else:  # for Act->Multiply->MatMul and Act->MatMul patterns scale inserted after Act as extra node
                 a_scale = fns.transpose(a_scale).astype(weight_dtype)
                 next_nodes = graph.get_next_nodes(merge_node)
@@ -339,7 +349,78 @@ class AWQ(Algorithm):
     def _clamp_scale(magnitudes, threshold, scale, clamped_scale):
         return fns.where(magnitudes < threshold, scale, clamped_scale)
 
-    def _data_free_step(self, weight, axis):
+
+    def get_weight(self, wp, graph, model):
+        weight_data = self._backend_entity.get_weight_names_and_port_ids(wp.node_with_weight, graph)
+        if len(weight_data) != 1:  # not supported by the algorithm
+            return None
+
+        _, weight_port_id = weight_data[0]
+        weight = self._backend_entity.get_weight(
+            wp.node_with_weight, weight_port_id, model, graph
+        )  # get_const_value(wp.weight_node)
+        weight_dtype = weight.dtype
+        weight = weight.astype(TensorDataType.float32)
+        return weight, weight_port_id, weight_dtype
+
+
+    def op_to_vp(self, all_weight_params, graph, model, statistics):
+        for wpv in all_weight_params:
+            if not 'v_proj' in wpv.node_with_weight.node_name:
+                continue
+            op_name = wpv.node_with_weight.node_name.replace('v_proj', 'o_proj')
+            
+            wpo = [wp for wp in all_weight_params if wp.node_with_weight.node_name == op_name][0]
+            
+            weight_v, weight_port_id_v, weight_dtype_v = self.get_weight(wpv, graph, model)
+            weight_o, weight_port_id_o, weight_dtype_o = self.get_weight(wpo, graph, model)
+            
+            scale = self._data_free_step(weight_o, 1 - wpo.reduction_axes[0])
+            scale_v = 1 / scale
+            
+            if scale.shape[0] != weight_v.shape[0]:
+                hidden_size = weight_o.shape[1]
+                hidden_size_to_head_size = {
+                    4096: 128,
+                    2048: 128, ##64,
+                    3072: 128
+                }
+                head_size = hidden_size_to_head_size.get(hidden_size, 128)
+                ratio = scale.shape[0] // weight_v.shape[0]
+                step = ratio * head_size
+                
+                scale_v = fns.zeros((weight_v.shape[0],), dtype=TensorDataType.float32, backend=scale.backend)
+
+                for i in range(weight_v.shape[0] // head_size):
+                    start = i * step
+                    end = start + step
+                    group_scale = fns.mean(fns.reshape(scale[start:end], (ratio, head_size)), axis=0)
+                    
+                    for j in range(ratio):
+                        start = i * step + j * head_size
+                        end = start + head_size
+                        scale.data[start:end] = group_scale.data
+                    scale_v.data[i * head_size:(i + 1) * head_size] = group_scale.data
+                
+                scale_v = 1 / scale_v
+
+            weight_o = weight_o * fns.unsqueeze(scale, 1 - wpo.reduction_axes[0])
+            weight_o = weight_o.astype(weight_dtype_o)
+            self._backend_entity.set_weight(wpo.node_with_weight, weight_port_id_o, model, graph, weight_o)
+            
+            weight_v = weight_v * fns.unsqueeze(scale_v, wpv.reduction_axes[0])
+            weight_v = weight_v.astype(weight_dtype_v)
+            self._backend_entity.set_weight(wpv.node_with_weight, weight_port_id_v, model, graph, weight_v)
+            
+            a_scale = fns.unsqueeze(1.0 / scale, wpo.reduction_axes[0])
+            self._scale_per_target_node[op_name] = a_scale
+            
+            
+            
+            
+            
+        
+    def _data_free_step(self, weight, axis, a_scale: Optional[TTensor] = None):
         eps = fns.finfo(weight).eps
         
         # dtype = torch.float32
@@ -363,8 +444,18 @@ class AWQ(Algorithm):
         
         weight = weight / fns.unsqueeze(out_scale, o_axis)        
         scale = fns.mean(fns.abs(weight), axis=axis) + eps
+        scale = scale.astype(TensorDataType.float32)
         scale = scale / fns.max(scale)
         scale = fns.power(scale, 0.5)
+
+        if a_scale is not None:
+            a_scale = a_scale.astype(TensorDataType.float32)
+            a_scale = a_scale / fns.max(a_scale)
+            a_scale = fns.power(a_scale + eps, 0.5)
+            scale = scale / a_scale
+            
+            scale = scale / fns.max(scale)
+            scale = fns.power(scale, 0.5)
         
         return 1 / scale
 
