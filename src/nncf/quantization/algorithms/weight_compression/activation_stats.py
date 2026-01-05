@@ -27,10 +27,15 @@ def process_stats(stats: WCTensorStatistic, subset_size: int) -> tuple[Tensor, T
         s - maximum channel magnitude across samples [HiddenDim]
         X - average channel magnitude across tokens in the sequence [HiddenDim, min(SampleSize, ~subset_size)]
     """
-    X = fns.stack(
-        stats.mean_values
-    )  # [SampleSize, HiddenDim] for 2-D or [SampleSize, No. of Experts, HiddenDim] for 3-D
-
+    if hasattr(stats, 'mean_values'):
+        X = fns.stack(
+            stats.mean_values
+        )  # [SampleSize, HiddenDim] for 2-D or [SampleSize, No. of Experts, HiddenDim] for 3-D
+    else:
+        X = fns.stack(
+            stats.values
+        )  # [SampleSize, HiddenDim] for 2-D or [SampleSize, No. of Experts, HiddenDim] for 3-D
+        
     # Move SampleSize to the last axis: [HiddenDim, SampleSize] or [No. of Experts, HiddenDim, SampleSize]
     # General approach: move axis 0 to the end
     axes = list(range(1, len(X.shape))) + [0]

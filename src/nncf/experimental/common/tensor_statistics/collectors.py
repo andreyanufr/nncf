@@ -497,6 +497,16 @@ class MinReducer(TensorReducerBase):
         return [fns.min(x, reduction_axes, keepdims=self._keepdims)]
 
 
+class LastReducer(TensorReducerBase):
+    def _reduce_out_of_place(self, x: list[Tensor]) -> list[Tensor]:
+        x = x[0]
+        a = 0.99
+        res = x[:, 0, :]
+        for i in range(1, x.shape[1]):
+            res = a * res + (1 - a) * x[:,i, :]
+        #res = fns.mean(x**2, axis=0)        
+        return res
+
 class MaxReducer(TensorReducerBase):
     def _reduce_out_of_place(self, x: list[Tensor]) -> list[Tensor]:
         x = x[0]

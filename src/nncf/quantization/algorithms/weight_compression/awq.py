@@ -158,6 +158,11 @@ class AWQ(Algorithm):
 
         for awq_data_item in track(awq_data, description=description):
             wps = awq_data_item.weight_params
+            
+            if not is_data_free and len(wps) > 1:
+                print("Skipping AWQ for multiple weights in one pattern in data-free mode.")
+                continue
+
             merge_node = awq_data_item.merge_node
             weights = []
             
@@ -185,7 +190,7 @@ class AWQ(Algorithm):
                 a_scale = None
                 if statistics is not None:
                     stats = statistics[k]
-                    a_scale, _ = process_stats(stats, -1)
+                    #a_scale, _ = process_stats(stats, -1)
                 scale = self._data_free_step(weight, 1 - wp.reduction_axes[0])
             else:
                 prev_weight, prev_statistics = None, None
@@ -540,8 +545,16 @@ class AWQ(Algorithm):
 
         # Multiply activations by the computed scales
         for node_name, scale in self._scale_per_target_node.items():
-            for mean_stat in statistics[node_name].mean_values:
-                mean_stat *= fns.squeeze(scale)
+            if hasattr(statistics[node_name], 'values'):
+                for stat in statistics[node_name].values:
+                    stat *= fns.squeeze(scale)
+            else:
+                for mean_stat in statistics[node_name].mean_values:
+                    mean_stat *= fns.squeeze(scale)
+        
+        
+        self._scale_per_target_node = {}
+
         return statistics
 
     def get_statistic_points(self, model: TModel, graph: NNCFGraph) -> StatisticPointsContainer:

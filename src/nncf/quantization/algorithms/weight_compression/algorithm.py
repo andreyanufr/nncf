@@ -1042,6 +1042,15 @@ class WeightCompression(Algorithm):
         :return: Transformed model with compressed weights and inserted backend-specific decompressor.
         """
         if self._awq:
+            # if self.awq_algo._prefer_data_aware_scaling:
+            #     self.awq_algo._prefer_data_aware_scaling = False
+                
+            #     model = self.awq_algo.apply(model, graph, all_weight_params, statistics, self._backend_entity)
+            #     # After applying AWQ we need to update statistics since AWQ alters the activations
+            #     statistics = self.awq_algo.update_statistics(statistics)
+                
+            #     self.awq_algo._prefer_data_aware_scaling = True
+
             model = self.awq_algo.apply(model, graph, all_weight_params, statistics, self._backend_entity)
             # After applying AWQ we need to update statistics since AWQ alters the activations
             statistics = self.awq_algo.update_statistics(statistics)
@@ -1241,6 +1250,9 @@ class WeightCompression(Algorithm):
                 stat_collector = self._backend_entity.mean_statistic_collector(
                     reduction_axes=reduction_axes, subset_size=self._subset_size
                 )
+                
+                stat_collector = self._backend_entity.raw_statistic_collector(reduction_axes=reduction_axes, subset_size=self._subset_size)
+                
                 statistic_container.add_statistic_point(
                     StatisticPoint(
                         target_point=statistic_point, tensor_collector=stat_collector, algorithm=self._algorithm_key

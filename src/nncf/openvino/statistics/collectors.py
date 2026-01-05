@@ -15,6 +15,7 @@ from nncf.experimental.common.tensor_statistics.collectors import AbsMaxReducer
 from nncf.experimental.common.tensor_statistics.collectors import AbsQuantileReducer
 from nncf.experimental.common.tensor_statistics.collectors import BatchMeanReducer
 from nncf.experimental.common.tensor_statistics.collectors import InplaceInsertionFNType
+from nncf.experimental.common.tensor_statistics.collectors import LastReducer
 from nncf.experimental.common.tensor_statistics.collectors import MaxReducer
 from nncf.experimental.common.tensor_statistics.collectors import MaxVarianceReducer
 from nncf.experimental.common.tensor_statistics.collectors import MeanAbsMaxReducer
@@ -140,6 +141,18 @@ def get_raw_stat_collector(num_samples: Optional[int] = None) -> TensorCollector
 
     collector = TensorCollector(RawTensorStatistic)
     collector.register_statistic_branch(RawTensorStatistic.VALUES_STATS, reducer, aggregator)
+    return collector
+
+
+def get_last_stat_collector(num_samples: Optional[int] = None) -> TensorCollector:
+    reducer = LastReducer()
+    aggregator = NoopAggregator(num_samples)
+    shape_reducer = OVShapeReducer(inplace=True)
+
+    collector = TensorCollector(RawTensorStatistic)
+    collector.register_statistic_branch(RawTensorStatistic.VALUES_STATS, reducer, aggregator)
+    collector.register_statistic_branch("shape_values", shape_reducer, NoopAggregator(num_samples))
+    
     return collector
 
 

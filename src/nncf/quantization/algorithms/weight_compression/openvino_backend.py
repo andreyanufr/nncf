@@ -50,6 +50,9 @@ from nncf.openvino.statistics.collectors import OVMeanAbsMaxReducer
 from nncf.openvino.statistics.collectors import OVMeanReducer
 from nncf.openvino.statistics.collectors import OVMeanVarianceReducer
 from nncf.openvino.statistics.collectors import OVShapeReducer
+from nncf.openvino.statistics.collectors import get_raw_stat_collector
+from nncf.openvino.statistics.collectors import get_last_stat_collector
+
 from nncf.parameters import CompressionFormat
 from nncf.parameters import CompressWeightsMode
 from nncf.quantization.advanced_parameters import AdvancedCompressionParameters
@@ -115,6 +118,11 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         collector.register_statistic_branch(WCTensorStatistic.MEAN_STAT, mean_reducer, NoopAggregator(subset_size))
         collector.register_statistic_branch(WCTensorStatistic.SHAPE_STAT, shape_reducer, NoopAggregator(subset_size))
         return collector
+    
+    def raw_statistic_collector(
+        self, reduction_axes: tuple[int], subset_size: Optional[int] = None
+    ) -> TensorCollector:
+        return get_last_stat_collector(num_samples=subset_size)
 
     @staticmethod
     def get_activation_port_id(node: NNCFNode, nncf_graph: NNCFGraph) -> int:
