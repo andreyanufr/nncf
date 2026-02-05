@@ -53,11 +53,25 @@ class WeightCompressionConfig:
             CompressWeightsMode.MXFP8_E4M3,
         ]:
             return 8
+        if self.mode == CompressWeightsMode.INT2_ASYM:
+            return 2
+
+        if self.mode == CompressWeightsMode.ADAPTIVE_CODEBOOK:
+            n_quants = self.codebook_values.size
+            if n_quants <= 4:
+                return 2
+            if n_quants <= 16:
+                return 4
+
         return 4
 
     @property
     def is_asym_mode(self):
-        return self.mode in [CompressWeightsMode.INT4_ASYM, CompressWeightsMode.INT8_ASYM]
+        return self.mode in [
+            CompressWeightsMode.INT4_ASYM,
+            CompressWeightsMode.INT8_ASYM,
+            CompressWeightsMode.INT2_ASYM,
+        ]
 
     @property
     def is_integer(self):
@@ -93,6 +107,8 @@ class WeightCompressionConfig:
         """
         if self.is_codebook:
             n_quants = self.codebook_values.size
+            if n_quants <= 4:
+                return TensorDataType.uint2
             if n_quants <= 16:
                 return TensorDataType.uint4
             if n_quants <= 256:
@@ -101,6 +117,7 @@ class WeightCompressionConfig:
         dtype_per_mode = {
             CompressWeightsMode.INT4_SYM: TensorDataType.int4,
             CompressWeightsMode.INT4_ASYM: TensorDataType.uint4,
+            CompressWeightsMode.INT2_ASYM: TensorDataType.uint2,
             CompressWeightsMode.INT8_ASYM: TensorDataType.uint8,
             CompressWeightsMode.INT8_SYM: TensorDataType.int8,
             CompressWeightsMode.NF4: TensorDataType.nf4,

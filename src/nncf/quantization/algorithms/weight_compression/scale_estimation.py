@@ -128,7 +128,7 @@ class ScaleEstimation:
             node_name = wp.node_with_weight.node_name
             config = wp.compression_config
 
-            if config.num_bits != 4 or node_name not in statistics:
+            if node_name not in statistics:
                 res[weight_name] = CompressedWeight()
                 continue
 
@@ -261,6 +261,10 @@ class ScaleEstimation:
         zero_scale = 0.001
         zero_mask = zero_scale * zero_mask.astype(weight.dtype)
 
+        if config.is_codebook:
+            print(config.codebook_values.data.data)
+        print("initial diff: ", fns.mean(min_max_scale_diffs))
+
         # iterative rectification of initial scale
         for i in range(initial_steps):
             near_to_ideal_scale = estimate_scales(weight, target, zero_mask, importance)
@@ -364,6 +368,23 @@ class ScaleEstimation:
             else:
                 near_to_ideal_scale = mask * result_scale + (1.0 - mask) * near_to_ideal_scale
             result_scale = near_to_ideal_scale
+
+        if not config.is_integer:
+            q_weights_ = float_quantize_dequantize_weight(
+                weight,
+                config,
+                precomputed_scale=result_scale,
+            )
+        else:
+            q_weights_ = integer_quantize_dequantize_weight(
+                weight,
+                config,
+                precomputed_scale=result_scale,
+                precomputed_zero_point=zp,
+            )
+        q_outs = fns.matmul(fns.moveaxis(q_weights_, -2, -3), X)
+        ideal_scale_diffs = fns.mean((fp_outs - q_outs) ** 2, axis=-1)
+        print("final diff: ", fns.mean(ideal_scale_diffs))
 
         if config.group_size == -1:
             result_scale = fns.squeeze(result_scale, axis=-2)

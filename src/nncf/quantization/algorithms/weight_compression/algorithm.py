@@ -11,6 +11,7 @@
 import copy
 import dataclasses
 import operator
+import re
 from collections import OrderedDict
 from collections import defaultdict
 from functools import reduce
@@ -555,7 +556,7 @@ class WeightCompression(Algorithm):
 
         return ratio_defining_params
 
-    def _get_backup_config(self, weight_dtype: TensorDataType) -> Optional[WeightCompressionConfig]:
+    def _get_backup_config(self, weight_dtype: TensorDataType, n_bits=4) -> Optional[WeightCompressionConfig]:
         """
         Returns the backup weight compression configuration based on the algorithm's backup mode.
 
@@ -568,9 +569,12 @@ class WeightCompression(Algorithm):
         mode = (
             CompressWeightsMode.INT8_ASYM if self._backup_mode == BackupMode.INT8_ASYM else CompressWeightsMode.INT8_SYM
         )
+        if n_bits == 2:
+            mode = CompressWeightsMode.INT4_ASYM
+
         if not self.is_weight_compression_supported(weight_dtype, mode):
             return None
-        return WeightCompressionConfig(mode=mode)
+        return WeightCompressionConfig(mode=mode, group_size=128 if n_bits == 2 else -1)
 
     def _get_primary_config(self, group_size: int) -> WeightCompressionConfig:
         codebook_values = None
@@ -616,9 +620,27 @@ class WeightCompression(Algorithm):
             primary_precision_node_names = set(
                 param.node_with_weight.node_name for param in primary_precision_weight_params
             )
+            n_bits = ratio_defining_params[0].compression_config.num_bits
+
             for weight_param in ratio_defining_params:
                 if weight_param.node_with_weight.node_name not in primary_precision_node_names:
-                    weight_param.compression_config = self._get_backup_config(weight_param.weight_dtype)
+                    weight_param.compression_config = self._get_backup_config(weight_param.weight_dtype, n_bits=n_bits)
+        elif len(ratio_defining_params) > 0:
+            n_bits = ratio_defining_params[0].compression_config.num_bits
+            n_layers = 0
+            for weight_param in ratio_defining_params:
+                if "v_proj" in weight_param.node_with_weight.node_name:
+                    n_layers += 1
+
+            for weight_param in ratio_defining_params:
+                if "v_proj" in weight_param.node_with_weight.node_name:
+                    weight_param.compression_config = self._get_backup_config(weight_param.weight_dtype, n_bits=n_bits)
+                elif "down_proj" in weight_param.node_with_weight.node_name:
+                    layer_nums = re.findall(r"\d+", weight_param.node_with_weight.node_name)
+                    if int(layer_nums[0]) < n_layers / 8:
+                        weight_param.compression_config = self._get_backup_config(
+                            weight_param.weight_dtype, n_bits=n_bits
+                        )
 
     def validate_group_size(
         self,

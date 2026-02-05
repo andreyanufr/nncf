@@ -155,7 +155,7 @@ class CodebookEstimation(Algorithm):
             node_name = wp.node_with_weight.node_name
             config = wp.compression_config
 
-            if config.num_bits != 4:
+            if not config.is_codebook:
                 res[weight_name] = CompressedWeight()
                 continue
 
@@ -169,6 +169,9 @@ class CodebookEstimation(Algorithm):
             weight = self._backend_entity.get_weight(wp.node_with_weight, weight_port_id, model, graph)
 
             codebook = self.calculate_codebook(stats, weight, wp.reduction_axes, config, wp)
+            wp.compression_config = deepcopy(wp.compression_config)
+            wp.compression_config.codebook_values = codebook
+
             res[weight_name] = CompressedWeight(None, None, None, codebook)
 
         return res
@@ -239,6 +242,7 @@ class CodebookEstimation(Algorithm):
 
             for gwp in group_weights_params:
                 res[gwp.weight_name] = CompressedWeight(None, None, None, codebook)
+                gwp.compression_config = deepcopy(gwp.compression_config)
                 gwp.compression_config.codebook_values = codebook
 
         return res
@@ -290,6 +294,10 @@ class CodebookEstimation(Algorithm):
         :return: Optimal codebook tensor in the target data type with shape (num_elements,).
             This codebook contains the centroid values that minimize reconstruction error.
         """
+        # return fns.tensor(
+        #         config.get_numpy_codebook().data, backend=weight.backend, dtype=TensorDataType.float16
+        #     )
+
         reduction_axis = reduction_axes[0]
         weight = deepcopy(weight.astype(TensorDataType.float32))
 
@@ -323,18 +331,22 @@ class CodebookEstimation(Algorithm):
         diff = float("inf")
 
         if self._num_elements == config.get_numpy_codebook().size:
-            variants[0] = fns.tensor(
-                config.get_numpy_codebook().data, backend=weight.backend, dtype=TensorDataType.float16
+            variants.append(
+                fns.tensor(config.get_numpy_codebook().data, backend=weight.backend, dtype=TensorDataType.float16)
             )
-        variants[1] = fns.tensor(
-            list(range(-self._num_elements // 2, self._num_elements - self._num_elements // 2)),
-            backend=weight.backend,
-            dtype=TensorDataType.float16,
+
+        variants.append(
+            fns.tensor(
+                list(range(-self._num_elements // 2 + 1, self._num_elements - self._num_elements // 2 + 1)),
+                backend=weight.backend,
+                dtype=TensorDataType.float16,
+            )
         )
 
         weight = fns.reshape(weight, orig_shape)
 
         fp_outs = fns.matmul(weight, X)
+        print("*" * 64)
         for var in variants:
             var = var.as_openvino_tensor().astype(self._value_type)
             config.codebook_values = Tensor(var)
@@ -342,6 +354,7 @@ class CodebookEstimation(Algorithm):
             q_outs = fns.matmul(fns.reshape(qw, orig_shape), X)
 
             cur_diff = fns.mean(fns.abs(fp_outs - q_outs)).item()
+            print(var.data.data, cur_diff)
             if cur_diff < diff:
                 diff = cur_diff
                 best_codebook = var
@@ -674,7 +687,7 @@ class KMeansWeighted:
             self.centroids = deepcopy(init)
             return
         if fixed is None:
-            fixed = [0, len(init) // 2, len(init) - 1]
+            fixed = [0] if len(init) == 4 else [0, len(init) // 2, len(init) - 1]
 
         self.hist = KMeansWeighted.create_histogramm_sorted(X_train, importance, intervals=intervals)
 
@@ -685,7 +698,7 @@ class KMeansWeighted:
 
         if init[0] <= 0.0:
             init_by_hist[zero_idx] = 0.0  # to have zero in codebook
-            fixed[1] = zero_idx
+            fixed[1 if len(fixed) > 1 else 0] = zero_idx
         init = init_by_hist
 
         self.centroids = deepcopy(init)
@@ -773,7 +786,11 @@ def weights_clusterization_k_means(
         weight,
         importance,
         n_init,
-        fixed=[0, n_centroids // 2 - 1, n_centroids - 1] if n_init[0] < 0.0 else [0, n_centroids - 1],
+        fixed=[0]
+        if n_centroids == 4
+        else [0, n_centroids // 2 - 1, n_centroids - 1]
+        if n_init[0] < 0.0
+        else [0, n_centroids - 1],
         intervals=intervals,
     )
     codebook, indexes = kmeans.evaluate(weight)
