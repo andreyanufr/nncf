@@ -1184,6 +1184,7 @@ class WeightCompression(Algorithm):
                 description += " with correction of low-rank adapters"
             del statistics
 
+
         # Sort weight params to start compression with the bigger constants. This lowers peak memory footprint.
         all_weight_params = sorted(all_weight_params, key=lambda wp: wp.num_weights, reverse=True)
         all_weight_sizes = [wp.num_weights for wp in all_weight_params]
