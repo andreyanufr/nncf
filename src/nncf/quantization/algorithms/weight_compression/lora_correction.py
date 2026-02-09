@@ -105,7 +105,7 @@ class LoraCorrectionAlgorithm:
         return self._lora_correction_params.use_int8_adapters
 
     def is_applicable(self, wc_params: WeightCompressionParameters):
-        return wc_params.compression_config.num_bits == 4
+        return wc_params.compression_config.num_bits <= 4
 
     def calculate_adapters(
         self, weight: Tensor, compressed_weight: CompressedWeight, wc_params: WeightCompressionParameters
@@ -171,7 +171,7 @@ class LoraCorrectionAlgorithm:
         mode = compression_config.mode
         assert len(reduction_axes) == 1, "Assumed a single reduction axis"
         reduction_axis = reduction_axes[0] if compression_config.group_size != -1 else -1
-        if mode in (CompressWeightsMode.INT4_SYM, CompressWeightsMode.INT4_ASYM):
+        if mode in (CompressWeightsMode.INT4_SYM, CompressWeightsMode.INT4_ASYM, CompressWeightsMode.INT2_ASYM):
             fq_weights = do_integer_dequantization(
                 compressed_weight.tensor,
                 compressed_weight.scale,

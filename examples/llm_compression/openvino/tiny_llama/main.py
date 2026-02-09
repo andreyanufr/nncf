@@ -51,7 +51,9 @@ def main():
     model.model = nncf.compress_weights(
         model.model,
         dataset=quantization_dataset,
-        mode=nncf.CompressWeightsMode.INT4_SYM,
+        group_size=64,
+        mode=nncf.CompressWeightsMode.INT2_ASYM,
+        lora_correction=True,
         ratio=0.8,
         sensitivity_metric=nncf.SensitivityMetric.HESSIAN_INPUT_ACTIVATION,
     )
