@@ -108,7 +108,7 @@ class WeightCompressionConfig:
         if self.is_codebook:
             n_quants = self.codebook_values.size
             if n_quants <= 4:
-                return TensorDataType.uint2
+                return TensorDataType.uint4
             if n_quants <= 16:
                 return TensorDataType.uint4
             if n_quants <= 256:
