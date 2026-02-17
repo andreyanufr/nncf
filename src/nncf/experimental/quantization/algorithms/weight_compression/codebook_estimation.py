@@ -358,6 +358,18 @@ class CodebookEstimation(Algorithm):
             if cur_diff < diff:
                 diff = cur_diff
                 best_codebook = var
+        
+        # for var in variants:
+        #     var = (-var).as_openvino_tensor().astype(self._value_type)
+        #     config.codebook_values = Tensor(var)
+        #     qw = float_quantize_dequantize_weight(weight, config, wp.reduction_axes)
+        #     q_outs = fns.matmul(fns.reshape(qw, orig_shape), X)
+
+        #     cur_diff = fns.mean(fns.abs(fp_outs - q_outs)).item()
+        #     print(var.data.data, cur_diff)
+        #     if cur_diff < diff:
+        #         diff = cur_diff
+        #         best_codebook = var
 
         return Tensor(best_codebook)
 

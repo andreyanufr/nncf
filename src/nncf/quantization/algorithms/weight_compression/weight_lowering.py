@@ -29,6 +29,7 @@ from nncf.quantization.algorithms.weight_compression.constants import OPTIMIZED_
 from nncf.quantization.algorithms.weight_compression.fp8_conversion import fp32_to_fp8e4m3
 from nncf.quantization.algorithms.weight_compression.parameters import CompressedWeight
 from nncf.quantization.fake_quantize import calculate_scale_zero_point
+from nncf.quantization.fake_quantize import calculate_zero_point
 from nncf.tensor import Tensor
 from nncf.tensor import functions as fns
 from nncf.tensor.definitions import TensorBackend
@@ -471,6 +472,27 @@ def do_integer_quantization(
     return compressed_weights, scale, zero_point
 
 
+def compute_zero_point_by_scale(weight: Tensor, scale: Tensor, config: WeightCompressionConfig, reduction_axes: ReductionAxes) -> Tensor:
+    """
+    Computes zero point for integer quantization based on the given scale.
+
+    :param weight: The weight tensor to compute zero point for.
+    :param scale: The scale tensor used for quantization.
+    :param config: The weight compression configuration.
+    :param reduction_axes: Axes along which to reduce (collect) statistics (e.g., min, max).
+    :return: The computed zero point tensor.
+    """
+    level_low = 0
+    level_high = 2**config.num_bits - 1
+    min_values = fns.min(weight, axis=reduction_axes, keepdims=True)  # [a1, r, a2] -> [a1, 1, a2]
+    max_values = fns.max(weight, axis=reduction_axes, keepdims=True)  # [a1, r, a2] -> [a1, 1, a2]
+    precomputed_zero_point = calculate_zero_point(
+        min_values, max_values, level_low, level_high, narrow_range=False, scale=scale
+    )
+    precomputed_zero_point = precomputed_zero_point.astype(scale.dtype)
+    return precomputed_zero_point
+
+
 def integer_quantize_dequantize_weight(
     weight: Tensor,
     config: WeightCompressionConfig,
@@ -492,7 +514,7 @@ def integer_quantize_dequantize_weight(
         (and zero point).
     :return: Dequantized weight tensor or a tuple containing the decompressed weight, compressed weight, scale,
         (and zero point).
-    """
+    """ 
     # Optimized implementation
     if _can_run_optimized(weight, config.mode):
         from nncf.openvino.optimized_functions import (

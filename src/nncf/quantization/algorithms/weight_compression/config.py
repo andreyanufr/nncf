@@ -53,7 +53,7 @@ class WeightCompressionConfig:
             CompressWeightsMode.MXFP8_E4M3,
         ]:
             return 8
-        if self.mode == CompressWeightsMode.INT2_ASYM:
+        if self.mode in [CompressWeightsMode.INT2_ASYM, CompressWeightsMode.INT2_SYM]:
             return 2
 
         if self.mode == CompressWeightsMode.ADAPTIVE_CODEBOOK:
@@ -116,6 +116,7 @@ class WeightCompressionConfig:
             return TensorDataType.uint16
         dtype_per_mode = {
             CompressWeightsMode.INT4_SYM: TensorDataType.int4,
+            CompressWeightsMode.INT2_SYM: TensorDataType.int4,
             CompressWeightsMode.INT4_ASYM: TensorDataType.uint4,
             CompressWeightsMode.INT2_ASYM: TensorDataType.uint4,
             CompressWeightsMode.INT8_ASYM: TensorDataType.uint8,
