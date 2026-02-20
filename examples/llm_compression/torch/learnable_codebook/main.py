@@ -334,7 +334,7 @@ def main(argv) -> float:
     tb = SummaryWriter(tensorboard_dir, "QAT with absorbable LoRA")
 
     # Load original model and tokenizer.
-    model = AutoModelForCausalLM.from_pretrained(args.pretrained, torch_dtype=torch_dtype, device_map="auto")
+    model = AutoModelForCausalLM.from_pretrained(args.pretrained, torch_dtype=torch_dtype, device_map="auto", use_cache=False)
     tokenizer = AutoTokenizer.from_pretrained(args.pretrained)
 
     # Prepare training and calibration data

@@ -61,7 +61,7 @@ class CodebookWrapperLinear(torch.nn.Module):
         self.orig_layer.to('cpu')
         self.orig_layer.weight.to('cpu')
         
-        print("")
+        self.mse_init()
 
     
     @torch.no_grad()
@@ -98,6 +98,56 @@ class CodebookWrapperLinear(torch.nn.Module):
 
     #     self.update_one_hot()
     
+    def mse_init(self, n_iters: int = 200, lr: float = 0.01, index_update_interval: int = 25):
+        """
+        Learn codebook and scale by minimizing MSE between dequantized and original weights.
+
+        :param n_iters: Number of optimization iterations.
+        :param lr: Learning rate for the optimizer.
+        :param index_update_interval: How often (in iterations) to reassign indexes.
+        """
+        device = self.codebook.device
+        orig_weight = self.orig_layer.weight.data.to(device)
+        
+        self.orig_layer.to(device)
+
+        optimizer = torch.optim.Adam([self.codebook, self.scale], lr=lr)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_iters)
+
+        best_loss = float("inf")
+        best_codebook = self.codebook.data.clone()
+        best_scale = self.scale.data.clone()
+        best_indexes = self.indexes.clone()
+
+        for i in range(n_iters):
+            optimizer.zero_grad()
+
+            deq_weight = self.dequantize_weight()
+            loss = F.mse_loss(deq_weight, orig_weight)
+
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+            with torch.no_grad():
+                if loss.item() < best_loss:
+                    best_loss = loss.item()
+                    best_codebook = self.codebook.data.clone()
+                    best_scale = self.scale.data.clone()
+                    best_indexes = self.indexes.clone()
+            if (i + 1) % index_update_interval == 0:
+                self.update_indexes()
+
+        # Restore best parameters
+        with torch.no_grad():
+            self.codebook.data.copy_(best_codebook)
+            self.scale.data.copy_(best_scale)
+            self.indexes = best_indexes
+
+        self.orig_layer.weight.data = self.orig_layer.weight.data.to("cpu")
+        self.orig_layer.to("cpu")
+        return best_loss
+
     @torch.no_grad()
     def update_one_hot(self):
         pass
@@ -113,13 +163,14 @@ class CodebookWrapperLinear(torch.nn.Module):
         #     diff = (weight - self.orig_layer.weight).abs().mean()
         #     print(f"Mean absolute difference between original and reconstructed weight: {diff.item():.6f}")
 
-    def dequantize_weight(self, memory_saving: bool = True):
+    def dequantize_weight(self, memory_saving: bool = False):
+        codebook = self.codebook / torch.max(self.codebook.abs())  # Normalize codebook to [-1, 1] for better numerical stability
         if memory_saving:
             flat_indexes = self.indexes.reshape(-1).long()
-            weight = self.codebook.index_select(0, flat_indexes).view_as(self.indexes)
+            weight = codebook.index_select(0, flat_indexes).view_as(self.indexes)
         else:
             one_hot = F.one_hot(self.indexes.long(), num_classes=2 ** self.n_bits).to(self.codebook.device).to(self.codebook.dtype)
-            weight = (self.codebook * one_hot).sum(dim=3)
+            weight = (codebook * one_hot).sum(dim=3)
 
         if self.use_exp_for_scale:
             weight = weight * self.scale.exp()
@@ -192,7 +243,7 @@ def unwrap_model(model: nn.Module) -> nn.Module:
         model.model.layers[i] = unwrap_model_block(layer)
     return model
 
-def wrap_model_block(model: nn.Module, n_bits: int = 2) -> nn.Module:
+def wrap_model_block(model: nn.Module, n_bits: int = 2, layer_index: int = -1, n_layers: int = -1, use_llama_cpp_scheme: bool = True) -> nn.Module:
     """
     Wraps the linear layers of the model with CodebookWrapperLinear for adaptive codebook compression.
 
@@ -204,14 +255,22 @@ def wrap_model_block(model: nn.Module, n_bits: int = 2) -> nn.Module:
     """
     
     changed_modules = {}
-
-    for name, module in model.named_modules():
-        if 'lm_head' in name or 'v_proj' in name or 'down_proj' in name:
-            continue
-        # if not 'k_proj' in name:
-        #     continue
-        if isinstance(module, nn.Linear):
-            changed_modules[name] = module
+    
+    if use_llama_cpp_scheme and layer_index >= 0 and n_layers > 0:
+        # For LLaMA-like models, only wrap q_proj, k_proj, v_proj, and out_proj of attention layers, and skip the first and last few layers
+        for name, module in model.named_modules():
+            if 'lm_head' in name or 'v_proj' in name or ('down_proj' in name and layer_index < n_layers / 8):
+                continue
+            if isinstance(module, nn.Linear):
+                changed_modules[name] = module
+    else:
+        for name, module in model.named_modules():
+            if 'lm_head' in name or 'v_proj' in name or 'down_proj' in name:
+                continue
+            # if not 'k_proj' in name:
+            #     continue
+            if isinstance(module, nn.Linear):
+                changed_modules[name] = module
     
     for name, module in changed_modules.items():
         print(f"Wrapping layer {name} with CodebookWrapperLinear")

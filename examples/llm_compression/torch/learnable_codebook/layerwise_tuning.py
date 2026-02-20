@@ -1,4 +1,5 @@
 import os
+import gc
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,6 +12,18 @@ from typing import Optional
 from codebook_wrapper import CodebookWrapperLinear, wrap_model, unwrap_model, wrap_model_block
 
 
+
+def cleanup():
+    torch.cuda.empty_cache()
+    gc.collect()
+
+def print_tensor_memory_usage():
+    for obj in gc.get_objects():
+        try:
+            if torch.is_tensor(obj) or (hasattr(obj, 'data') and torch.is_tensor(obj.data)):
+                print(type(obj), obj.size(), obj.dtype, obj.device, obj.shape)
+        except:
+            pass
 
 
 class BlockInputCacher(nn.Module):
@@ -105,15 +118,45 @@ def finetune_layerwise(
     epochs_per_layer: int = 10,
     batch_size: int = 64,
     microbatch_size: int = 8,
-    device: torch.device = "cuda",
+    device: torch.device = "cuda:0",
     tb: Optional[SummaryWriter] = None,
+    ignored_layers: Optional[list[int]] = [] #0, 1, 2, 3, 4, 5, 6,  -1, -2, -3, -4, -5, -6, -7]
 ) -> nn.Module:
+    # Normalize device to a concrete torch.device (e.g. "cuda" -> "cuda:0")
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+
     # dump block inputs for each layer
     inputs = get_first_block_inputs(model, dataset=train_loader)
-    
+
     model.to('cpu')
+    torch.cuda.empty_cache()
     
+    # Strip accelerate dispatch hooks from all layers (and their submodules)
+    # before processing.  accelerate replaces module.forward with a hooked
+    # version and saves the original as module._old_forward.  The hooks move
+    # tensors between devices which conflicts with our explicit device management.
+    saved_accelerate_forwards: dict[nn.Module, object] = {}
+    for module in model.modules():
+        if hasattr(module, "_old_forward"):
+            saved_accelerate_forwards[module] = module.forward
+            module.forward = module._old_forward
+            del module._old_forward
+    
+    # Move non-hidden-state inputs (e.g. position_embeddings) to device once
+    if "position_embeddings" in inputs:
+        inputs["position_embeddings"] = (
+            inputs["position_embeddings"][0].to(device),
+            inputs["position_embeddings"][1].to(device),
+        )
+
     # For each layer, load the cached inputs and fine-tune that layer
+    q_inputs = None
+    
+    n_layers = len(model.model.layers)
+    ignored_layers = [i if i >= 0 else n_layers + i for i in ignored_layers if i < n_layers]
+
     for layer_idx in range(len(model.model.layers)):
         print(f"\n{'='*80}")
         print(f"Fine-tuning Layer {layer_idx}")
@@ -122,23 +165,37 @@ def finetune_layerwise(
         fp_inputs = inputs
         fp_outputs = []
         
-        model.model.layers[layer_idx].to(device)
+        
+        layer = model.model.layers[layer_idx].to(device)
 
         with torch.no_grad():
             for i in range(len(fp_inputs["hidden_states"])):
                 batch_input = {}
-                batch_input["hidden_states"] = fp_inputs["hidden_states"][i]
+                batch_input["hidden_states"] = fp_inputs["hidden_states"][i].to(device)
                 for key in fp_inputs:
                     if key != "hidden_states":
                         batch_input[key] = fp_inputs[key]
 
-                output = model.model.layers[layer_idx](**batch_input)[0]
-                fp_outputs.append(output)
+                output = layer(**batch_input)
+                fp_outputs.append(output.detach())
+        
+        if layer_idx in ignored_layers:
+            model.model.layers[layer_idx].to('cpu')#= layer.to('cpu')
+            del fp_inputs["hidden_states"]
+            fp_inputs["hidden_states"] = fp_outputs
+            cleanup()  # Clear cache after each layer
+            continue
 
         print(f"  Starting fine-tuning for layer {layer_idx}...")
-        
-        layer = wrap_model_block(model.model.layers[layer_idx].to(device), n_bits=2)  # Wrap the layer with codebook wrapper for fine-tuning
-        model.model.layers[layer_idx] = finetune_layer_l2(
+
+        if q_inputs is not None:
+            model.model.layers[layer_idx].to('cpu')
+            del fp_inputs["hidden_states"]
+            fp_inputs["hidden_states"] = q_inputs  # Use quantized inputs for subsequent layers after the first one
+            cleanup()
+
+        layer = wrap_model_block(layer.to(device), n_bits=2, layer_index=layer_idx, n_layers=len(model.model.layers), use_llama_cpp_scheme=True)  # Wrap the layer with codebook wrapper for fine-tuning
+        layer, q_inputs = finetune_layer_l2(
             layer=layer,
             fp_inputs=fp_inputs,
             fp_outputs=fp_outputs,
@@ -148,19 +205,41 @@ def finetune_layerwise(
             batch_size=batch_size,
             microbatch_size=microbatch_size,
             device=device,
-            tb=tb
-        ).to('cpu')  # Move back to CPU after fine-tuning this layer
+            tb=tb,
+            return_next_layer_inputs=True
+        )
+        model.model.layers[layer_idx] = layer.to('cpu')  # Move back to CPU after fine-tuning this layer
+        del fp_inputs["hidden_states"]
+        fp_inputs["hidden_states"] = fp_outputs
+        cleanup()  # Clear cache after each layer
+
+    # Restore accelerate dispatch hooks on all modules that had them
+    for module, fwd in saved_accelerate_forwards.items():
+        module._old_forward = module.forward
+        module.forward = fwd
 
 
-def collate_fn(batch):
-    hidden_states = torch.cat([item["hidden_states"] for item in batch], dim=0)
+def collate_fn(data, indexes):
+    hidden_states = torch.cat([data["hidden_states"][i] for i in indexes], dim=0)
 
     kwargs = {}
-    for key in batch[0]:
+    for key in data:
         if key != "hidden_states":
-            kwargs[key] = torch.cat([item[key] for item in batch], dim=0)
+            val = data[key]
+            # Move tensor tuples (e.g. position_embeddings) and tensors to the
+            # same device as hidden_states to avoid cross-device errors.
+            if isinstance(val, (tuple, list)) and all(isinstance(v, Tensor) for v in val):
+                val = type(val)(v.to(hidden_states.device) for v in val)
+            elif isinstance(val, Tensor):
+                val = val.to(hidden_states.device)
+            kwargs[key] = val
     return hidden_states, kwargs
 
+
+def log_gradients_in_model(model, tb, step, layer_idx):
+    for tag, value in model.named_parameters():
+        if value.grad is not None:
+            tb.add_scalar(f"layer_{layer_idx}/{tag}/grad", value.grad.abs().cpu().mean(), step)
 
 def finetune_layer_l2(
     layer: nn.Module,
@@ -202,26 +281,39 @@ def finetune_layer_l2(
     
     if not param_to_train:
         print(f"WARNING: No trainable parameters found in layer {layer_idx}, skipping fine-tuning for this layer.")
-        return layer  # No parameters to train, return original layer
+        if return_next_layer_inputs:
+            num_samples = len(fp_inputs["hidden_states"])
+            next_inputs = []
+            with torch.no_grad():
+                for i in range(num_samples):
+                    hidden, kwargs = collate_fn(fp_inputs, [i])
+                    next_inputs.append(layer(hidden.to(device), **kwargs))
+            return layer, next_inputs
+        return layer
 
     # Create optimizer for this layer
     opt = torch.optim.AdamW(param_to_train, lr=lr)
-    lambda_lr = lambda epoch: 0.99 ** epoch
-    scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lambda_lr)
+    # lambda_lr = lambda epoch: 0.99 ** epoch
+    # scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lambda_lr)
+    
     
     # Training loop for this layer
     grad_accumulation_steps = batch_size // microbatch_size
-    num_samples = len(fp_inputs)
+    num_samples = len(fp_inputs["hidden_states"])
     epoch_samples = num_samples - num_samples % microbatch_size
     microbatches_per_epoch = epoch_samples // microbatch_size
     
-    global_step = epochs_per_layer * microbatches_per_epoch
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs_per_layer * num_samples // grad_accumulation_steps)
+    
+    global_step = 0
     
     for epoch in range(epochs_per_layer):
+        opt.zero_grad()  # Clear any stale gradients from prior epoch's incomplete accumulation
         batch_indices_epoch = torch.randperm(num_samples)[:epoch_samples].chunk(microbatches_per_epoch)
         epoch_loss = 0.0
         num_batches = 0
         loss_numerator = grad_steps = 0
+        loss_denuminator = 0
         
         for indices in track(
             batch_indices_epoch, 
@@ -230,45 +322,54 @@ def finetune_layer_l2(
             indices = indices.tolist()
             
             # Form batch
-            batch_inputs = collate_fn([{"hidden_states": fp_inputs[i], "attention_mask": None, "position_ids": None} for i in indices])
-            layer_outputs = layer(**batch_inputs)[0]
+            hidden, kwargs = collate_fn(fp_inputs, indices)
+            hidden = hidden.to(device)
+
+            layer_outputs = layer(hidden, **kwargs)#[0]
+            #orig_output = torch.stack([fp_outputs[i] for i in indices], dim=0).to(device)
             orig_output = torch.cat([fp_outputs[i] for i in indices], dim=0).to(device)
-            
-        
             
             # Compute L2 loss between outputs
             loss = F.mse_loss(layer_outputs, orig_output.to(dtype=layer_outputs.dtype))
             
-            # Gradient accumulation
-            loss_numerator += loss.item()
-            grad_steps += 1
-            
             if not torch.isfinite(loss).item():
                 err = f"Fine-tuning loss is {loss} at layer {layer_idx}"
                 raise ValueError(err)
+            
+            # Gradient accumulation
+            loss_numerator += loss.item()
+            loss_denuminator += torch.mean(orig_output**2).detach().item()
+            grad_steps += 1
             
             (loss / grad_accumulation_steps).backward()
             
             if grad_steps == grad_accumulation_steps:
                 torch.nn.utils.clip_grad_norm_(param_to_train, 1.0)
                 opt.step()
-                opt.zero_grad()
+                scheduler.step()
                 
+                rel_aggregated_loss = (loss_numerator /  max(loss_denuminator, 1e-8)) #/  grad_steps
                 aggregated_loss = loss_numerator / grad_steps
                 epoch_loss += aggregated_loss
                 num_batches += 1
-                loss_numerator = grad_steps = 0
+                loss_numerator = loss_denuminator = grad_steps = 0
                 
                 if tb is not None:
+                    tb.add_scalar(f"layerwise_relative_loss/layer_{layer_idx}", rel_aggregated_loss, global_step)
                     tb.add_scalar(f"layerwise_loss/layer_{layer_idx}", aggregated_loss, global_step)
-                    tb.add_scalar(f"layerwise_lr/layer_{layer_idx}", opt.param_groups[0]["lr"], global_step)
+                    #tb.add_scalar(f"layerwise_lr/layer_{layer_idx}", opt.param_groups[0]["lr"], global_step)
+                    log_gradients_in_model(layer, tb, global_step, layer_idx)
+                
+                opt.zero_grad()
                 
                 global_step += 1
 
-        scheduler.step()
+        #scheduler.step()
         avg_epoch_loss = epoch_loss / max(num_batches, 1)
         print(f"    Epoch {epoch}: avg loss = {avg_epoch_loss:.6f}")
     
+    del opt, scheduler
+    cleanup()
     # Clear cache after each layer
     torch.cuda.empty_cache()
     print(f"\n{'='*80}")
@@ -279,8 +380,8 @@ def finetune_layer_l2(
         next_inputs = []
         with torch.no_grad():
             for i in range(num_samples):
-                batch_input = collate_fn(fp_inputs[i:i+1])
-                next_input = layer(**batch_input)[0].cpu()
+                hidden, kwargs = collate_fn(fp_inputs, [i])
+                next_input = layer(hidden, **kwargs)#.cpu()
                 next_inputs.append(next_input)
         return layer, next_inputs
 
