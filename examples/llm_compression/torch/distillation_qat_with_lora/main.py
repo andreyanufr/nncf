@@ -21,7 +21,7 @@ import warnings
 from datetime import datetime
 from pathlib import Path
 from pprint import pprint
-from typing import Any, Optional, Union
+from typing import Any
 
 import mlflow
 import torch
@@ -112,27 +112,6 @@ DATASET_LOADERS = {
     "pile": get_pile,
     "wikitext": get_wikitext2,
 }
-
-
-# def measure_perplexity(
-#     optimum_model: OptimizedModel,
-#     max_length: Optional[int] = None,
-#     limit: Optional[Union[int, float]] = None,
-# ) -> float:
-#     """
-#     Measure perplexity on the Wikitext dataset, via rolling loglikelihoods for a given model.
-
-#     :param optimum_model: A model to be evaluated.
-#     :param max_length: The maximum sequence length for evaluation.
-#     :param limit: Limit the number of examples per task (only use this for testing).
-#         If <1, limit is a percentage of the total number of examples.
-#     :return: The similarity score as a float.
-#     """
-#     task = "wikitext"
-#     print("#" * 50 + " Evaluate via lm-eval-harness " + "#" * 50)
-#     lm_obj = OptimumLM(pretrained=optimum_model, max_length=max_length)
-#     results = simple_evaluate(lm_obj, tasks=[task], limit=limit, log_samples=False)
-#     return results["results"][task]["word_perplexity,none"]
 
 
 def evaluate_with_vllm(
@@ -469,28 +448,6 @@ def load_checkpoint(model: nn.Module, ckpt_file: Path) -> nn.Module:
     return model
 
 
-# @torch.no_grad()
-# def export_to_openvino(pretrained: str, ckpt_file: Path, ir_dir: Path) -> OVModelForCausalLM:
-#     """
-#     Create a wrapper of OpenVINO model from the checkpoint for evaluation on CPU via WWB.
-
-#     :param pretrained: The name or path of the pretrained model.
-#     :param ckpt_file: The path to the checkpoint file to load the model weights and NNCF configurations.
-#     :param last_dir: The directory where the OpenVINO model will be saved.
-#     :return: A wrapper of OpenVINO model ready for evaluation.
-#     """
-#     model_to_eval = AutoModelForCausalLM.from_pretrained(pretrained, torch_dtype=torch.float32, device_map="cpu")
-#     model_to_eval = load_checkpoint(model_to_eval, ckpt_file)
-#     model_to_eval = nncf.strip(model_to_eval, do_copy=False, strip_format=StripFormat.DQ)
-#     export_from_model(model_to_eval, ir_dir, device="cpu")
-#     return OVModelForCausalLM.from_pretrained(
-#         model_id=ir_dir,
-#         trust_remote_code=True,
-#         load_in_8bit=False,
-#         compile=True,
-#     )
-
-
 def limit_type(astr: str):
     value = float(astr)
     if value < 0 or value > 1:
@@ -760,88 +717,6 @@ def _main_impl(args) -> int:
     run_name = args.run_name or datetime.now().strftime("%Y-%m-%d__%H-%M-%S")
     with mlflow.start_run(run_name=run_name):
         _train(args, compression_config, device, torch_dtype, last_dir, output_dir, ckpt_file, hidden_file)
-
-        # Free GPU memory before loading checkpoints for stripping & evaluation.
-        # gc.collect()
-        # torch.cuda.synchronize()
-        # torch.cuda.empty_cache()
-        # torch.cuda.ipc_collect()
-
-        # # ── Build evaluation list: epoch 0 = init checkpoint, then trained epochs ──
-        # tokenizer = AutoTokenizer.from_pretrained(args.pretrained)
-        # eval_checkpoints: list[tuple[int, Path]] = [(0, ckpt_file)]
-        # epoch_ckpts = sorted(
-        #     last_dir.glob("nncf_checkpoint_epoch*.pth"),
-        #     key=lambda p: int(p.stem.replace("nncf_checkpoint_epoch", "")),
-        # )
-        # for p in epoch_ckpts:
-        #     eval_checkpoints.append((int(p.stem.replace("nncf_checkpoint_epoch", "")), p))
-
-        # for epoch_num, ckpt_path in eval_checkpoints:
-        #     # Cache eval results only for epoch 0 (initial PTQ checkpoint) — reusable across runs.
-        #     # Trained epoch results are always re-evaluated (caching would be error-prone with tuning).
-        #     cache_file = ckpt_path.with_suffix(".eval.json") if epoch_num == 0 else None
-        #     if cache_file and cache_file.exists():
-        #         with open(cache_file) as f:
-        #             cached = json.load(f)
-        #         lambada_acc = cached["lambada_acc"]
-        #         lambada_ppl = cached["lambada_ppl"]
-        #         print(
-        #             f"Epoch {epoch_num} — cached from {cache_file.name}: acc={lambada_acc:.4f}, ppl={lambada_ppl:.4f}"
-        #         )
-        #     else:
-        #         stripped_dir = last_dir / "stripped"
-        #         print(f"\n{'=' * 60}")
-        #         print(f"Stripping & evaluating: {ckpt_path.name} (epoch {epoch_num})")
-        #         print(f"{'=' * 60}")
-
-        #         model_to_strip = AutoModelForCausalLM.from_pretrained(
-        #             args.pretrained, torch_dtype=torch_dtype, device_map="cpu"
-        #         )
-        #         model_to_strip = load_checkpoint(model_to_strip, ckpt_path)
-        #         model_to_strip = nncf.strip(model_to_strip, strip_format=nncf.StripFormat.IN_PLACE)
-        #         if stripped_dir.exists():
-        #             shutil.rmtree(stripped_dir)
-        #         model_to_strip.save_pretrained(stripped_dir)
-        #         tokenizer.save_pretrained(stripped_dir)
-        #         del model_to_strip
-        #         gc.collect()
-        #         torch.cuda.empty_cache()
-
-        #         eval_results = evaluate_with_vllm(
-        #             checkpoint_dir=stripped_dir,
-        #             tasks=["lambada_openai"],
-        #             tensor_parallel_size=2,
-        #             dtype="auto",
-        #             fewshot_as_multiturn=False,
-        #             cuda_devices="1,2",
-        #             apply_chat_template=False,
-        #             batch_size="auto",
-        #             limit=args.limit,
-        #         )
-        #         lambada_acc = eval_results["results"]["lambada_openai"]["acc,none"]
-        #         lambada_ppl = eval_results["results"]["lambada_openai"]["perplexity,none"]
-        #         if cache_file:
-        #             with open(cache_file, "w") as f:
-        #                 json.dump({"lambada_acc": lambada_acc, "lambada_ppl": lambada_ppl}, f, indent=2)
-
-        #     mlflow.log_metrics(
-        #         {"lambada_acc": lambada_acc, "lambada_ppl": lambada_ppl},
-        #         step=epoch_num,
-        #     )
-        #     print(f"Epoch {epoch_num} — LAMBADA accuracy: {lambada_acc:.4f}, perplexity: {lambada_ppl:.4f}")
-
-    # del model
-    # Export the best tuned model to OpenVINO and evaluate it using LM-Evaluation-Harness.
-    # model_for_eval = export_to_openvino(args.pretrained, ckpt_file, ckpt_file.parent)
-    # ov_perplexity = measure_perplexity(model_for_eval, args.eval_seqlen, args.limit)
-    # mlflow.log_metric("ov_perplexity", ov_perplexity, step=0)
-    # print(
-    #     f"The finetuned model has been exported to OpenVINO and saved to: {last_dir}\n"
-    #     f"The word perplexity on wikitext (test) = {ov_perplexity:.4f}"
-    # )
-    # return ov_perplexity
-    # return gsm8k_acc
     return 0
 
 
