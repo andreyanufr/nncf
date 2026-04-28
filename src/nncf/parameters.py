@@ -164,11 +164,14 @@ class StripFormat(StrEnum):
         in low-bit precision using fake quantize parameters. This is the default format for deploying models
         with compressed weights.
     :param IN_PLACE: Directly applies NNCF operations to the weights, replacing the original weights.
+    :param OV: Similar to DQ, but with additional transformations to ensure compatibility with OpenVINO. This format is
+        used when exporting models to OpenVINO IR format.
     """
 
     NATIVE = "native"
     DQ = "dequantize"
     IN_PLACE = "in_place"
+    OV = "openvino"
 
 
 @api(canonical_alias="nncf.BackupMode")

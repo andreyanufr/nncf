@@ -28,12 +28,15 @@ from nncf.torch.model_graph_manager import get_const_node
 from nncf.torch.model_graph_manager import get_module_by_name
 from nncf.torch.model_graph_manager import split_const_name
 from nncf.torch.quantization.layers import AsymmetricQuantizer
+from nncf.torch.quantization.layers import AsymmetricLoraQuantizer
 from nncf.torch.quantization.layers import BaseQuantizer
 from nncf.torch.quantization.layers import BaseWeightsDecompressor
 from nncf.torch.quantization.layers import StretchedSymmetricQuantizer
 from nncf.torch.quantization.layers import SymmetricQuantizer
+from nncf.torch.quantization.layers import SymmetricLoraQuantizer
 from nncf.torch.quantization.strip import asym_fq_to_decompressor
 from nncf.torch.quantization.strip import convert_to_torch_fakequantizer
+from nncf.torch.quantization.strip import get_quantized_weight_for_nncf_linear
 from nncf.torch.quantization.strip import sym_fq_to_decompressor
 
 TModel = TypeVar("TModel", bound=nn.Module)
@@ -60,6 +63,8 @@ def strip_model(model: TModel, example_input: Any = None, strip_format: StripFor
         model = replace_quantizer_to_compressed_weight_with_decompressor(model)
     elif strip_format == StripFormat.IN_PLACE:
         model = apply_compression_in_place(model)
+    elif strip_format == StripFormat.OV:
+        model = replace_quantizer_to_compressed_weight_with_nncf_linear(model)
     else:
         msg = f"Unsupported strip format: {strip_format}"
         raise nncf.ParameterNotSupportedError(msg)
@@ -148,6 +153,48 @@ def replace_quantizer_to_compressed_weight_with_decompressor(model: TModel) -> T
         weight_param.data = packed_tensor
 
         hook_storage.set_submodule(hook_name, decompressor)
+    return model
+
+
+@torch.no_grad()
+def replace_quantizer_to_compressed_weight_with_nncf_linear(model: TModel) -> TModel:
+    """
+    Performs transformation from fake quantize format (FQ) to dequantization one (DQ):
+        (weights + FQ) -> (compressed_weights + DQ)
+
+    :param model: Compressed model
+    :return: The modified NNCF network.
+    """
+    from nncf.experimental.torch.qlinear import create_nncf_qlinear_dequantizer  # Importing here to avoid circular import
+
+    hook_storage = get_hook_storage(model)
+
+    for hook_name, hook_module in hook_storage.named_hooks():
+        StretchedSymmetricQuantizer
+        if not isinstance(hook_module, (SymmetricQuantizer, AsymmetricQuantizer, SymmetricLoraQuantizer, AsymmetricLoraQuantizer)):
+            continue
+        msg = ""
+        if hook_module._qspec.half_range or hook_module._qspec.narrow_range:
+            msg += "Unexpected parameters of quantizers on strip: half_range and narrow_range should be False.\n"
+        if hook_module.num_bits not in [2, 3, 4, 8]:
+            msg += f"Unsupported number of bits {hook_module.num_bits} for the quantizer {hook_module}.\n"
+        if msg:
+            raise nncf.ValidationError(msg)
+
+        _, op_name, _ = decode_hook_name(hook_name)
+
+        module_name, weight_attr_name = split_const_name(op_name)
+        module = get_module_by_name(module_name, model)
+        weight_param = getattr(module, weight_attr_name)
+        
+        q_weight, zero_point, scale, sym, num_bits, group_size, bias = get_quantized_weight_for_nncf_linear(hook_module, weight_param)
+
+        qlinear = create_nncf_qlinear_dequantizer(q_weight, zero_point, scale, num_bits, group_size, bias, symmetric=sym)
+        
+        weight_param.requires_grad = False
+        weight_param.data = torch.zeros(1) # The weight parameter is not used in forward pass of NNCFQLinearDequantizer, so we can set it to any value.
+
+        hook_storage.set_submodule(hook_name, qlinear)
     return model
 
 

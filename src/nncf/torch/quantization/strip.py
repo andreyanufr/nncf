@@ -85,6 +85,62 @@ def convert_to_torch_fakequantizer(nncf_quantizer: BaseQuantizer) -> FakeQuantiz
 
     return fakequantizer
 
+def get_quantized_weight_for_nncf_linear(quantizer: AsymmetricQuantizer | SymmetricQuantizer, weight: torch.Tensor) -> torch.Tensor:
+    """
+    Get quantized weight from quantizer and original weight tensor.
+
+    :param quantizer: The quantizer instance.
+    :param weight: The weight tensor to be quantized.
+    :return: Quantized weight corresponding to the given quantizer and original weight.
+    """
+    assert isinstance(quantizer, BaseQuantizer)
+
+    weight_dtype = weight.dtype
+    weight_shape = weight.shape
+    float_dtype = torch.float32
+    integer_dtype = torch.uint8
+
+    eps = torch.finfo(float_dtype).eps
+    qdq_weight = quantizer.quantize(weight)
+    group_size = -1
+    if hasattr(quantizer, "_lspec"):
+        # Reshape for group-wise quantization, implemented for classes with lora spec only
+        qdq_weight = qdq_weight.reshape(quantizer._lspec.weight_shape)
+        group_size = quantizer._lspec.weight_shape[-1]
+    qdq_weight = qdq_weight.to(float_dtype)
+    
+    if isinstance(quantizer, AsymmetricQuantizer):
+        input_range_safe = abs(quantizer.input_range) + quantizer.eps
+        input_low, input_range = TuneRange.apply(quantizer.input_low, input_range_safe, quantizer.levels)
+
+        input_low = input_low.to(float_dtype)
+        input_range = input_range.to(float_dtype)
+
+        scale = input_range / quantizer.level_high
+        scale = torch.where(torch.abs(scale) < eps, eps, scale)
+        scale = scale.to(float_dtype)
+
+        zero_point = quantizer.level_low - torch.round(input_low / scale)
+        zero_point = torch.clip(zero_point, quantizer.level_low, quantizer.level_high)
+        zero_point = zero_point.to(float_dtype)
+    else:
+        scale = quantizer.scale.to(float_dtype) / abs(quantizer.level_low)
+        scale = torch.where(torch.abs(scale) < eps, eps, scale)
+        scale = scale.to(float_dtype)
+        zero_point = torch.tensor([-quantizer.level_low], dtype=float_dtype)
+    
+    q_weight = qdq_weight / scale
+    q_weight = q_weight + zero_point
+    q_weight = torch.round(q_weight)
+    q_weight = torch.clip(q_weight, 0, quantizer.level_high - quantizer.level_low)
+
+    q_weight = q_weight.to(integer_dtype)
+    zero_point = zero_point.data.to(integer_dtype)
+    scale = scale.data.to(weight_dtype)
+    sym = isinstance(quantizer, SymmetricQuantizer)
+
+    return q_weight, zero_point, scale, sym, quantizer.num_bits, group_size, None
+
 
 def asym_fq_to_decompressor(
     quantizer: AsymmetricQuantizer, weight: torch.Tensor

@@ -21,7 +21,7 @@ import warnings
 from datetime import datetime
 from pathlib import Path
 from pprint import pprint
-from typing import Any
+from typing import Any, Optional, Union
 
 import mlflow
 import torch
@@ -473,7 +473,7 @@ def get_argument_parser() -> argparse.ArgumentParser:
         default="output",
         help="Path to the directory for storing logs, tuning checkpoint, compressed model, validation references.",
     )
-    parser.add_argument("--lora_rank", type=int, default=64, help="Rank of lora adapters")
+    parser.add_argument("--lora_rank", type=int, default=16, help="Rank of lora adapters")
     parser.add_argument(
         "--basic_init",
         action="store_true",
@@ -492,8 +492,8 @@ def get_argument_parser() -> argparse.ArgumentParser:
         help="Training dataset to use. 'pile' = NeelNanda/pile-10k, 'wikitext' = Salesforce/wikitext-2-raw-v1. "
         "Default: pile.",
     )
-    parser.add_argument("--num_train_samples", type=int, default=512, help="Number of training samples")
-    parser.add_argument("--train_seqlen", type=int, default=512, help="Train data context length.")
+    parser.add_argument("--num_train_samples", type=int, default=256, help="Number of training samples")
+    parser.add_argument("--train_seqlen", type=int, default=256, help="Train data context length.")
     parser.add_argument("--eval_seqlen", type=int, default=2048, help="Evaluation data context length.")
     parser.add_argument(
         "--limit",
@@ -596,12 +596,12 @@ def get_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--compression_format",
         type=str,
-        default="FQ_STRETCHED_LORA",
+        default="FQ_LORA",
         choices=[f.name for f in CompressionFormat],
         help="Compression format to use. Key options: "
         "FQ_LORA (standard fake-quantize + LoRA), "
         "FQ_STRETCHED_LORA (ParetoQ-style stretched quantization + LoRA). "
-        "Default: FQ_STRETCHED_LORA.",
+        "Default: FQ_LORA.",
     )
     parser.add_argument(
         "--init_ckpt",

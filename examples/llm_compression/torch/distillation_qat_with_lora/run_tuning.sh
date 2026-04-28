@@ -22,8 +22,8 @@ set -euo pipefail
 #   1e-5   1e-3     1e-3   1e-4     0       0         15
 # ────────────────────────────────────────────────────────────────────
 
-# PRETRAINED="meta-llama/Llama-3.2-1B-Instruct"
-PRETRAINED="Qwen/Qwen3-4B"
+PRETRAINED="meta-llama/Llama-3.2-1B-Instruct"
+#PRETRAINED="Qwen/Qwen3-4B"
 OUTPUT_DIR="output"
 LOG_FILE="grid_search.log"
 CONFIGS_FILE=""

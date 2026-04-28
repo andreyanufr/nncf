@@ -1444,7 +1444,7 @@ class StretchedSymmetricLoraQuantizer(StretchedSymmetricQuantizer, LoraMixin):
         return cls(qspec, lspec)
 
 
-def get_per_channel_scale_shape(input_shape, is_weights, channel_idx: Optional[int] = None) -> list[int]:
+def get_per_channel_scale_shape(input_shape, is_weights, channel_idx: int | None = None) -> list[int]:
     scale_shape = [1 for _ in input_shape]
     if channel_idx is None:
         if is_weights:
@@ -1678,8 +1678,8 @@ class INT2SymmetricWeightsDecompressor(BaseWeightsDecompressor):
         self,
         scale: torch.Tensor,
         compressed_weight_shape: tuple[int, ...],
-        result_shape: Optional[tuple[int, ...]] = None,
-        result_dtype: Optional[torch.dtype] = None,
+        result_shape: tuple[int, ...] | None = None,
+        result_dtype: torch.dtype | None = None,
     ):
         """
         :param scale: A scale in quantization scheme
