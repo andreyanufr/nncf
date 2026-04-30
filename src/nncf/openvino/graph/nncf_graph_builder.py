@@ -59,6 +59,7 @@ class GraphConverter:
             "i64": "int",
             "u1": "int",
             "u2": "int",
+            "u3": "int",
             "u4": "int",
             "u8": "int",
             "u16": "int",

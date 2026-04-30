@@ -38,8 +38,22 @@ from nncf.torch.quantization.strip import asym_fq_to_decompressor
 from nncf.torch.quantization.strip import convert_to_torch_fakequantizer
 from nncf.torch.quantization.strip import get_quantized_weight_for_nncf_linear
 from nncf.torch.quantization.strip import sym_fq_to_decompressor
+from nncf.common.logging.track_progress import track
+from nncf.torch.function_hook.wrapper import ATR_HOOK_STORAGE
 
 TModel = TypeVar("TModel", bound=nn.Module)
+
+
+class _QuantizationConfig:
+    """Minimal quantization config container compatible with HuggingFace model configs."""
+
+    def to_dict(self) -> dict:
+        """
+        Returns a dictionary representation of the quantization config.
+
+        :return: Dictionary of all config attributes.
+        """
+        return vars(self)
 
 
 def strip_model(model: TModel, example_input: Any = None, strip_format: StripFormat = StripFormat.NATIVE) -> TModel:
@@ -165,12 +179,11 @@ def replace_quantizer_to_compressed_weight_with_nncf_linear(model: TModel) -> TM
     :param model: Compressed model
     :return: The modified NNCF network.
     """
-    from nncf.experimental.torch.qlinear import create_nncf_qlinear_dequantizer  # Importing here to avoid circular import
+    from nncf.experimental.torch.qlinear import create_nncf_qlinear  # Importing here to avoid circular import
 
     hook_storage = get_hook_storage(model)
 
-    for hook_name, hook_module in hook_storage.named_hooks():
-        StretchedSymmetricQuantizer
+    for hook_name, hook_module in track(list(hook_storage.named_hooks()), description="Converting to OV conversion format"):
         if not isinstance(hook_module, (SymmetricQuantizer, AsymmetricQuantizer, SymmetricLoraQuantizer, AsymmetricLoraQuantizer)):
             continue
         msg = ""
@@ -187,14 +200,41 @@ def replace_quantizer_to_compressed_weight_with_nncf_linear(model: TModel) -> TM
         module = get_module_by_name(module_name, model)
         weight_param = getattr(module, weight_attr_name)
         
+        if not isinstance(module, nn.Linear):
+            # For non-Linear modules the hook storage is deleted at the end of this function,
+            # so a decompressor hook would be orphaned and never called during tracing.
+            # Instead, apply the quantizer in-place (quantize-dequantize) to preserve
+            # quantization error while keeping the weight as float.
+            weight_param.requires_grad = False
+            weight_param.data = hook_module.quantize(weight_param)
+            continue
+
         q_weight, zero_point, scale, sym, num_bits, group_size, bias = get_quantized_weight_for_nncf_linear(hook_module, weight_param)
 
-        qlinear = create_nncf_qlinear_dequantizer(q_weight, zero_point, scale, num_bits, group_size, bias, symmetric=sym)
-        
-        weight_param.requires_grad = False
-        weight_param.data = torch.zeros(1) # The weight parameter is not used in forward pass of NNCFQLinearDequantizer, so we can set it to any value.
+        new_linear = create_nncf_qlinear(q_weight, zero_point, scale, num_bits, group_size, bias, symmetric=sym)
 
-        hook_storage.set_submodule(hook_name, qlinear)
+        del hook_module
+
+        if module_name.count(".") == 0:
+            # Top-level module
+            setattr(model, module_name, new_linear)
+        else:
+            parent_module_name, module_child_name = module_name.rsplit(".", 1)
+            parent_module = get_module_by_name(parent_module_name, model)
+            setattr(parent_module, module_child_name, new_linear)
+
+    # Unwrap the model to avoid conflicts with TorchFunctionMode
+    model.forward = model.forward.orig_forward
+    delattr(model, ATR_HOOK_STORAGE)
+    
+    if not hasattr(model, "config"):
+        model.config = type("", (), {})()  # Create an empty object for config
+        model.config.quantization_config = _QuantizationConfig()
+    else:
+        if not hasattr(model.config, "quantization_config"):
+            model.config.quantization_config = _QuantizationConfig()
+    model.config.quantization_config.quant_method = "nncf"
+
     return model
 
 
