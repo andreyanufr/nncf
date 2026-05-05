@@ -858,6 +858,148 @@ class WeightCompression(Algorithm):
         pretty_string = f"Statistics of the bitwidth distribution:\n{table}"
         return pretty_string
 
+    @staticmethod
+    def get_checkpoint_size_str(
+        all_params: list[WeightCompressionParameters],
+        skipped_weight_params: list[WeightCompressionParameters],
+    ) -> str:
+        """
+        Estimates the compressed checkpoint size considering weights, scales, zero points,
+        and uncompressed layers (embeddings, lm_head, etc.).
+
+        For each compressed weight:
+          - Compressed weights: num_weights * num_bits / 8
+          - Scales: one per group (fp16 = 2 bytes). Per-channel if group_size == -1.
+          - Zero points (asymmetric only): same shape as scales, stored in compressed dtype.
+        For uncompressed (skipped / float) weights:
+          - Stored in original dtype (weight_dtype).
+
+        :param all_params: Information about each weight node.
+        :param skipped_weight_params: Weights that remain in original precision.
+        :return: A human-readable string with the estimated checkpoint size breakdown.
+        """
+        total_weights_bytes = 0  # compressed weight data
+        total_scales_bytes = 0
+        total_zp_bytes = 0
+        total_float_bytes = 0  # uncompressed / skipped layers
+
+        # Per-category accumulators for the breakdown table
+        # key = (label, bits_or_dtype_size) → {"weights": bytes, "scales": bytes, "zp": bytes, "count": int}
+        category_stats: dict[str, dict[str, int]] = {}
+
+        def _add_to_category(label: str, w_bytes: int, s_bytes: int, z_bytes: int) -> None:
+            if label not in category_stats:
+                category_stats[label] = {"weights": 0, "scales": 0, "zp": 0, "count": 0}
+            category_stats[label]["weights"] += w_bytes
+            category_stats[label]["scales"] += s_bytes
+            category_stats[label]["zp"] += z_bytes
+            category_stats[label]["count"] += 1
+
+        for wp in all_params:
+            num_weights = int(wp.num_weights)
+            cc = wp.compression_config
+
+            if cc is None:
+                # Uncompressed — stored in original dtype
+                dtype_bits = wp.weight_dtype.itemsize() if hasattr(wp.weight_dtype, "itemsize") else 16
+                f_bytes = num_weights * dtype_bits // 8
+                total_float_bytes += f_bytes
+                label = f"float ({wp.weight_dtype.name})"
+                _add_to_category(label, f_bytes, 0, 0)
+                continue
+
+            num_bits = cc.num_bits
+            group_size = cc.group_size
+
+            # Compressed weight data
+            w_bytes = (num_weights * num_bits + 7) // 8
+            total_weights_bytes += w_bytes
+
+            # Number of scale/zp groups
+            weight_shape = wp.weight_shape
+            reduction_axes = wp.reduction_axes
+            if group_size == -1:
+                # Per-channel: one scale per output channel
+                n_groups = 1
+                for i, dim in enumerate(weight_shape):
+                    if i not in reduction_axes:
+                        n_groups *= dim
+            else:
+                # Group quantization
+                reduction_size = 1
+                for ax in reduction_axes:
+                    reduction_size *= weight_shape[ax]
+                n_groups_per_channel = (reduction_size + group_size - 1) // group_size
+                output_channels = 1
+                for i, dim in enumerate(weight_shape):
+                    if i not in reduction_axes:
+                        output_channels *= dim
+                n_groups = output_channels * n_groups_per_channel
+
+            # Scales: stored in fp16 (2 bytes each)
+            s_bytes = n_groups * 2
+            total_scales_bytes += s_bytes
+
+            # Zero points: only for asymmetric modes, stored in compressed dtype
+            z_bytes = 0
+            if cc.is_asym_mode:
+                zp_bits = cc.compression_dtype.itemsize() if hasattr(cc.compression_dtype, "itemsize") else num_bits
+                z_bytes = (n_groups * zp_bits + 7) // 8
+                total_zp_bytes += z_bytes
+
+            gs_label = f"g{group_size}" if group_size != -1 else "per-ch"
+            label = f"{cc.mode.value} {num_bits}bit {gs_label}"
+            _add_to_category(label, w_bytes, s_bytes, z_bytes)
+
+        # Skipped weights (embeddings, lm_head, etc.)
+        for wp in skipped_weight_params:
+            num_weights = int(wp.num_weights)
+            dtype_bits = wp.weight_dtype.itemsize() if hasattr(wp.weight_dtype, "itemsize") else 16
+            f_bytes = num_weights * dtype_bits // 8
+            total_float_bytes += f_bytes
+            label = f"skipped ({wp.weight_dtype.name})"
+            _add_to_category(label, f_bytes, 0, 0)
+
+        total_bytes = total_weights_bytes + total_scales_bytes + total_zp_bytes + total_float_bytes
+
+        def _fmt(b: int) -> str:
+            if b >= 1024**3:
+                return f"{b / 1024**3:.2f} GB"
+            return f"{b / 1024**2:.2f} MB"
+
+        # Build table
+        header = ["Category (layers)", "Weights", "Scales", "Zero Points", "Subtotal", "% of total"]
+        rows = []
+        for label in sorted(category_stats.keys()):
+            st = category_stats[label]
+            sub = st["weights"] + st["scales"] + st["zp"]
+            pct = 100.0 * sub / total_bytes if total_bytes > 0 else 0
+            rows.append(
+                [
+                    f"{label} ({st['count']})",
+                    _fmt(st["weights"]),
+                    _fmt(st["scales"]),
+                    _fmt(st["zp"]),
+                    _fmt(sub),
+                    f"{pct:.1f}%",
+                ]
+            )
+
+        # Totals row
+        rows.append(
+            [
+                "TOTAL",
+                _fmt(total_weights_bytes + total_float_bytes),
+                _fmt(total_scales_bytes),
+                _fmt(total_zp_bytes),
+                _fmt(total_bytes),
+                "100.0%",
+            ]
+        )
+
+        table = create_table(header, rows)
+        return f"Estimated compressed checkpoint size: {_fmt(total_bytes)}\n{table}"
+
     def _get_ignored_scope_weight_statistics(self, model: TModel, graph: NNCFGraph) -> list[int]:
         """
         Collect the weight statistics for nodes in the ignored scope.
@@ -1118,6 +1260,7 @@ class WeightCompression(Algorithm):
         nncf_logger.info(
             self.get_bitwidth_distribution_str(all_weight_params, ratio_defining_params, skipped_weight_params)
         )
+        nncf_logger.info(self.get_checkpoint_size_str(all_weight_params, skipped_weight_params))
 
         # Filter all_weight_params by excluding nodes that should remain in their original floating-point precision
         all_weight_params = [w_params for w_params in all_weight_params if w_params.compression_config is not None]

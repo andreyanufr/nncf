@@ -394,7 +394,10 @@ def main(argv) -> float:
                         targets = targets / fls
                         targets = torch.tanh(targets)
                         targets = targets * fls
-            outputs = model(**inputs).logits
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                outputs = model(**inputs).logits
+
             loss = kl_div(outputs, targets.to(dtype=torch_dtype, device=device))
 
             # Perform an optimization step after accumulating gradients over multiple minibatches.
@@ -414,8 +417,9 @@ def main(argv) -> float:
 
         save_checkpoint(model, ckpt_file, model_state=not args.basic_init)
         with torch.no_grad():
-            answer2 = generate_answer(model, tokenizer)
-            print(f"Answer after epoch {epoch}: {answer2}\n")
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                answer2 = generate_answer(model, tokenizer)
+                print(f"Answer after epoch {epoch}: {answer2}\n")
 
     del model
     # Export the best tuned model to OpenVINO and evaluate it using LM-Evaluation-Harness.
