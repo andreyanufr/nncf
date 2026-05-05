@@ -60,15 +60,23 @@ class WeightCompressionConfig:
             if n_quants <= 256:
                 return 8
             return 16
+        
+        mode_to_bits_map = {
+            CompressWeightsMode.INT4_SYM: 4,
+            CompressWeightsMode.INT4_ASYM: 4,
+            CompressWeightsMode.INT8_ASYM: 8,
+            CompressWeightsMode.INT8_SYM: 8,
+            CompressWeightsMode.NF4: 4,
+            CompressWeightsMode.FP4: 4,
+            CompressWeightsMode.MXFP4: 4,
+            CompressWeightsMode.NVFP4: 4,
+            CompressWeightsMode.FP8_E4M3: 8,
+            CompressWeightsMode.MXFP8_E4M3: 8,
+            CompressWeightsMode.INT2_SYM: 2,
+            CompressWeightsMode.INT2_ASYM: 2,
+        }
 
-        if self.mode in [
-            CompressWeightsMode.INT8_SYM,
-            CompressWeightsMode.INT8_ASYM,
-            CompressWeightsMode.FP8_E4M3,
-            CompressWeightsMode.MXFP8_E4M3,
-        ]:
-            return 8
-        return 4
+        return mode_to_bits_map[self.mode]
 
     @property
     def is_asym_mode(self) -> bool:

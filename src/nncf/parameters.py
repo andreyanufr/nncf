@@ -104,6 +104,8 @@ class CompressWeightsMode(StrEnum):
     INT8_ASYM = "int8_asym"
     INT4_SYM = "int4_sym"
     INT4_ASYM = "int4_asym"
+    INT2_SYM = "int2_sym"
+    INT2_ASYM = "int2_asym"
     NF4 = "nf4"
     CB4 = "cb4"
     MXFP4 = "mxfp4"

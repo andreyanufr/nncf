@@ -648,6 +648,16 @@ class WeightCompression(Algorithm):
             for weight_param in ratio_defining_params:
                 if weight_param.node_with_weight.node_name not in primary_precision_node_names:
                     weight_param.compression_config = self._get_backup_config(weight_param.weight_dtype)
+        elif len(ratio_defining_params) > 0 and self._mode in [CompressWeightsMode.INT2_SYM, CompressWeightsMode.INT2_ASYM]: # check predefind matmul names
+            for weight_param in ratio_defining_params:
+                if 'model_int2' in weight_param.node_with_weight.node_name:
+                    weight_param.compression_config = self._get_primary_config(self._group_size)
+                elif 'model_int4' in weight_param.node_with_weight.node_name:
+                    tmp = self._mode
+                    self._mode = CompressWeightsMode.INT4_SYM if self._mode == CompressWeightsMode.INT2_SYM else CompressWeightsMode.INT4_ASYM
+                    weight_param.compression_config = self._get_primary_config(2 * self._group_size)
+                    self._mode = tmp
+
 
     def validate_group_size(
         self,
