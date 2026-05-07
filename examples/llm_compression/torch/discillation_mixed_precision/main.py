@@ -290,14 +290,6 @@ def get_argument_parser() -> argparse.ArgumentParser:
     # Data params
     parser.add_argument("--num_train_samples", type=int, default=512, help="Number of training samples")
     parser.add_argument("--train_seqlen", type=int, default=1024, help="Train data context length.")
-    parser.add_argument("--eval_seqlen", type=int, default=2048, help="Evaluation data context length.")
-    parser.add_argument(
-        "--limit",
-        type=limit_type,
-        default=None,
-        help="A percentage of the total number of examples for evaluation. "
-        "Should be on the range [0,1]. If None, all samples will be used.",
-    )
 
     # Training params
     parser.add_argument(
@@ -326,12 +318,6 @@ def get_argument_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.03,
         help="Fraction of total optimizer steps used for linear warmup before cosine decay.",
-    )
-    parser.add_argument(
-        "--min_lr_ratio",
-        type=float,
-        default=0.1,
-        help="Final LR as a fraction of the peak LR at the end of the cosine schedule.",
     )
     return parser
 
@@ -476,14 +462,14 @@ def main(argv) -> float:
 
             # compute loss only for second half of the sequence, to let the model see enough context before computing loss and getting meaningful gradients for distillation
             kl_loss = kl_div(
-                logits[:, logits.shape[1] // 2 :],
-                targets[:, targets.shape[1] // 2 :].to(dtype=torch_dtype, device=device),
+                logits[:, logits.shape[1] // 3 :],
+                targets[:, targets.shape[1] // 3 :].to(dtype=torch_dtype, device=device),
             )
             l1_loss = F.l1_loss(
-                cur_student_hiddens[:, cur_student_hiddens.shape[1] // 2 :],
-                cur_teacher_hiddens[:, cur_teacher_hiddens.shape[1] // 2 :].to(dtype=torch_dtype, device=device),
+                cur_student_hiddens[:, cur_student_hiddens.shape[1] // 3 :],
+                cur_teacher_hiddens[:, cur_teacher_hiddens.shape[1] // 3 :].to(dtype=torch_dtype, device=device),
             )
-            loss = kl_loss + 0.1 * l1_loss
+            loss = kl_loss # + 0.1 * l1_loss
 
             # Perform an optimization step after accumulating gradients over multiple minibatches.
             loss_numerator += loss.item()
