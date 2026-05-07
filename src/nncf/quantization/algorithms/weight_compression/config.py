@@ -60,7 +60,7 @@ class WeightCompressionConfig:
             if n_quants <= 256:
                 return 8
             return 16
-        
+
         mode_to_bits_map = {
             CompressWeightsMode.INT4_SYM: 4,
             CompressWeightsMode.INT4_ASYM: 4,

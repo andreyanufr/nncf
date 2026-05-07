@@ -21,10 +21,6 @@ import torch
 import torch.nn.functional as F
 import transformers
 from datasets import load_dataset
-from lm_eval import simple_evaluate
-from lm_eval.models.optimum_lm import OptimumLM
-from optimum.exporters.openvino.convert import export_from_model
-from optimum.intel.openvino import OVModelForCausalLM
 from optimum.modeling_base import OptimizedModel
 from torch import Tensor
 from torch import nn
@@ -32,13 +28,13 @@ from torch.jit import TracerWarning
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoModelForCausalLM
 from transformers import AutoTokenizer
+from utils import replace_linear_with_mixer
 
 import nncf
 from nncf.common.logging.track_progress import track
 from nncf.data.dataset import Dataset
 from nncf.parameters import CompressionFormat
 from nncf.parameters import CompressWeightsMode
-from nncf.parameters import StripFormat
 from nncf.quantization.advanced_parameters import AdvancedAWQParameters
 from nncf.quantization.advanced_parameters import AdvancedCompressionParameters
 from nncf.quantization.quantize_model import compress_weights
@@ -47,16 +43,12 @@ from nncf.torch.function_hook.wrapper import get_hook_storage
 from nncf.torch.quantization.layers import AsymmetricLoraQuantizer
 from nncf.torch.quantization.layers import SymmetricLoraQuantizer
 
-from utils import export_to_pytorch
-from utils import replace_linear_with_mixer
-
-
 warnings.filterwarnings("ignore", category=TracerWarning)
 
 
-
-
-def generate_answer(model: OptimizedModel, tokenizer: AutoTokenizer, question: str="What is AI? ", max_new_tokens=32) -> str:
+def generate_answer(
+    model: OptimizedModel, tokenizer: AutoTokenizer, question: str = "What is AI? ", max_new_tokens=32
+) -> str:
     """
     Generate an answer to a given question using the provided model and tokenizer.
 
@@ -76,9 +68,10 @@ def generate_answer(model: OptimizedModel, tokenizer: AutoTokenizer, question: s
     answer = tokenizer.decode(output[input_len:], skip_special_tokens=True)
     return answer
 
+
 def get_pile(num_samples: int, seqlen: int, tokenizer: Any, device: torch.device) -> list[Tensor]:
     ds = load_dataset("NeelNanda/pile-10k", split="train")
-    
+
     trainloader = []
     for example in ds:
         trainenc = tokenizer(example["text"], return_tensors="pt")
@@ -94,6 +87,40 @@ def get_pile(num_samples: int, seqlen: int, tokenizer: Any, device: torch.device
         if len(trainloader) >= num_samples:
             break
 
+    return trainloader
+
+
+def get_distill_dataset(
+    num_samples: int,
+    seqlen: int,
+    tokenizer: Any,
+    device: torch.device,
+    name="mlfoundations-dev/DeepSeek-R1-Distill-Qwen-7B_eval_03-07-25_17-46_2870",
+) -> Dataset:
+    """
+    Prepares a dataset for distillation by tokenizing and processing the input data.
+
+    :param num_samples: The number of samples to include in the dataset.
+    :param seqlen: The sequence length to which the input data should be truncated or padded.
+    :param tokenizer: The tokenizer used to process the input data.
+    :param device: The device on which the tensors will be stored (e.g., CPU or GPU).
+    :return: A Dataset object containing the processed input data for distillation.
+    """
+    ds = load_dataset(name, split="train")
+    trainloader = []
+    for example in ds:
+        trainenc = tokenizer(example["context"][0]["content"] + " " + example["model_outputs"], return_tensors="pt")
+        if trainenc.input_ids.shape[1] < seqlen:
+            continue
+        if trainenc.input_ids.shape[1] > seqlen + 1:
+            i = torch.randint(0, trainenc.input_ids.shape[1] - seqlen - 1, (1,)).item()
+        else:
+            i = 0
+        j = i + seqlen
+        inp = trainenc.input_ids[:, i:j].to(device)
+        trainloader.append(inp)
+        if len(trainloader) >= num_samples:
+            break
     return trainloader
 
 
@@ -138,8 +165,10 @@ def kl_div(student_hiddens: torch.Tensor, teacher_hiddens: torch.Tensor) -> torc
     """
     num_classes = student_hiddens.shape[-1]
     return F.kl_div(
-        input=F.log_softmax(student_hiddens.view(-1, num_classes), dim=-1),
-        target=F.log_softmax(teacher_hiddens.view(-1, num_classes), dim=-1),
+        # input=F.log_softmax(student_hiddens.view(-1, num_classes), dim=-1),
+        # target=F.log_softmax(teacher_hiddens.view(-1, num_classes), dim=-1),
+        input=F.log_softmax(student_hiddens.reshape(-1, num_classes), dim=-1),
+        target=F.log_softmax(teacher_hiddens.reshape(-1, num_classes), dim=-1),
         log_target=True,
         reduction="batchmean",
     )
@@ -286,6 +315,24 @@ def get_argument_parser() -> argparse.ArgumentParser:
         default=2,
         help="Size of each training microbatch. Gradients will be accumulated until the batch size is reached.",
     )
+    parser.add_argument(
+        "--distill_dataset_name",
+        type=str,
+        default="mlfoundations-dev/DeepSeek-R1-Distill-Qwen-7B_eval_03-07-25_17-46_2870",
+        help="Name of the dataset to use for distillation.",
+    )
+    parser.add_argument(
+        "--warmup_ratio",
+        type=float,
+        default=0.03,
+        help="Fraction of total optimizer steps used for linear warmup before cosine decay.",
+    )
+    parser.add_argument(
+        "--min_lr_ratio",
+        type=float,
+        default=0.1,
+        help="Final LR as a fraction of the peak LR at the end of the cosine schedule.",
+    )
     return parser
 
 
@@ -298,18 +345,19 @@ def main(argv) -> float:
     args = parser.parse_args(argv)
     assert torch.cuda.is_available()
     transformers.set_seed(42)
+
     device = "cuda"
     torch_dtype = torch.bfloat16
     compression_config = dict(
         mode=CompressWeightsMode.INT2_SYM,
         group_size=32,
-        awq=not args.basic_init,
+        awq=False,  # avoid awq for splitted linear layers
         scale_estimation=not args.basic_init,
         compression_format=CompressionFormat.FQ_LORA,
     )
     pprint({"CLI arguments": vars(args), "Major compression parameters": compression_config})
     compression_config["advanced_parameters"] = AdvancedCompressionParameters(
-        awq_params=AdvancedAWQParameters(prefer_data_aware_scaling=not args.basic_init),
+        awq_params=AdvancedAWQParameters(prefer_data_aware_scaling=False),  # not args.basic_init),
         lora_adapter_rank=args.lora_rank,
     )
     # Configure output and log files.
@@ -325,22 +373,36 @@ def main(argv) -> float:
     tb = SummaryWriter(tensorboard_dir, "QAT with absorbable LoRA")
 
     # Load original model and tokenizer.
-    model = AutoModelForCausalLM.from_pretrained(args.pretrained, torch_dtype=torch_dtype, device_map="auto", use_cache=False)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.pretrained, torch_dtype=torch_dtype, device_map="auto", use_cache=False
+    )
     tokenizer = AutoTokenizer.from_pretrained(args.pretrained)
-    
+
+    # Prepare training and calibration data
+    train_loader = get_pile(
+        num_samples=args.num_train_samples, seqlen=args.train_seqlen, tokenizer=tokenizer, device=device
+    )
+    if args.distill_dataset_name:
+        dataset = get_distill_dataset(
+            num_samples=args.num_train_samples,
+            seqlen=args.train_seqlen,
+            tokenizer=tokenizer,
+            device=device,
+            name=args.distill_dataset_name,
+        )
+        train_loader.extend(dataset)
+
     answer1 = generate_answer(model, tokenizer)
     print(f"Answer before mixed: {answer1}\n")
     model = replace_linear_with_mixer(model)
     answer2 = generate_answer(model, tokenizer)
     print(f"Answer after mixed: {answer2}\n")
     if answer1 != answer2:
-        print("The answers are different after replacing linear layers with LinearMIXER. This may be due to the fact that the model has not been fine-tuned yet, and the weights of the new LinearMIXER layers have been initialized based on the original linear layers. Fine-tuning the model with the new LinearMIXER layers should help to recover the original performance.")
+        print(
+            "The answers are different after replacing linear layers with LinearMIXER. This may be due to the fact that the model has not been fine-tuned yet, and the weights of the new LinearMIXER layers have been initialized based on the original linear layers. Fine-tuning the model with the new LinearMIXER layers should help to recover the original performance."
+        )
         exit(1)
 
-    # Prepare training and calibration data
-    train_loader = get_pile(
-        num_samples=args.num_train_samples, seqlen=args.train_seqlen, tokenizer=tokenizer, device=device
-    )
     if args.basic_init:
         example_input = {k: v.to(device) for k, v in model.dummy_inputs.items()}
         dataset = Dataset([example_input])
@@ -373,8 +435,19 @@ def main(argv) -> float:
     num_samples = len(train_loader)
     epoch_samples = num_samples - num_samples % args.microbatch_size
     microbatches_per_epoch = epoch_samples // args.microbatch_size
+    optimizer_steps_per_epoch = max(1, microbatches_per_epoch // grad_accumulation_steps)
+    total_optimizer_steps = max(1, args.epochs * optimizer_steps_per_epoch)
+    warmup_steps = max(1, int(args.warmup_ratio * total_optimizer_steps)) if args.warmup_ratio > 0 else 0
+    scheduler = transformers.get_linear_schedule_with_warmup(
+        opt,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_optimizer_steps,
+    )
     aggregated_loss = float("nan")
     loss_numerator = grad_steps = total_steps = 0
+    aggregated_kl_loss = 0.0
+    aggregated_l1_loss = 0.0
+
     for epoch in range(args.epochs):
         batch_indices_epoch = torch.randperm(num_samples)[:epoch_samples].chunk(microbatches_per_epoch)
         for indices in track(batch_indices_epoch, description=f"Train epoch {epoch}"):
@@ -387,7 +460,8 @@ def main(argv) -> float:
             # Compute distillation loss between logits of the original model and the model with FQ + LoRA.
             inputs = form_batch(train_loader, model_input=True)
             with torch.no_grad():
-                targets = model.lm_head(form_batch(orig_hiddens, model_input=False))
+                cur_teacher_hiddens = form_batch(orig_hiddens, model_input=False)
+                targets = model.lm_head(cur_teacher_hiddens)
                 if hasattr(model.config, "final_logit_softcapping"):  # Gemma has post-processing after lm_head
                     fls = model.config.final_logit_softcapping
                     if fls is not None:
@@ -396,9 +470,20 @@ def main(argv) -> float:
                         targets = targets * fls
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                outputs = model(**inputs).logits
+                outputs = model(**inputs, output_hidden_states=True)
+                logits = outputs.logits
+                cur_student_hiddens = outputs.hidden_states[-1]
 
-            loss = kl_div(outputs, targets.to(dtype=torch_dtype, device=device))
+            # compute loss only for second half of the sequence, to let the model see enough context before computing loss and getting meaningful gradients for distillation
+            kl_loss = kl_div(
+                logits[:, logits.shape[1] // 2 :],
+                targets[:, targets.shape[1] // 2 :].to(dtype=torch_dtype, device=device),
+            )
+            l1_loss = F.l1_loss(
+                cur_student_hiddens[:, cur_student_hiddens.shape[1] // 2 :],
+                cur_teacher_hiddens[:, cur_teacher_hiddens.shape[1] // 2 :].to(dtype=torch_dtype, device=device),
+            )
+            loss = kl_loss + 0.1 * l1_loss
 
             # Perform an optimization step after accumulating gradients over multiple minibatches.
             loss_numerator += loss.item()
@@ -407,13 +492,22 @@ def main(argv) -> float:
                 err = f"Fine-tuning loss is {loss}"
                 raise ValueError(err)
             (loss / grad_accumulation_steps).backward()
+
+            aggregated_kl_loss += kl_loss.item()
+            aggregated_l1_loss += l1_loss.item()
+
             if grad_steps == grad_accumulation_steps:
                 opt.step()
+                scheduler.step()
                 opt.zero_grad()
                 aggregated_loss = loss_numerator / grad_steps
-                loss_numerator = grad_steps = 0
                 total_steps += 1
                 tb.add_scalar("loss", aggregated_loss, total_steps)
+                tb.add_scalar("kl_loss", aggregated_kl_loss / grad_steps, total_steps)
+                tb.add_scalar("l1_loss", aggregated_l1_loss / grad_steps, total_steps)
+                for i, pg in enumerate(opt.param_groups):
+                    tb.add_scalar(f"lr/group_{i}", pg["lr"], total_steps)
+                loss_numerator = grad_steps = aggregated_kl_loss = aggregated_l1_loss = 0
 
         save_checkpoint(model, ckpt_file, model_state=not args.basic_init)
         with torch.no_grad():
@@ -423,8 +517,8 @@ def main(argv) -> float:
 
     del model
     # Export the best tuned model to OpenVINO and evaluate it using LM-Evaluation-Harness.
-    #export_to_pytorch(args.pretrained, ckpt_file, ckpt_file.parent / "pt_model_for_eval")
-    #tokenizer.save_pretrained(ckpt_file.parent / "pt_model_for_eval")
+    # export_to_pytorch(args.pretrained, ckpt_file, ckpt_file.parent / "pt_model_for_eval")
+    # tokenizer.save_pretrained(ckpt_file.parent / "pt_model_for_eval")
     # model_for_eval = export_to_openvino(args.pretrained, ckpt_file, ckpt_file.parent)
     # ov_perplexity = measure_perplexity(model_for_eval, args.eval_seqlen, args.limit)
     # tb.add_scalar("ov_perplexity", ov_perplexity, 0)
@@ -432,7 +526,7 @@ def main(argv) -> float:
     #     f"The finetuned model has been exported to OpenVINO and saved to: {last_dir}\n"
     #     f"The word perplexity on wikitext (test) = {ov_perplexity:.4f}"
     # )
-    #return ov_perplexity
+    # return ov_perplexity
 
 
 if __name__ == "__main__":
