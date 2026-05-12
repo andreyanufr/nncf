@@ -13,6 +13,7 @@ import shutil
 import sys
 import warnings
 from datetime import datetime
+import copy
 from pathlib import Path
 from pprint import pprint
 from typing import Any
@@ -46,6 +47,283 @@ from nncf.torch.quantization.layers import SymmetricLoraQuantizer
 warnings.filterwarnings("ignore", category=TracerWarning)
 
 
+# ---------------------------------------------------------------------- #
+# MLP equalization (down_proj input scale absorbed into up_proj/gate_proj)
+# ---------------------------------------------------------------------- #
+def _find_mlp_groups(model: nn.Module) -> list[tuple[nn.Module, nn.Linear, list[nn.Linear]]]:
+    """
+    Collect ``(parent, down_proj, [producers])`` triples where ``producers``
+    are the sibling linears whose outputs are consumed by ``down_proj`` along
+    its input-channel dimension.
+
+    Recognized layouts:
+      * Llama-style: ``down_proj`` consumes ``up_proj`` * SiLU(``gate_proj``);
+        producers = ``[up_proj, gate_proj]``.
+      * Generic: only ``up_proj`` present -> producers = ``[up_proj]``.
+    """
+    groups: list[tuple[nn.Module, nn.Linear, list[nn.Linear]]] = []
+    for parent in model.modules():
+        down = getattr(parent, "down_proj", None)
+        if not isinstance(down, nn.Linear):
+            continue
+        producers: list[nn.Linear] = []
+        for attr in ("up_proj",):#, "gate_proj"):
+            sib = getattr(parent, attr, None)
+            if isinstance(sib, nn.Linear) and sib.out_features == down.in_features:
+                producers.append(sib)
+        if producers:
+            groups.append((parent, down, producers))
+    return groups
+
+
+@torch.no_grad()
+def equalize_down_proj(
+    model: nn.Module,
+    calib_inputs: list[Tensor],
+    eps: float = 1e-5,
+) -> int:
+    """
+    Equalize each ``down_proj`` layer by absorbing the per-input-channel
+    activation magnitude into its producers (``up_proj`` and, when present,
+    ``gate_proj``).
+
+    For every MLP block let ``s = mean(|x|, dim=batch_seq)`` measured at the
+    input of ``down_proj`` over the calibration set. Then:
+
+    * ``down_proj.weight  /= s[None, :]`` (divide along input channels)
+    * For each producer ``L`` (e.g. ``up_proj``, ``gate_proj``):
+      ``L.weight *= s[:, None]``  (scale output channels)
+      ``L.bias   *= s``           (if a bias exists)
+
+    Mathematically, ``down(up(x) * silu(gate(x))) = down((up(x)*s) * (silu(gate(x)*s)/s))``
+    is *not* exact for the SiLU branch in general, but in practice this
+    pre-quantization equalization (cf. SmoothQuant / AWQ) significantly
+    flattens the weight magnitudes seen by the per-group quantizer. The
+    transformation is exact when no SiLU is present (``producers == [up_proj]``).
+
+    :param model: Model whose MLP blocks expose ``down_proj`` (and optional
+        ``up_proj``/``gate_proj`` siblings) as direct attributes. Must be
+        called on plain ``nn.Linear`` layers (i.e. **before** wrapping them
+        with :class:`QuantizedLoraLinear`).
+    :param calib_inputs: Token-id tensors used for activation statistics.
+    :param eps: Lower bound for ``s`` to avoid division by zero.
+    :return: Number of equalized MLP groups.
+    """
+    groups = _find_mlp_groups(model)
+    if not groups:
+        return 0
+
+    # abs_sum: dict[int, Tensor] = {}
+    # counts: dict[int, int] = {}
+    # handles = []
+    # for _, down, _ in groups:
+    #     def make_hook(key: int):
+    #         def hook(_mod, args):
+    #             x = args[0].detach()
+    #             x_flat = x.reshape(-1, x.shape[-1]).float()
+    #             a = x_flat.abs().sum(dim=0)
+    #             if key in abs_sum:
+    #                 abs_sum[key] += a
+    #                 counts[key] += x_flat.shape[0]
+    #             else:
+    #                 abs_sum[key] = a
+    #                 counts[key] = x_flat.shape[0]
+    #         return hook
+    #     handles.append(down.register_forward_pre_hook(make_hook(id(down))))
+
+    # was_training = model.training
+    # model.eval()
+    # try:
+    #     for ids in tqdm(calib_inputs, desc="MLP equalization: collecting activations"):
+    #         model(**get_model_input(ids))
+    # finally:
+    #     for h in handles:
+    #         h.remove()
+    #     if was_training:
+    #         model.train()
+
+    n_done = 0
+    for _, down, producers in groups:
+        key = id(down)
+        # if key not in abs_sum:
+        #     continue
+        # s = (abs_sum[key] / max(counts[key], 1)).clamp_min(eps).to(
+        #     device=down.weight.device, dtype=down.weight.dtype
+        # )
+        s = down.weight.abs().mean(dim=0).clamp_min(eps).to(device=down.weight.device, dtype=down.weight.dtype)
+        # Divide down_proj input columns by s.
+        down.weight.mul_(1.0 / s.unsqueeze(0))
+        # Scale producer output rows by s.
+        for prod in producers:
+            s_dev = s.to(device=prod.weight.device, dtype=prod.weight.dtype)
+            prod.weight.mul_(s_dev.unsqueeze(1))
+            if prod.bias is not None:
+                prod.bias.mul_(s_dev)
+        n_done += 1
+    return n_done
+
+
+# ---------------------------------------------------------------------- #
+# Per-head Hadamard rotation between v_proj and o_proj
+# ---------------------------------------------------------------------- #
+def _build_hadamard(n: int, device: torch.device, dtype: torch.dtype) -> Tensor:
+    """
+    Build a normalized (orthogonal) Hadamard matrix of size ``n x n``.
+
+    Requires ``n`` to be a power of two. The returned matrix ``H`` satisfies
+    ``H @ H.T == I`` (so ``H^{-1} == H.T``).
+
+    :param n: Matrix size; must be a power of two.
+    :param device: Target device.
+    :param dtype: Target dtype.
+    :return: ``(n, n)`` orthogonal Hadamard matrix.
+    """
+    if n <= 0 or (n & (n - 1)) != 0:
+        raise ValueError(f"Hadamard size must be a positive power of two, got {n}")
+    h = torch.ones((1, 1), dtype=torch.float64)
+    while h.shape[0] < n:
+        h = torch.cat(
+            [
+                torch.cat([h,  h], dim=1),
+                torch.cat([h, -h], dim=1),
+            ],
+            dim=0,
+        )
+    h = h / (n ** 0.5)
+    return h.to(device=device, dtype=dtype)
+
+
+def _build_random_orthogonal(n: int, device: torch.device, dtype: torch.dtype, seed: int) -> Tensor:
+    """Random orthogonal ``n x n`` matrix via QR of a Gaussian matrix."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    a = torch.randn((n, n), generator=g, dtype=torch.float64)
+    q, r = torch.linalg.qr(a)
+    # Make the decomposition unique (sign of diag(r)) so q is uniform on O(n).
+    q = q * torch.sign(torch.diagonal(r)).unsqueeze(0)
+    return q.to(device=device, dtype=dtype)
+
+
+def _find_attention_groups(
+    model: nn.Module,
+) -> list[tuple[nn.Module, nn.Linear, nn.Linear, int, int, int]]:
+    """
+    Collect ``(parent, v_proj, o_proj, head_dim, num_kv_heads, num_q_heads)``
+    triples for each transformer attention block.
+
+    Recognized layout (Llama / Qwen / Mistral): the parent module exposes
+    ``v_proj`` and ``o_proj`` as direct ``nn.Linear`` attributes, and the
+    head dimension can be inferred from ``v_proj.out_features`` and the
+    model config (``num_attention_heads``, ``num_key_value_heads``).
+    """
+    cfg = getattr(model, "config", None)
+    if cfg is None:
+        return []
+    num_q_heads = getattr(cfg, "num_attention_heads", None)
+    num_kv_heads = getattr(cfg, "num_key_value_heads", num_q_heads)
+    head_dim = getattr(cfg, "head_dim", None)
+    if num_q_heads is None or num_kv_heads is None:
+        return []
+
+    groups: list[tuple[nn.Module, nn.Linear, nn.Linear, int, int, int]] = []
+    for parent in model.modules():
+        v = getattr(parent, "v_proj", None)
+        o = getattr(parent, "o_proj", None)
+        if not (isinstance(v, nn.Linear) and isinstance(o, nn.Linear)):
+            continue
+        # Resolve head_dim from shapes if config does not provide it.
+        hd = head_dim
+        if hd is None:
+            if v.out_features % num_kv_heads != 0:
+                continue
+            hd = v.out_features // num_kv_heads
+        if v.out_features != num_kv_heads * hd or o.in_features != num_q_heads * hd:
+            # Layout does not match the GQA convention we expect.
+            continue
+        groups.append((parent, v, o, hd, num_kv_heads, num_q_heads))
+    return groups
+
+
+@torch.no_grad()
+def equalize_v_o_with_hadamard(model: nn.Module, seed: int = 0) -> int:
+    """
+    Apply a per-head invertible rotation between ``v_proj`` and ``o_proj`` so
+    that quantization of either weight sees a more uniform per-channel
+    magnitude distribution. The transformation preserves the attention output
+    exactly (no calibration data is required).
+
+    For each attention head ``h`` with head dimension ``d`` we choose an
+    orthogonal matrix ``H`` of shape ``(d, d)``. With the standard
+    ``nn.Linear`` convention ``y = x @ W.T``, the per-head V/O contribution is
+
+    .. code::
+
+        attn_h @ (X @ W_v[h_slice].T) @ W_o[:, h_slice].T
+
+    Inserting ``H @ H.T = I`` between the two factors keeps the output
+    invariant under
+
+    .. code::
+
+        W_v[h_slice]  <- H.T @ W_v[h_slice]      # rows of v_proj for head h
+        W_o[:, h_slice] <- W_o[:, h_slice] @ H   # cols of o_proj for head h
+
+    For Grouped-Query Attention the same KV head feeds ``num_q_heads /
+    num_kv_heads`` Q heads; the corresponding ``num_q_heads / num_kv_heads``
+    column slices of ``o_proj`` all receive the matching ``H``.
+
+    A Hadamard matrix is used when ``head_dim`` is a power of two (it
+    maximally spreads each weight row across the head dimension); otherwise
+    the function falls back to a random orthogonal matrix.
+
+    :param model: Model with attention modules exposing ``v_proj`` / ``o_proj``.
+        Must be called on plain ``nn.Linear`` layers (i.e. **before**
+        wrapping them with :class:`QuantizedLoraLinear`).
+    :param seed: Seed for the random orthogonal fallback.
+    :return: Number of attention layers transformed.
+    """
+    groups = _find_attention_groups(model)
+    if not groups:
+        return 0
+
+    n_done = 0
+    for layer_idx, (_, v, o, head_dim, num_kv, num_q) in enumerate(groups):
+        if num_q % num_kv != 0:
+            continue
+        group_size = num_q // num_kv
+        device = v.weight.device
+        dtype = v.weight.dtype
+        try:
+            h_mat = _build_hadamard(head_dim, device=device, dtype=dtype)
+        except ValueError:
+            h_mat = _build_random_orthogonal(
+                head_dim, device=device, dtype=dtype, seed=seed + layer_idx
+            )
+        h_t = h_mat.t().contiguous()
+
+        # v_proj: rows for KV head h_kv occupy [h_kv*head_dim : (h_kv+1)*head_dim].
+        v_w = v.weight
+        for h_kv in range(num_kv):
+            r0 = h_kv * head_dim
+            r1 = r0 + head_dim
+            v_w[r0:r1, :] = h_t @ v_w[r0:r1, :]
+            if v.bias is not None:
+                # Bias of v_proj is part of V; rotate the per-head slice the same way.
+                v.bias[r0:r1] = h_t @ v.bias[r0:r1]
+
+        # o_proj: each KV head feeds `group_size` consecutive Q heads; rotate
+        # each Q head's column slice by the same H.
+        o_w = o.weight
+        for h_kv in range(num_kv):
+            for q_in_group in range(group_size):
+                q = h_kv * group_size + q_in_group
+                c0 = q * head_dim
+                c1 = c0 + head_dim
+                o_w[:, c0:c1] = o_w[:, c0:c1] @ h_mat
+        n_done += 1
+    return n_done
+
+
+@torch.no_grad()
 def generate_answer(
     model: OptimizedModel, tokenizer: AutoTokenizer, question: str = "What is AI? ", max_new_tokens=32
 ) -> str:
@@ -278,6 +556,7 @@ def get_argument_parser() -> argparse.ArgumentParser:
         "start from scratch by post-training weight compression initialization.",
     )
     parser.add_argument("--lora_rank", type=int, default=32, help="Rank of lora adapters")
+    parser.add_argument("--description", type=str, default=None, help="Description of the experiment")
     parser.add_argument(
         "--basic_init",
         action="store_true",
@@ -319,6 +598,21 @@ def get_argument_parser() -> argparse.ArgumentParser:
         default=0.03,
         help="Fraction of total optimizer steps used for linear warmup before cosine decay.",
     )
+    
+    parser.add_argument("--int4_ratio", type=float, default=0.5, help="Ratio of output channels to quantize to 4 bits")
+    parser.add_argument(
+        "--equalize_down_proj",
+        action="store_true",
+        help="Absorb per-input-channel activation magnitude of down_proj into up_proj/gate_proj before quantization.",
+    )
+    parser.add_argument(
+        "--hadamard_vo",
+        action="store_true",
+        help="Apply a per-head orthogonal (Hadamard when head_dim is a power of two) "
+        "rotation between v_proj and o_proj. Preserves attention output exactly and "
+        "spreads outliers across each head's channels prior to quantization.",
+    )
+    
     return parser
 
 
@@ -348,8 +642,8 @@ def main(argv) -> float:
     )
     # Configure output and log files.
     output_dir = Path(args.output_dir)
-    tensorboard_dir = output_dir / "tb" / datetime.now().strftime("%Y-%m-%d__%H-%M-%S")
-    last_dir = output_dir / "last"
+    tensorboard_dir = output_dir / "tb" / datetime.now().strftime("%Y-%m-%d__%H-%M-%S") if args.description is None else output_dir / "tb" / args.description
+    last_dir = output_dir / "last" if args.description is None else output_dir / ("last_" + args.description)
     if not args.resume:
         shutil.rmtree(last_dir, ignore_errors=True)
     for path in [output_dir, tensorboard_dir, last_dir]:
@@ -378,17 +672,6 @@ def main(argv) -> float:
         )
         train_loader.extend(dataset)
 
-    answer1 = generate_answer(model, tokenizer)
-    print(f"Answer before mixed: {answer1}\n")
-    model = replace_linear_with_mixer(model)
-    answer2 = generate_answer(model, tokenizer)
-    print(f"Answer after mixed: {answer2}\n")
-    if answer1 != answer2:
-        print(
-            "The answers are different after replacing linear layers with LinearMIXER. This may be due to the fact that the model has not been fine-tuned yet, and the weights of the new LinearMIXER layers have been initialized based on the original linear layers. Fine-tuning the model with the new LinearMIXER layers should help to recover the original performance."
-        )
-        exit(1)
-
     if args.basic_init:
         example_input = {k: v.to(device) for k, v in model.dummy_inputs.items()}
         dataset = Dataset([example_input])
@@ -404,6 +687,63 @@ def main(argv) -> float:
     else:
         orig_hiddens = calc_hiddens(model, train_loader)
         torch.save(orig_hiddens, hiddens_pth)
+
+    # find gpu with less memory usage to keep copy of lm_head for distillation, as it will be needed to compute teacher logits and distillation loss during training
+    gpu_id = None
+    best_memory = float("inf")
+
+    for i in range(torch.cuda.device_count()):
+        if torch.cuda.memory_allocated(i) < best_memory:
+            best_memory = torch.cuda.memory_allocated(i)
+            gpu_id = i
+    
+    teacher_lm_head = copy.deepcopy(model.lm_head)
+    teacher_lm_head.eval().requires_grad_(False)
+    if gpu_id is not None:
+        teacher_lm_head = teacher_lm_head.to(f"cuda:{gpu_id}")
+
+    # Optional pre-quantization equalization of down_proj input scale into
+    # the producing up_proj / gate_proj output channels.
+    if args.equalize_down_proj:
+        answer_before_equalization = generate_answer(model, tokenizer)
+        eq_loader = get_pile(
+            num_samples=1,
+            seqlen=1,
+            tokenizer=tokenizer,
+            device=device,
+        )
+        n_eq = equalize_down_proj(model, eq_loader)
+        print(f"Equalized {n_eq} down_proj layers.")
+        print(f"Answer before equalization: {answer_before_equalization}")
+        print(f"Answer (post equalization):  {generate_answer(model, tokenizer)}\n")
+
+    # Optional per-head Hadamard / orthogonal rotation between v_proj and o_proj.
+    # Output-invariant; intended to flatten per-channel weight magnitudes seen by
+    # the per-group quantizer of v_proj and o_proj.
+    if args.hadamard_vo:
+        answer_before_hadamard = generate_answer(model, tokenizer)
+        n_rot = equalize_v_o_with_hadamard(model, seed=42)
+        print(f"Applied Hadamard rotation to {n_rot} attention layers (v_proj/o_proj).")
+        print(f"Answer before Hadamard:    {answer_before_hadamard}")
+        print(f"Answer (post Hadamard):    {generate_answer(model, tokenizer)}\n")
+    
+    
+    # model.save_pretrained('after_equalization_and_hadamard')
+    # tokenizer.save_pretrained('after_equalization_and_hadamard')
+    # return
+
+    answer1 = generate_answer(model, tokenizer)
+    print(f"Answer before mixed: {answer1}\n")
+    model = replace_linear_with_mixer(model, ratio=0.5)
+    torch.cuda.empty_cache()
+
+    answer2 = generate_answer(model, tokenizer)
+    print(f"Answer after mixed: {answer2}\n")
+    if answer1 != answer2:
+        print(
+            "The answers are different after replacing linear layers with LinearMIXER. This may be due to the fact that the model has not been fine-tuned yet, and the weights of the new LinearMIXER layers have been initialized based on the original linear layers. Fine-tuning the model with the new LinearMIXER layers should help to recover the original performance."
+        )
+        exit(1)
 
     # Create or load model to tune with Fake Quantizers and absorbable LoRA adapters.
     if args.resume and ckpt_file.exists():
@@ -447,7 +787,7 @@ def main(argv) -> float:
             inputs = form_batch(train_loader, model_input=True)
             with torch.no_grad():
                 cur_teacher_hiddens = form_batch(orig_hiddens, model_input=False)
-                targets = model.lm_head(cur_teacher_hiddens)
+                targets = teacher_lm_head(cur_teacher_hiddens)
                 if hasattr(model.config, "final_logit_softcapping"):  # Gemma has post-processing after lm_head
                     fls = model.config.final_logit_softcapping
                     if fls is not None:
@@ -462,8 +802,8 @@ def main(argv) -> float:
 
             # compute loss only for second half of the sequence, to let the model see enough context before computing loss and getting meaningful gradients for distillation
             kl_loss = kl_div(
-                logits[:, logits.shape[1] // 3 :],
-                targets[:, targets.shape[1] // 3 :].to(dtype=torch_dtype, device=device),
+                logits[:, cur_student_hiddens.shape[1] // 3 :],
+                targets[:, cur_student_hiddens.shape[1] // 3 :].to(dtype=torch_dtype, device=device),
             )
             l1_loss = F.l1_loss(
                 cur_student_hiddens[:, cur_student_hiddens.shape[1] // 3 :],

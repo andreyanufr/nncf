@@ -128,7 +128,7 @@ class ScaleEstimation:
             node_name = wp.node_with_weight.node_name
             config = wp.compression_config
 
-            if config.num_bits != 4 or node_name not in statistics:
+            if config.num_bits > 6 or node_name not in statistics:
                 res[weight_name] = CompressedWeight()
                 continue
 
@@ -315,6 +315,9 @@ class ScaleEstimation:
                 zero_mask = zero_scale * zero_mask.astype(weight.dtype)
 
         # iterative rectification of scale based on grid search
+        if config.num_bits == 2:
+            scale_steps = 20
+
         for scale_step in range(scale_steps):
             factor = 1.0 - 0.05 * scale_step
             scaled_scale = factor * scale

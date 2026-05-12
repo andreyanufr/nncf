@@ -46,7 +46,7 @@ class LinearINT4(nn.Module):
         return self.model_int4(x)
 
 
-class LinearMIXER(nn.Module):
+class LinearMIXERHorizontal(nn.Module):
     """
     class for mixing 4-bit and 2-bit quantization in the same linear layer. The output channels are split into two parts, one part is quantized to 4 bits and the other part is quantized to 2 bits.
     The ratio of the split is determined by the `ratio` parameter. The weights of the original linear layer are copied to the two new linear layers according to the split.
@@ -55,12 +55,14 @@ class LinearMIXER(nn.Module):
         nn (_type_): _description_
     """
 
-    def __init__(self, model: nn.Module, ratio=0.5):
+    def __init__(self, model: nn.Module, ratio=0.5, group_size=-1):
         super().__init__()
         if not isinstance(model, nn.Linear):
             raise ValueError("LinearMIXER can only be applied to nn.Linear modules.")
         self.ratio = ratio
-        self.int4_first = self.if_first_layers_more_sensitive(model.weight.data)
+        self.group_size = group_size
+        int4_first = self.if_first_layers_more_sensitive(model.weight.data)
+        self.register_buffer("int4_first", torch.tensor(int4_first, dtype=torch.bool))
 
         dim_div = int(model.out_features * self.ratio)
         out_channel_1 = dim_div
@@ -70,24 +72,21 @@ class LinearMIXER(nn.Module):
         dtype = model.weight.data.dtype
         bias = model.bias is not None
 
-        if self.int4_first:
-            self.model_int4 = nn.Linear(model.in_features, out_channel_1, bias=bias, device=device, dtype=dtype)
-            self.model_int2 = nn.Linear(model.in_features, out_channel_2, bias=bias, device=device, dtype=dtype)
+        self.model_int4 = nn.Linear(model.in_features, out_channel_1, bias=bias, device=device, dtype=dtype)
+        self.model_int2 = nn.Linear(model.in_features, out_channel_2, bias=bias, device=device, dtype=dtype)
 
+        if self.int4_first:
             self.model_int4.weight.data.copy_(model.weight.data[:out_channel_1])
             self.model_int2.weight.data.copy_(model.weight.data[out_channel_1:])
             if model.bias is not None:
                 self.model_int4.bias.data.copy_(model.bias.data[:out_channel_1])
                 self.model_int2.bias.data.copy_(model.bias.data[out_channel_1:])
         else:
-            self.model_int4 = nn.Linear(model.in_features, out_channel_2, bias=bias, device=device, dtype=dtype)
-            self.model_int2 = nn.Linear(model.in_features, out_channel_1, bias=bias, device=device, dtype=dtype)
-
-            self.model_int4.weight.data.copy_(model.weight.data[out_channel_1:])
-            self.model_int2.weight.data.copy_(model.weight.data[:out_channel_1])
+            self.model_int4.weight.data.copy_(model.weight.data[out_channel_2:])
+            self.model_int2.weight.data.copy_(model.weight.data[:out_channel_2])
             if model.bias is not None:
-                self.model_int4.bias.data.copy_(model.bias.data[out_channel_1:])
-                self.model_int2.bias.data.copy_(model.bias.data[:out_channel_1])
+                self.model_int4.bias.data.copy_(model.bias.data[out_channel_2:])
+                self.model_int2.bias.data.copy_(model.bias.data[:out_channel_2])
 
     def forward(self, x):
         if self.int4_first:
@@ -129,19 +128,22 @@ class LinearMIXER(nn.Module):
         :return: ``True`` if the first block is deemed more sensitive.
         """
         out_features = weight.shape[0]
+        in_features = weight.shape[1]
         block = int(out_features * self.ratio)
         if block <= 0 or block >= out_features:
             raise ValueError(f"Invalid block size {block} for out_features {out_features} and ratio {self.ratio}")
 
         w = weight.detach().float().abs()
+        if self.group_size > 0:
+            w = w.view(out_features, in_features // self.group_size, self.group_size)
         # Per-channel outlier score: peak-to-average ratio.
-        per_channel = w.amax(dim=1) / (w.mean(dim=1) + eps)
+        per_channel = w.amax(dim=-1) / (w.mean(dim=-1) + eps)
 
-        first = per_channel[:block]
-        last = per_channel[-block:]
+        first = per_channel[:block].flatten()
+        last = per_channel[-block:].flatten()
 
         # Robust aggregation: average of top-k (k = 10% of the block, at least 1).
-        k = max(1, block // 10)
+        k = max(1, first.numel() // 10)
         first_score = torch.topk(first, k).values.mean()
         last_score = torch.topk(last, k).values.mean()
 
@@ -173,6 +175,135 @@ class LinearMIXER(nn.Module):
         return linear_layer
 
 
+
+class LinearMIXER(nn.Module):
+    """
+    class for mixing 4-bit and 2-bit quantization in the same linear layer. The input channels are split into two parts, one part is quantized to 4 bits and the other part is quantized to 2 bits.
+    The ratio of the split is determined by the `ratio` parameter. The weights of the original linear layer are copied to the two new linear layers according to the split.
+    The forward pass concatenates the outputs of the two linear layers. The decision on which part of the input channels to quantize to 4 bits is based on a heuristic that checks if the first layers are more sensitive to quantization.
+    Args:
+        nn (_type_): _description_
+    """
+
+    def __init__(self, model: nn.Module, ratio=0.5, group_size=-1):
+        super().__init__()
+        if not isinstance(model, nn.Linear):
+            raise ValueError("LinearMIXER can only be applied to nn.Linear modules.")
+        self.ratio = ratio
+        self.group_size = group_size
+        int4_first = self.if_first_layers_more_sensitive(model.weight.data)
+        self.register_buffer("int4_first", torch.tensor(int4_first, dtype=torch.bool))
+
+        dim_div1 = int(model.in_features * self.ratio)
+        dim_div2 = model.in_features - dim_div1
+
+        device = model.weight.data.device
+        dtype = model.weight.data.dtype
+        bias = model.bias is not None
+
+        self.model_int4 = nn.Linear(dim_div1, model.out_features, bias=bias, device=device, dtype=dtype)
+        self.model_int2 = nn.Linear(dim_div2, model.out_features, bias=bias, device=device, dtype=dtype)
+
+        if self.int4_first:
+            self.model_int4.weight.data.copy_(model.weight.data[:, :dim_div1])
+            self.model_int2.weight.data.copy_(model.weight.data[:, dim_div1:])
+            if model.bias is not None:
+                self.model_int4.bias.data.copy_(model.bias.data)
+                self.model_int2.bias.data.copy_(model.bias.data)
+        else:
+            self.model_int4.weight.data.copy_(model.weight.data[:, dim_div2:])
+            self.model_int2.weight.data.copy_(model.weight.data[:, :dim_div2])
+            if model.bias is not None:
+                self.model_int4.bias.data.copy_(model.bias.data)
+                self.model_int2.bias.data.copy_(model.bias.data)
+
+    def forward(self, x):
+        if self.int4_first:
+            return self.model_int4(x[..., :self.model_int4.in_features]) + self.model_int2(x[..., self.model_int4.in_features:])
+        return self.model_int2(x[..., :self.model_int2.in_features]) + self.model_int4(x[..., self.model_int2.in_features:])
+
+    # def if_first_layers_more_sensitive(self, weight: Tensor) -> bool:
+    #     # This is a heuristic to determine if the first layers are more sensitive to quantization.
+    #     # It checks if the standard deviation of the weights in the first half of the output dimension is greater than the second half.
+    #     out_dim = int(weight.shape[0] * self.ratio)
+
+    #     first_half_mean = weight[:out_dim].std().item()
+    #     second_half_mean = weight[-out_dim:].std().item()
+    #     print(f"First half mean: {first_half_mean}, Second half mean: {second_half_mean}")
+    #     return first_half_mean > second_half_mean
+
+    def if_first_layers_more_sensitive(
+        self,
+        weight: Tensor,
+        *,
+        eps: float = 1e-6,
+        rel_margin: float = 0.05,
+    ) -> bool:
+        """
+        Decide whether the first output-channel block is more quantization-sensitive
+        than the last block of the same size.
+
+        Sensitivity per output channel is approximated by the ratio
+            max(|w|) / (mean(|w|) + eps)
+        which captures outlier-driven quantization error far better than a single std.
+        The two blocks are compared via the mean of the top-k channel scores
+        (robust to a handful of extreme channels). A relative margin avoids
+        flip-flopping on near-ties.
+
+        :param weight: 2D weight tensor of shape ``[out_features, in_features]``.
+        :param eps: Numerical stabilizer for the per-channel ratio.
+        :param rel_margin: Minimum relative gap required to declare the first block
+            more sensitive; otherwise returns ``False`` (deterministic tie-break).
+        :return: ``True`` if the first block is deemed more sensitive.
+        """
+        out_features = weight.shape[0]
+        in_features = weight.shape[1]
+        block = int(in_features * self.ratio)
+        if block <= 0 or block >= in_features:
+            raise ValueError(f"Invalid block size {block} for in_features {in_features} and ratio {self.ratio}")
+
+        w = weight.detach().float().abs()
+        # Per-channel outlier score: peak-to-average ratio.
+        per_channel = w.amax(dim=0) / (w.mean(dim=0) + eps)
+
+        first = per_channel[:block].flatten()
+        last = per_channel[-block:].flatten()
+
+        # Robust aggregation: average of top-k (k = 10% of the block, at least 1).
+        k = max(1, first.numel() // 10)
+        first_score = torch.topk(first, k).values.mean()
+        last_score = torch.topk(last, k).values.mean()
+
+        # Dead-zone to suppress noise-level flips.
+        return (first_score - last_score).item() > rel_margin * last_score.item()
+
+    def to_linear(self) -> nn.Linear:
+        """
+        Converts the LinearMIXER back to a standard nn.Linear layer by concatenating the weights and biases of the two linear layers.
+        The output channels are ordered according to the original order in the input linear layer.
+        Returns:
+            nn.Linear: The converted nn.Linear layer with the same output features as the original input linear layer.
+        """
+        out_features = self.model_int4.out_features
+        in_features = self.model_int4.in_features + self.model_int2.in_features
+        
+        device = self.model_int4.weight.data.device
+        dtype = self.model_int4.weight.data.dtype
+        bias = self.model_int4.bias is not None
+
+        linear_layer = nn.Linear(in_features, out_features, bias=bias, device=device, dtype=dtype)
+
+        if self.int4_first:
+            linear_layer.weight.data.copy_(torch.cat([self.model_int4.weight.data, self.model_int2.weight.data], dim=1))
+            if bias:
+                linear_layer.bias.data.copy_(self.model_int4.bias.data)
+        else:
+            linear_layer.weight.data.copy_(torch.cat([self.model_int2.weight.data, self.model_int4.weight.data], dim=1))
+            if bias:
+                linear_layer.bias.data.copy_(self.model_int2.bias.data)
+        return linear_layer
+
+
 def replace_linear_with_mixer(model: nn.Module, parent_name="", ratio=0.5, n_layers=-1) -> nn.Module:
     """
     Recursively replaces all nn.Linear modules in the given model with LinearMIXER modules.
@@ -192,12 +323,13 @@ def replace_linear_with_mixer(model: nn.Module, parent_name="", ratio=0.5, n_lay
             continue
         full_name = parent_name + "." + name if parent_name else name
         if isinstance(module, nn.Linear):
-            if ("v_proj" in name or "mlp" in parent_name) and ('.0.' in parent_name or f'.{n_layers}.' in parent_name):
-                print(f"Replacing {full_name} with LinearINT4")
-                setattr(model, name, LinearINT4(module))
-            else:
-                print(f"Replacing {full_name} with LinearMIXER")
-                setattr(model, name, LinearMIXER(module, ratio))
+            # if ("v_proj" in name or "mlp" in parent_name) and ('.0.' in parent_name or f'.{n_layers}.' in parent_name):
+            #     print(f"Replacing {full_name} with LinearINT4")
+            #     setattr(model, name, LinearINT4(module))
+            # else:
+            print(f"Replacing {full_name} with LinearMIXER")
+            setattr(model, name, LinearMIXER(module, ratio))
+            del module
         else:
             replace_linear_with_mixer(module, full_name, ratio=ratio, n_layers=n_layers)
     return model
@@ -213,6 +345,7 @@ def replace_mixer_with_linear(model: nn.Module) -> nn.Module:
     for name, module in model.named_children():
         if isinstance(module, LinearMIXER):
             setattr(model, name, module.to_linear())
+            del module
         elif isinstance(module, LinearINT4):
             setattr(model, name, module.model_int4)
         else:
@@ -231,10 +364,15 @@ def export_to_pytorch(pretrained: str, ckpt_file: Path, model_dir: Path) -> None
     :return: A wrapper of OpenVINO model ready for evaluation.
     """
     model_to_eval = AutoModelForCausalLM.from_pretrained(pretrained, torch_dtype=torch.bfloat16, device_map="cpu")
-    model_to_eval = replace_linear_with_mixer(model_to_eval)
+    model_to_eval = replace_linear_with_mixer(model_to_eval, ratio=0.5)
+    
+    # ckpt = torch.load(ckpt_file, weights_only=False, map_location="cpu")
+    # if "model_state" in ckpt:
+    #     model_to_eval.load_state_dict(ckpt["model_state"], strict=False)
+        
     model_to_eval = load_checkpoint(model_to_eval, ckpt_file)
-
     model_to_eval = nncf.strip(model_to_eval, do_copy=False, strip_format=StripFormat.IN_PLACE)
+    
     model_to_eval = replace_mixer_with_linear(model_to_eval)
 
     model_to_eval.save_pretrained(model_dir)
