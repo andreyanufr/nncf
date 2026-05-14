@@ -222,15 +222,6 @@ class LinearMIXER(nn.Module):
             return self.model_int4(x[..., :self.model_int4.in_features]) + self.model_int2(x[..., self.model_int4.in_features:])
         return self.model_int2(x[..., :self.model_int2.in_features]) + self.model_int4(x[..., self.model_int2.in_features:])
 
-    # def if_first_layers_more_sensitive(self, weight: Tensor) -> bool:
-    #     # This is a heuristic to determine if the first layers are more sensitive to quantization.
-    #     # It checks if the standard deviation of the weights in the first half of the output dimension is greater than the second half.
-    #     out_dim = int(weight.shape[0] * self.ratio)
-
-    #     first_half_mean = weight[:out_dim].std().item()
-    #     second_half_mean = weight[-out_dim:].std().item()
-    #     print(f"First half mean: {first_half_mean}, Second half mean: {second_half_mean}")
-    #     return first_half_mean > second_half_mean
 
     def if_first_layers_more_sensitive(
         self,
@@ -264,10 +255,13 @@ class LinearMIXER(nn.Module):
 
         w = weight.detach().float().abs()
         # Per-channel outlier score: peak-to-average ratio.
-        per_channel = w.amax(dim=0) / (w.mean(dim=0) + eps)
+        # per_channel = w.amax(dim=0) / (w.mean(dim=0) + eps)
 
-        first = per_channel[:block].flatten()
-        last = per_channel[-block:].flatten()
+        # first = per_channel[:block].flatten()
+        # last = per_channel[-block:].flatten()
+        first = w[:, :block].amax(dim=1) / (w[:, :block].mean(dim=1) + eps)
+        last = w[:, -block:].amax(dim=1) / (w[:, -block:].mean(dim=1) + eps)
+
 
         # Robust aggregation: average of top-k (k = 10% of the block, at least 1).
         k = max(1, first.numel() // 10)

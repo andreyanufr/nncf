@@ -76,6 +76,69 @@ def _find_mlp_groups(model: nn.Module) -> list[tuple[nn.Module, nn.Linear, list[
     return groups
 
 
+
+# ---------------------------------------------------------------------- #
+# MLP equalization (average up_proj/gate_proj input scale absorbed into layer norm weights)
+# ---------------------------------------------------------------------- #
+def _find_up_gate_groups(model: nn.Module) -> list[tuple[nn.Module, nn.Linear, list[nn.Linear]]]:
+    """
+    Collect ``(parent, down_proj, [producers])`` triples where ``producers``
+    are the sibling linears whose outputs are consumed by ``down_proj`` along
+    its input-channel dimension.
+
+    Recognized layouts:
+      * Llama-style: ``down_proj`` consumes ``up_proj`` * SiLU(``gate_proj``);
+        producers = ``[up_proj, gate_proj]``.
+      * Generic: only ``up_proj`` present -> producers = ``[up_proj]``.
+    """
+    groups: list[tuple[nn.Module, nn.Linear, list[nn.Linear]]] = []
+    for parent in model.modules():
+        if not hasattr(parent, "mlp"):
+            continue
+        mlp = getattr(parent, "mlp")
+        gate = getattr(mlp, "gate_proj", None)
+        if not isinstance(gate, nn.Linear):
+            continue
+        
+        up = getattr(mlp, "up_proj", None)
+        if not isinstance(up, nn.Linear):
+            continue
+
+        producer = None
+        for attr in ("post_attention_layernorm",):#, "gate_proj"):
+            sib = getattr(parent, attr, None)
+            producer = sib
+
+        if producer:
+            groups.append((up, gate, producer))
+    return groups
+
+
+@torch.no_grad()
+def equalize_up_gate_with_layernorm(model: nn.Module, eps: float = 1e-5) -> int:
+    groups = _find_up_gate_groups(model)
+    if not groups:
+        return 0
+
+    n_done = 0
+    for up, gate, producer in groups:
+        s_gate = gate.weight.abs().mean(dim=0).clamp_min(eps).to(device=gate.weight.device, dtype=gate.weight.dtype)
+        s_up = up.weight.abs().mean(dim=0).clamp_min(eps).to(device=up.weight.device, dtype=up.weight.dtype)
+        # up_proj theoretically more sensitive to quantization 
+        s = 0.1 * s_gate + 0.9 * s_up
+        # Divide down_proj input columns by s.
+        gate.weight.mul_(1.0 / s.unsqueeze(0))
+        up.weight.mul_(1.0 / s.unsqueeze(0))
+
+        # Scale producer output rows by s.
+        s_dev = s.to(device=producer.weight.device, dtype=producer.weight.dtype)
+        producer.weight.mul_(s_dev)
+        if hasattr(producer, "bias") and producer.bias is not None:
+            producer.bias.mul_(s_dev)
+        n_done += 1
+    return n_done
+
+
 @torch.no_grad()
 def equalize_down_proj(
     model: nn.Module,
@@ -353,6 +416,32 @@ def get_pile(num_samples: int, seqlen: int, tokenizer: Any, device: torch.device
     trainloader = []
     for example in ds:
         trainenc = tokenizer(example["text"], return_tensors="pt")
+        if trainenc.input_ids.shape[1] < seqlen:
+            continue
+        if trainenc.input_ids.shape[1] > seqlen + 1:
+            i = torch.randint(0, trainenc.input_ids.shape[1] - seqlen - 1, (1,)).item()
+        else:
+            i = 0
+        j = i + seqlen
+        inp = trainenc.input_ids[:, i:j].to(device)
+        trainloader.append(inp)
+        if len(trainloader) >= num_samples:
+            break
+
+    return trainloader
+
+
+def get_LLM_compression_calibration(num_samples: int, seqlen: int, tokenizer: Any, device: torch.device) -> list[Tensor]:
+    num_samples = 2048
+    ds = load_dataset("neuralmagic/LLM_compression_calibration", split="train")
+    ds = ds.shuffle().select(range(num_samples))
+
+    trainloader = []
+    for example in ds:
+        #trainenc = tokenizer(example["text"], return_tensors="pt")
+        text = tokenizer.apply_chat_template(example["messages"], add_generation_prompt=False, tokenize=False)
+
+        trainenc = tokenizer(text, return_tensors="pt")
         if trainenc.input_ids.shape[1] < seqlen:
             continue
         if trainenc.input_ids.shape[1] > seqlen + 1:
@@ -676,7 +765,8 @@ def main(argv) -> float:
         example_input = {k: v.to(device) for k, v in model.dummy_inputs.items()}
         dataset = Dataset([example_input])
     else:
-        calib_loader = get_pile(num_samples=128, seqlen=128, tokenizer=tokenizer, device=device)
+        #calib_loader = get_pile(num_samples=128, seqlen=128, tokenizer=tokenizer, device=device)
+        calib_loader = get_LLM_compression_calibration(num_samples=256, seqlen=512, tokenizer=tokenizer, device=device)
         dataset = Dataset(map(get_model_input, calib_loader))
 
     # Pre-compute hiddens of teacher model for distillation loss.
@@ -701,6 +791,8 @@ def main(argv) -> float:
     teacher_lm_head.eval().requires_grad_(False)
     if gpu_id is not None:
         teacher_lm_head = teacher_lm_head.to(f"cuda:{gpu_id}")
+    if hasattr(teacher_lm_head, "_old_forward"):
+        teacher_lm_head.forward = teacher_lm_head._old_forward
 
     # Optional pre-quantization equalization of down_proj input scale into
     # the producing up_proj / gate_proj output channels.
@@ -716,7 +808,11 @@ def main(argv) -> float:
         print(f"Equalized {n_eq} down_proj layers.")
         print(f"Answer before equalization: {answer_before_equalization}")
         print(f"Answer (post equalization):  {generate_answer(model, tokenizer)}\n")
-
+        
+        # n_eq = equalize_up_gate_with_layernorm(model)
+        # print(f"Equalized {n_eq} up_proj/gate_proj layers with preceding LayerNorm.\n")
+        # print(f"Answer (post equalization):  {generate_answer(model, tokenizer)}\n")
+        
     # Optional per-head Hadamard / orthogonal rotation between v_proj and o_proj.
     # Output-invariant; intended to flatten per-channel weight magnitudes seen by
     # the per-group quantizer of v_proj and o_proj.
@@ -751,10 +847,11 @@ def main(argv) -> float:
     else:
         model = compress_weights(model, dataset=dataset, **compression_config)
         save_checkpoint(model, ckpt_file, model_state=not args.basic_init)
-    fq_lr = args.lr / 10
+    fq_lr = args.lr #/ 10
     weight_decay = args.lr
     param_to_train = set_trainable(model, lora_lr=args.lr, fq_lr=fq_lr)
     opt = torch.optim.AdamW(param_to_train, weight_decay=weight_decay)
+    #opt = torch.optim.Muon(param_to_train, weight_decay=weight_decay)
 
     # Run tuning with distillation loss and validation after each epoch.
     grad_accumulation_steps = args.batch_size // args.microbatch_size
@@ -787,6 +884,7 @@ def main(argv) -> float:
             inputs = form_batch(train_loader, model_input=True)
             with torch.no_grad():
                 cur_teacher_hiddens = form_batch(orig_hiddens, model_input=False)
+                cur_teacher_hiddens = cur_teacher_hiddens.to(device=teacher_lm_head.weight.device)
                 targets = teacher_lm_head(cur_teacher_hiddens)
                 if hasattr(model.config, "final_logit_softcapping"):  # Gemma has post-processing after lm_head
                     fls = model.config.final_logit_softcapping

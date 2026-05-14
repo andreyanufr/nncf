@@ -316,7 +316,7 @@ class ScaleEstimation:
 
         # iterative rectification of scale based on grid search
         if config.num_bits == 2:
-            scale_steps = 20
+            scale_steps = 15
 
         for scale_step in range(scale_steps):
             factor = 1.0 - 0.05 * scale_step
