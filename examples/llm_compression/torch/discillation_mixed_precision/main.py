@@ -124,6 +124,10 @@ def equalize_up_gate_with_layernorm(model: nn.Module, eps: float = 1e-5) -> int:
     for up, gate, producer in groups:
         s_gate = gate.weight.abs().mean(dim=0).clamp_min(eps).to(device=gate.weight.device, dtype=gate.weight.dtype)
         s_up = up.weight.abs().mean(dim=0).clamp_min(eps).to(device=up.weight.device, dtype=up.weight.dtype)
+        
+        s_gate = s_gate / s_gate.norm(p=2, dim=0, keepdim=True)
+        s_up = s_up / s_up.norm(p=2, dim=0, keepdim=True)
+
         # up_proj theoretically more sensitive to quantization 
         s = 0.1 * s_gate + 0.9 * s_up
         # Divide down_proj input columns by s.
@@ -809,9 +813,9 @@ def main(argv) -> float:
         print(f"Answer before equalization: {answer_before_equalization}")
         print(f"Answer (post equalization):  {generate_answer(model, tokenizer)}\n")
         
-        # n_eq = equalize_up_gate_with_layernorm(model)
-        # print(f"Equalized {n_eq} up_proj/gate_proj layers with preceding LayerNorm.\n")
-        # print(f"Answer (post equalization):  {generate_answer(model, tokenizer)}\n")
+        n_eq = equalize_up_gate_with_layernorm(model)
+        print(f"Equalized {n_eq} up_proj/gate_proj layers with preceding LayerNorm.\n")
+        print(f"Answer (post equalization):  {generate_answer(model, tokenizer)}\n")
         
     # Optional per-head Hadamard / orthogonal rotation between v_proj and o_proj.
     # Output-invariant; intended to flatten per-channel weight magnitudes seen by
