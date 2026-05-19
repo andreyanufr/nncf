@@ -26,6 +26,7 @@ After training the script:
 
 This file does not depend on NNCF.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -37,12 +38,13 @@ from datetime import datetime
 from pathlib import Path
 from pprint import pprint
 from typing import Any
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
 import transformers
 from datasets import load_dataset
+from quant_lora_linear import QuantizedLoraLinear
+from quant_lora_linear import unwrap_linear_layers
 from torch import Tensor
 from torch import nn
 from torch.jit import TracerWarning
@@ -50,10 +52,6 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM
 from transformers import AutoTokenizer
-
-from quant_lora_linear import QuantizedLoraLinear
-from quant_lora_linear import unwrap_linear_layers
-from quant_lora_linear import wrap_linear_layers
 from utils import replace_linear_with_mixer
 from utils import replace_mixer_with_linear
 
@@ -150,6 +148,72 @@ def kl_div(student_hiddens: Tensor, teacher_hiddens: Tensor) -> Tensor:
 
 
 # ---------------------------------------------------------------------- #
+# MLP equalization (average up_proj/gate_proj input scale absorbed into layer norm weights)
+# ---------------------------------------------------------------------- #
+def _find_up_gate_groups(model: nn.Module) -> list[tuple[nn.Module, nn.Linear, list[nn.Linear]]]:
+    """
+    Collect ``(parent, down_proj, [producers])`` triples where ``producers``
+    are the sibling linears whose outputs are consumed by ``down_proj`` along
+    its input-channel dimension.
+
+    Recognized layouts:
+      * Llama-style: ``down_proj`` consumes ``up_proj`` * SiLU(``gate_proj``);
+        producers = ``[up_proj, gate_proj]``.
+      * Generic: only ``up_proj`` present -> producers = ``[up_proj]``.
+    """
+    groups: list[tuple[nn.Module, nn.Linear, list[nn.Linear]]] = []
+    for parent in model.modules():
+        if not hasattr(parent, "mlp"):
+            continue
+        mlp = getattr(parent, "mlp")
+        gate = getattr(mlp, "gate_proj", None)
+        if not isinstance(gate, nn.Linear):
+            continue
+
+        up = getattr(mlp, "up_proj", None)
+        if not isinstance(up, nn.Linear):
+            continue
+
+        producer = None
+        for attr in ("post_attention_layernorm",):  # , "gate_proj"):
+            sib = getattr(parent, attr, None)
+            producer = sib
+
+        if producer:
+            groups.append((up, gate, producer))
+    return groups
+
+
+@torch.no_grad()
+def equalize_up_gate_with_layernorm(model: nn.Module, eps: float = 1e-5) -> int:
+    groups = _find_up_gate_groups(model)
+    if not groups:
+        return 0
+
+    n_done = 0
+    for up, gate, producer in groups:
+        s_gate = gate.weight.abs().mean(dim=0).clamp_min(eps).to(device=gate.weight.device, dtype=gate.weight.dtype)
+        s_up = up.weight.abs().mean(dim=0).clamp_min(eps).to(device=up.weight.device, dtype=up.weight.dtype)
+
+        s_gate = s_gate / s_gate.norm(p=2, dim=0, keepdim=True)
+        s_up = s_up / s_up.norm(p=2, dim=0, keepdim=True)
+
+        # up_proj theoretically more sensitive to quantization
+        s = 0.1 * s_gate + 0.9 * s_up
+        # Divide down_proj input columns by s.
+        gate.weight.mul_(1.0 / s.unsqueeze(0))
+        up.weight.mul_(1.0 / s.unsqueeze(0))
+
+        # Scale producer output rows by s.
+        s_dev = s.to(device=producer.weight.device, dtype=producer.weight.dtype)
+        producer.weight.mul_(s_dev)
+        if hasattr(producer, "bias") and producer.bias is not None:
+            producer.bias.mul_(s_dev)
+        n_done += 1
+    return n_done
+
+
+# ---------------------------------------------------------------------- #
 # MLP equalization (down_proj input scale absorbed into up_proj/gate_proj)
 # ---------------------------------------------------------------------- #
 def _find_mlp_groups(model: nn.Module) -> list[tuple[nn.Module, nn.Linear, list[nn.Linear]]]:
@@ -169,7 +233,7 @@ def _find_mlp_groups(model: nn.Module) -> list[tuple[nn.Module, nn.Linear, list[
         if not isinstance(down, nn.Linear):
             continue
         producers: list[nn.Linear] = []
-        for attr in ("up_proj",):#, "gate_proj"):
+        for attr in ("up_proj",):  # , "gate_proj"):
             sib = getattr(parent, attr, None)
             if isinstance(sib, nn.Linear) and sib.out_features == down.in_features:
                 producers.append(sib)
@@ -219,6 +283,7 @@ def equalize_down_proj(
     counts: dict[int, int] = {}
     handles = []
     for _, down, _ in groups:
+
         def make_hook(key: int):
             def hook(_mod, args):
                 x = args[0].detach()
@@ -230,7 +295,9 @@ def equalize_down_proj(
                 else:
                     abs_sum[key] = a
                     counts[key] = x_flat.shape[0]
+
             return hook
+
         handles.append(down.register_forward_pre_hook(make_hook(id(down))))
 
     was_training = model.training
@@ -286,12 +353,12 @@ def _build_hadamard(n: int, device: torch.device, dtype: torch.dtype) -> Tensor:
     while h.shape[0] < n:
         h = torch.cat(
             [
-                torch.cat([h,  h], dim=1),
+                torch.cat([h, h], dim=1),
                 torch.cat([h, -h], dim=1),
             ],
             dim=0,
         )
-    h = h / (n ** 0.5)
+    h = h / (n**0.5)
     return h.to(device=device, dtype=dtype)
 
 
@@ -397,9 +464,7 @@ def equalize_v_o_with_hadamard(model: nn.Module, seed: int = 0) -> int:
         try:
             h_mat = _build_hadamard(head_dim, device=device, dtype=dtype)
         except ValueError:
-            h_mat = _build_random_orthogonal(
-                head_dim, device=device, dtype=dtype, seed=seed + layer_idx
-            )
+            h_mat = _build_random_orthogonal(head_dim, device=device, dtype=dtype, seed=seed + layer_idx)
         h_t = h_mat.t().contiguous()
 
         # v_proj: rows for KV head h_kv occupy [h_kv*head_dim : (h_kv+1)*head_dim].
@@ -469,6 +534,7 @@ def run_scale_estimation(
 
     handles = []
     for name, module in layers:
+
         def make_hook(n: str):
             def hook(_mod, args):
                 x = args[0].detach()
@@ -484,7 +550,9 @@ def run_scale_estimation(
                     take = min(subset_size - samples_count[n], x_flat.shape[0])
                     samples[n].append(x_flat[:take].cpu())
                     samples_count[n] += take
+
             return hook
+
         handles.append(module.register_forward_pre_hook(make_hook(name)))
 
     was_training = model.training
@@ -502,9 +570,9 @@ def run_scale_estimation(
         if name not in abs_sum or samples_count[name] == 0:
             continue
         s = abs_sum[name] / max(counts[name], 1)
-        x = torch.cat(samples[name], dim=0).to(module.weight.device)
+        x = torch.cat(samples[name], dim=0).to(module.module.weight.device)
         module.apply_scale_estimation(
-            s_per_channel=s.to(module.weight.device),
+            s_per_channel=s.to(module.module.weight.device),
             x_calib=x,
             initial_steps=initial_steps,
             scale_steps=scale_steps,
@@ -520,7 +588,7 @@ def _collect_layer_calibration(
     model: nn.Module,
     calib_inputs: list[Tensor],
     subset_size: int,
-    only_num_bits: Optional[set[int]] = None,
+    only_num_bits: set[int] | None = None,
 ) -> tuple[
     list[tuple[str, QuantizedLoraLinear]],
     dict[str, Tensor],
@@ -558,6 +626,7 @@ def _collect_layer_calibration(
 
     handles = []
     for name, module in layers:
+
         def make_hook(n: str):
             def hook(_mod, args):
                 x = args[0].detach()
@@ -573,7 +642,9 @@ def _collect_layer_calibration(
                     take = min(subset_size - samples_count[n], x_flat.shape[0])
                     samples[n].append(x_flat[:take].cpu())
                     samples_count[n] += take
+
             return hook
+
         handles.append(module.register_forward_pre_hook(make_hook(name)))
 
     was_training = model.training
@@ -588,89 +659,6 @@ def _collect_layer_calibration(
             model.train()
 
     return layers, abs_sum, samples, samples_count, counts
-
-
-@torch.no_grad()
-def run_gptq_init(
-    model: nn.Module,
-    calib_inputs: list[Tensor],
-    subset_size: int = 256,
-    percdamp: float = 0.01,
-    only_num_bits: Optional[set[int]] = None,
-) -> int:
-    """
-    Initialize :class:`QuantizedLoraLinear` modules with GPTQ/OBQ
-    compensation on a small calibration subset.
-
-    :param subset_size: Number of input rows kept per layer for the Hessian.
-    :param percdamp: Diagonal damping fraction for the Hessian inverse.
-    :param only_num_bits: If given, only layers with these bit-widths are
-        re-initialized (e.g. ``{2}`` to focus the budget on INT2).
-    :return: Number of layers initialized.
-    """
-    layers, _, samples, samples_count, _ = _collect_layer_calibration(
-        model, calib_inputs, subset_size=subset_size, only_num_bits=only_num_bits,
-    )
-    n_done = 0
-    for name, module in tqdm(layers, desc="GPTQ init"):
-        if samples_count.get(name, 0) == 0:
-            continue
-        x = torch.cat(samples[name], dim=0).to(module.weight.device)
-        module.init_from_gptq(x_calib=x, percdamp=percdamp)
-        # Free the per-layer cache as we go.
-        samples[name].clear()
-        n_done += 1
-    return n_done
-
-
-# ---------------------------------------------------------------------- #
-# Per-group MSE clip search
-# ---------------------------------------------------------------------- #
-@torch.no_grad()
-def run_clip_search(
-    model: nn.Module,
-    calib_inputs: Optional[list[Tensor]] = None,
-    num_steps: int = 21,
-    min_factor: float = 0.5,
-    max_factor: float = 1.0,
-    only_num_bits: Optional[set[int]] = None,
-) -> int:
-    """
-    Apply :meth:`QuantizedLoraLinear.apply_clip_search` to every wrapped
-    layer (optionally filtered by bit-width). When ``calib_inputs`` is
-    provided, per-channel activation magnitudes are used as MSE weights;
-    otherwise the search uses uniform weighting.
-
-    :param num_steps: Grid resolution.
-    :param min_factor: Smallest clip factor.
-    :param max_factor: Largest clip factor (``1.0`` keeps the current scale).
-    :param only_num_bits: If given, only refine layers with these bit-widths.
-    :return: Number of layers refined.
-    """
-    importance_per_layer: dict[str, Tensor] = {}
-    if calib_inputs is not None:
-        _, abs_sum, _, _, counts = _collect_layer_calibration(
-            model, calib_inputs, subset_size=0, only_num_bits=only_num_bits,
-        )
-        for name, a in abs_sum.items():
-            importance_per_layer[name] = (a / max(counts[name], 1)).contiguous()
-
-    n_done = 0
-    for name, module in tqdm(
-        [(n, m) for n, m in model.named_modules() if isinstance(m, QuantizedLoraLinear)],
-        desc="Clip search",
-    ):
-        if only_num_bits is not None and module.num_bits not in only_num_bits:
-            continue
-        imp = importance_per_layer.get(name)
-        module.apply_clip_search(
-            num_steps=num_steps,
-            min_factor=min_factor,
-            max_factor=max_factor,
-            importance=imp.to(module.weight.device) if imp is not None else None,
-        )
-        n_done += 1
-    return n_done
 
 
 # ---------------------------------------------------------------------- #
@@ -714,6 +702,7 @@ def _wrap_mixer_linears(
                 log_scale=log_scale,
             ).to(device=child.weight.device, dtype=child.weight.dtype)
             setattr(parent, attr_name, wrapped)
+            print(attr_name, wrapped.module.weight.min().item(), wrapped.module.weight.max().item())
     return model
 
 
@@ -757,10 +746,7 @@ def set_trainable(
     params = list(model.parameters())
     trainable = sum(p.numel() for p in params if p.requires_grad)
     total = sum(p.numel() for p in params)
-    print(
-        f"trainable params: {trainable:,d} || all params: {total:,d} || "
-        f"trainable%: {100 * trainable / total:.4f}"
-    )
+    print(f"trainable params: {trainable:,d} || all params: {total:,d} || trainable%: {100 * trainable / total:.4f}")
     print(
         f"  LoRA params:    {sum(p.numel() for p in adapters_to_train):,d} @ lr={lora_lr}\n"
         f"  INT4 scales:    {sum(p.numel() for p in scales_int4):,d} @ lr={fq_lr_int4}\n"
@@ -872,19 +858,18 @@ def estimate_quantized_size(model: nn.Module) -> dict[str, float]:
         elements_per_bits[_EMBEDDING_BITS] = elements_per_bits.get(_EMBEDDING_BITS, 0) + numel
         if isinstance(emb_module, nn.Linear) and emb_module.bias is not None:
             bits_embed += emb_module.bias.numel() * _DEFAULT_FP_BITS
-            elements_per_bits[_DEFAULT_FP_BITS] = (
-                elements_per_bits.get(_DEFAULT_FP_BITS, 0) + emb_module.bias.numel()
-            )
+            elements_per_bits[_DEFAULT_FP_BITS] = elements_per_bits.get(_DEFAULT_FP_BITS, 0) + emb_module.bias.numel()
 
     # Quantized linears.
     for module in model.modules():
         if not isinstance(module, QuantizedLoraLinear):
             continue
-        w_id = id(module.weight)
+
+        w_id = id(module.module.weight)
         if w_id in seen_ids:
             continue
         seen_ids.add(w_id)
-        numel = module.weight.numel()
+        numel = module.module.weight.numel()
         bits_quant_weights += numel * module.num_bits
         elements_per_bits[module.num_bits] = elements_per_bits.get(module.num_bits, 0) + numel
         n_groups = module.out_features * module.num_groups
@@ -895,10 +880,10 @@ def estimate_quantized_size(model: nn.Module) -> dict[str, float]:
             bits_lora += (module.lora_a.numel() + module.lora_b.numel()) * _DEFAULT_FP_BITS
             # LoRA adapters intentionally not added to elements_per_bits:
             # they are folded into the weights when the model is unwrapped.
-        if module.bias is not None:
-            bits_other += module.bias.numel() * _DEFAULT_FP_BITS
+        if module.module.bias is not None:
+            bits_other += module.module.bias.numel() * _DEFAULT_FP_BITS
             elements_per_bits[_DEFAULT_FP_BITS] = (
-                elements_per_bits.get(_DEFAULT_FP_BITS, 0) + module.bias.numel()
+                elements_per_bits.get(_DEFAULT_FP_BITS, 0) + module.module.bias.numel()
             )
 
     # Everything else.
@@ -929,10 +914,10 @@ def report_quantized_size(model: nn.Module) -> None:
     print("Estimated quantized model size:")
     print(f"  total: {info['total_mib']:.2f} MiB ({info['total_bytes']:.0f} bytes)")
     print(f"  - quantized weights : {info['quant_weight_bits'] / 8 / (1024 * 1024):.2f} MiB")
-    print(f"  - scales/zero-points: {info['quant_meta_bits']  / 8 / (1024 * 1024):.2f} MiB")
-    print(f"  - LoRA adapters     : {info['lora_bits']        / 8 / (1024 * 1024):.2f} MiB")
-    print(f"  - embed/lm_head (8b): {info['embed_bits']       / 8 / (1024 * 1024):.2f} MiB")
-    print(f"  - other (fp16)      : {info['other_bits']       / 8 / (1024 * 1024):.2f} MiB")
+    print(f"  - scales/zero-points: {info['quant_meta_bits'] / 8 / (1024 * 1024):.2f} MiB")
+    print(f"  - LoRA adapters     : {info['lora_bits'] / 8 / (1024 * 1024):.2f} MiB")
+    print(f"  - embed/lm_head (8b): {info['embed_bits'] / 8 / (1024 * 1024):.2f} MiB")
+    print(f"  - other (fp16)      : {info['other_bits'] / 8 / (1024 * 1024):.2f} MiB")
 
     elements_per_bits: dict[int, int] = info["elements_per_bits"]
     total_elements = sum(elements_per_bits.values())
@@ -968,10 +953,18 @@ def get_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Absorb per-input-channel activation magnitude of down_proj into up_proj/gate_proj before quantization.",
     )
-    parser.add_argument("--eq_num_calib_samples", type=int, default=128,
-                        help="Number of calibration samples for down_proj equalization.")
-    parser.add_argument("--eq_calib_seqlen", type=int, default=128,
-                        help="Sequence length of calibration samples for down_proj equalization.")
+    parser.add_argument(
+        "--eq_num_calib_samples",
+        type=int,
+        default=128,
+        help="Number of calibration samples for down_proj equalization.",
+    )
+    parser.add_argument(
+        "--eq_calib_seqlen",
+        type=int,
+        default=128,
+        help="Sequence length of calibration samples for down_proj equalization.",
+    )
     parser.add_argument(
         "--hadamard_vo",
         action="store_true",
@@ -1000,12 +993,15 @@ def get_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Refine per-group scales with NNCF-style scale estimation before training.",
     )
-    parser.add_argument("--se_num_calib_samples", type=int, default=128,
-                        help="Number of calibration samples for scale estimation.")
-    parser.add_argument("--se_calib_seqlen", type=int, default=128,
-                        help="Sequence length of calibration samples for scale estimation.")
-    parser.add_argument("--se_subset_size", type=int, default=32,
-                        help="Per-layer rows kept for the per-group MSE objective.")
+    parser.add_argument(
+        "--se_num_calib_samples", type=int, default=128, help="Number of calibration samples for scale estimation."
+    )
+    parser.add_argument(
+        "--se_calib_seqlen", type=int, default=128, help="Sequence length of calibration samples for scale estimation."
+    )
+    parser.add_argument(
+        "--se_subset_size", type=int, default=32, help="Per-layer rows kept for the per-group MSE objective."
+    )
     parser.add_argument("--se_initial_steps", type=int, default=5)
     parser.add_argument("--se_scale_steps", type=int, default=10)
     parser.add_argument("--se_weight_penalty", type=float, default=-1.0)
@@ -1023,8 +1019,9 @@ def get_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--gptq_num_calib_samples", type=int, default=128)
     parser.add_argument("--gptq_calib_seqlen", type=int, default=512)
-    parser.add_argument("--gptq_subset_size", type=int, default=512,
-                        help="Per-layer rows kept for the activation Hessian.")
+    parser.add_argument(
+        "--gptq_subset_size", type=int, default=512, help="Per-layer rows kept for the activation Hessian."
+    )
     parser.add_argument("--gptq_percdamp", type=float, default=0.01)
 
     # Per-group MSE clip search
@@ -1059,15 +1056,21 @@ def get_argument_parser() -> argparse.ArgumentParser:
     )
 
     # Training
-    parser.add_argument("--lr", type=float, default=1e-4,
-                        help="Base learning rate for LoRA adapters (and default for fq scales).")
-    parser.add_argument("--lora_lr", type=float, default=None,
-                        help="Learning rate for LoRA adapters. Defaults to --lr.")
-    parser.add_argument("--fq_lr_int4", type=float, default=None,
-                        help="Learning rate for INT4 (and other non-INT2) per-group scales. "
-                        "Defaults to --lr / 10.")
-    parser.add_argument("--fq_lr_int2", type=float, default=None,
-                        help="Learning rate for INT2 per-group scales. Defaults to --lr / 2.")
+    parser.add_argument(
+        "--lr", type=float, default=1e-4, help="Base learning rate for LoRA adapters (and default for fq scales)."
+    )
+    parser.add_argument(
+        "--lora_lr", type=float, default=None, help="Learning rate for LoRA adapters. Defaults to --lr."
+    )
+    parser.add_argument(
+        "--fq_lr_int4",
+        type=float,
+        default=None,
+        help="Learning rate for INT4 (and other non-INT2) per-group scales. Defaults to --lr / 10.",
+    )
+    parser.add_argument(
+        "--fq_lr_int2", type=float, default=None, help="Learning rate for INT2 per-group scales. Defaults to --lr / 2."
+    )
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--microbatch_size", type=int, default=2)
@@ -1159,6 +1162,11 @@ def main(argv: list[str]) -> None:
         print(f"Answer before equalization: {answer_before_equalization}")
         print(f"Answer (post equalization):  {generate_answer(model, tokenizer)}\n")
 
+        n_eq = equalize_up_gate_with_layernorm(model)
+        print(f"Equalized {n_eq} up_proj/gate_proj layers with layernorm.")
+        print(f"Answer before equalization: {answer_before_equalization}")
+        print(f"Answer (post equalization):  {generate_answer(model, tokenizer)}\n")
+
     # Optional per-head Hadamard / orthogonal rotation between v_proj and o_proj.
     # Output-invariant; intended to flatten per-channel weight magnitudes seen by
     # the per-group quantizer of v_proj and o_proj.
@@ -1190,49 +1198,8 @@ def main(argv: list[str]) -> None:
         log_scale=args.log_scale,
     )
 
-    # Optional GPTQ/OBQ initialization on a calibration subset.
-    if args.gptq_init:
-        gptq_loader = get_pile(
-            num_samples=args.gptq_num_calib_samples,
-            seqlen=args.gptq_calib_seqlen,
-            tokenizer=tokenizer,
-            device=device,
-        )
-        only_bits = {args.num_bits_int2} if args.gptq_int2_only else None
-        n_gptq = run_gptq_init(
-            model,
-            calib_inputs=gptq_loader,
-            subset_size=args.gptq_subset_size,
-            percdamp=args.gptq_percdamp,
-            only_num_bits=only_bits,
-        )
-        print(f"GPTQ-initialized {n_gptq} layers.")
-        print(f"Answer (post GPTQ init): {generate_answer(model, tokenizer)}\n")
-
-    # Optional per-group MSE clip search on the per-group scales.
-    if args.clip_search:
-        clip_loader = None
-        if args.clip_search_use_activations:
-            clip_loader = get_pile(
-                num_samples=args.clip_num_calib_samples,
-                seqlen=args.clip_calib_seqlen,
-                tokenizer=tokenizer,
-                device=device,
-            )
-        only_bits = {args.num_bits_int2} if args.clip_search_int2_only else None
-        n_clip = run_clip_search(
-            model,
-            calib_inputs=clip_loader,
-            num_steps=args.clip_search_num_steps,
-            min_factor=args.clip_search_min_factor,
-            max_factor=args.clip_search_max_factor,
-            only_num_bits=only_bits,
-        )
-        print(f"Clip-search refined {n_clip} layers.")
-        print(f"Answer (post clip search): {generate_answer(model, tokenizer)}\n")
-
     # Optional NNCF-style scale estimation on a small calibration subset.
-    if args.scale_estimation:
+    if args.scale_estimation and False:
         calib_loader = get_pile(
             num_samples=args.se_num_calib_samples,
             seqlen=args.se_calib_seqlen,
@@ -1375,13 +1342,13 @@ def main(argv: list[str]) -> None:
     model.eval()
     unwrap_linear_layers(model)
     replace_mixer_with_linear(model)
-    
+
     dequant_dir = last_dir / "dequantized_model"
     dequant_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(dequant_dir)
     tokenizer.save_pretrained(dequant_dir)
     print(f"Dequantized model saved to: {dequant_dir}")
-    
+
     with torch.no_grad():
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             print(f"Answer after epoch {epoch}: {generate_answer(model, tokenizer)}\n")

@@ -175,7 +175,6 @@ class LinearMIXERHorizontal(nn.Module):
         return linear_layer
 
 
-
 class LinearMIXER(nn.Module):
     """
     class for mixing 4-bit and 2-bit quantization in the same linear layer. The input channels are split into two parts, one part is quantized to 4 bits and the other part is quantized to 2 bits.
@@ -219,9 +218,12 @@ class LinearMIXER(nn.Module):
 
     def forward(self, x):
         if self.int4_first:
-            return self.model_int4(x[..., :self.model_int4.in_features]) + self.model_int2(x[..., self.model_int4.in_features:])
-        return self.model_int2(x[..., :self.model_int2.in_features]) + self.model_int4(x[..., self.model_int2.in_features:])
-
+            return self.model_int4(x[..., : self.model_int4.in_features]) + self.model_int2(
+                x[..., self.model_int4.in_features :]
+            )
+        return self.model_int2(x[..., : self.model_int2.in_features]) + self.model_int4(
+            x[..., self.model_int2.in_features :]
+        )
 
     def if_first_layers_more_sensitive(
         self,
@@ -262,7 +264,6 @@ class LinearMIXER(nn.Module):
         first = w[:, :block].amax(dim=1) / (w[:, :block].mean(dim=1) + eps)
         last = w[:, -block:].amax(dim=1) / (w[:, -block:].mean(dim=1) + eps)
 
-
         # Robust aggregation: average of top-k (k = 10% of the block, at least 1).
         k = max(1, first.numel() // 10)
         first_score = torch.topk(first, k).values.mean()
@@ -280,7 +281,7 @@ class LinearMIXER(nn.Module):
         """
         out_features = self.model_int4.out_features
         in_features = self.model_int4.in_features + self.model_int2.in_features
-        
+
         device = self.model_int4.weight.data.device
         dtype = self.model_int4.weight.data.dtype
         bias = self.model_int4.bias is not None
@@ -359,14 +360,14 @@ def export_to_pytorch(pretrained: str, ckpt_file: Path, model_dir: Path) -> None
     """
     model_to_eval = AutoModelForCausalLM.from_pretrained(pretrained, torch_dtype=torch.bfloat16, device_map="cpu")
     model_to_eval = replace_linear_with_mixer(model_to_eval, ratio=0.5)
-    
+
     # ckpt = torch.load(ckpt_file, weights_only=False, map_location="cpu")
     # if "model_state" in ckpt:
     #     model_to_eval.load_state_dict(ckpt["model_state"], strict=False)
-        
+
     model_to_eval = load_checkpoint(model_to_eval, ckpt_file)
     model_to_eval = nncf.strip(model_to_eval, do_copy=False, strip_format=StripFormat.IN_PLACE)
-    
+
     model_to_eval = replace_mixer_with_linear(model_to_eval)
 
     model_to_eval.save_pretrained(model_dir)

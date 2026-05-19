@@ -17,25 +17,42 @@ from torch import nn
 import nncf
 from nncf.common.graph.graph import NNCFGraph
 from nncf.common.graph.layer_attributes import ConstantLayerAttributes
+from nncf.common.logging.track_progress import track
 from nncf.parameters import StripFormat
 from nncf.torch.function_hook.hook_storage import decode_hook_name
 from nncf.torch.function_hook.nncf_graph.nncf_graph_builder import build_nncf_graph
 from nncf.torch.function_hook.pruning.magnitude.modules import UnstructuredPruningMask
 from nncf.torch.function_hook.pruning.rb.modules import RBPruningMask
+from nncf.torch.function_hook.wrapper import ATR_HOOK_STORAGE
 from nncf.torch.function_hook.wrapper import get_hook_storage
 from nncf.torch.model_graph_manager import get_const_data
 from nncf.torch.model_graph_manager import get_const_node
 from nncf.torch.model_graph_manager import get_module_by_name
 from nncf.torch.model_graph_manager import split_const_name
+from nncf.torch.quantization.layers import AsymmetricLoraQuantizer
 from nncf.torch.quantization.layers import AsymmetricQuantizer
 from nncf.torch.quantization.layers import BaseQuantizer
 from nncf.torch.quantization.layers import BaseWeightsDecompressor
+from nncf.torch.quantization.layers import SymmetricLoraQuantizer
 from nncf.torch.quantization.layers import SymmetricQuantizer
 from nncf.torch.quantization.strip import asym_fq_to_decompressor
 from nncf.torch.quantization.strip import convert_to_torch_fakequantizer
+from nncf.torch.quantization.strip import get_quantized_weight_for_nncf_linear
 from nncf.torch.quantization.strip import sym_fq_to_decompressor
 
 TModel = TypeVar("TModel", bound=nn.Module)
+
+
+class _QuantizationConfig:
+    """Minimal quantization config container compatible with HuggingFace model configs."""
+
+    def to_dict(self) -> dict:
+        """
+        Returns a dictionary representation of the quantization config.
+
+        :return: Dictionary of all config attributes.
+        """
+        return vars(self)
 
 
 def strip_model(model: TModel, example_input: Any = None, strip_format: StripFormat = StripFormat.NATIVE) -> TModel:
@@ -59,6 +76,8 @@ def strip_model(model: TModel, example_input: Any = None, strip_format: StripFor
         model = replace_quantizer_to_compressed_weight_with_decompressor(model)
     elif strip_format == StripFormat.IN_PLACE:
         model = apply_compression_in_place(model)
+    elif strip_format == StripFormat.OV:
+        model = replace_quantizer_to_compressed_weight_with_nncf_linear(model)
     else:
         msg = f"Unsupported strip format: {strip_format}"
         raise nncf.ParameterNotSupportedError(msg)
@@ -126,7 +145,7 @@ def replace_quantizer_to_compressed_weight_with_decompressor(model: TModel) -> T
         msg = ""
         if hook_module._qspec.half_range or hook_module._qspec.narrow_range:
             msg += "Unexpected parameters of quantizers on strip: half_range and narrow_range should be False.\n"
-        if hook_module.num_bits not in [4, 8]:
+        if hook_module.num_bits not in [2, 4, 8]:
             msg += f"Unsupported number of bits {hook_module.num_bits} for the quantizer {hook_module}.\n"
         if msg:
             raise nncf.ValidationError(msg)
@@ -147,6 +166,80 @@ def replace_quantizer_to_compressed_weight_with_decompressor(model: TModel) -> T
         weight_param.data = packed_tensor
 
         hook_storage.set_submodule(hook_name, decompressor)
+    return model
+
+
+@torch.no_grad()
+def replace_quantizer_to_compressed_weight_with_nncf_linear(model: TModel) -> TModel:
+    """
+    Performs transformation from fake quantize format (FQ) to dequantization one (DQ):
+        (weights + FQ) -> (compressed_weights + DQ)
+
+    :param model: Compressed model
+    :return: The modified NNCF network.
+    """
+    from nncf.experimental.torch.qlinear import create_nncf_qlinear  # Importing here to avoid circular import
+
+    hook_storage = get_hook_storage(model)
+
+    for hook_name, hook_module in track(
+        list(hook_storage.named_hooks()), description="Converting to OV conversion format"
+    ):
+        if not isinstance(
+            hook_module, (SymmetricQuantizer, AsymmetricQuantizer, SymmetricLoraQuantizer, AsymmetricLoraQuantizer)
+        ):
+            continue
+        msg = ""
+        if hook_module._qspec.half_range or hook_module._qspec.narrow_range:
+            msg += "Unexpected parameters of quantizers on strip: half_range and narrow_range should be False.\n"
+        if hook_module.num_bits not in [2, 3, 4, 8]:
+            msg += f"Unsupported number of bits {hook_module.num_bits} for the quantizer {hook_module}.\n"
+        if msg:
+            raise nncf.ValidationError(msg)
+
+        _, op_name, _ = decode_hook_name(hook_name)
+
+        module_name, weight_attr_name = split_const_name(op_name)
+        module = get_module_by_name(module_name, model)
+        weight_param = getattr(module, weight_attr_name)
+
+        if not isinstance(module, nn.Linear):
+            # For non-Linear modules the hook storage is deleted at the end of this function,
+            # so a decompressor hook would be orphaned and never called during tracing.
+            # Instead, apply the quantizer in-place (quantize-dequantize) to preserve
+            # quantization error while keeping the weight as float.
+            weight_param.requires_grad = False
+            weight_param.data = hook_module.quantize(weight_param)
+            continue
+
+        q_weight, zero_point, scale, sym, num_bits, group_size, bias = get_quantized_weight_for_nncf_linear(
+            hook_module, weight_param
+        )
+
+        new_linear = create_nncf_qlinear(q_weight, zero_point, scale, num_bits, group_size, bias, symmetric=sym)
+
+        del hook_module
+
+        if module_name.count(".") == 0:
+            # Top-level module
+            setattr(model, module_name, new_linear)
+        else:
+            parent_module_name, module_child_name = module_name.rsplit(".", 1)
+            parent_module = get_module_by_name(parent_module_name, model)
+            setattr(parent_module, module_child_name, new_linear)
+
+    # Unwrap the model to avoid conflicts with TorchFunctionMode
+    model.forward = model.forward.orig_forward
+    delattr(model, ATR_HOOK_STORAGE)
+
+    if not hasattr(model, "config"):
+        model.config = type("", (), {})()  # Create an empty object for config
+        model.config.quantization_config = _QuantizationConfig()
+    else:
+        if not hasattr(model.config, "quantization_config"):
+            model.config.quantization_config = _QuantizationConfig()
+    model.config.quantization_config.quant_method = "nncf"
+
     return model
 
 

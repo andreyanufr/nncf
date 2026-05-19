@@ -9,11 +9,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
+import copy
 import shutil
 import sys
 import warnings
 from datetime import datetime
-import copy
 from pathlib import Path
 from pprint import pprint
 from typing import Any
@@ -67,14 +67,13 @@ def _find_mlp_groups(model: nn.Module) -> list[tuple[nn.Module, nn.Linear, list[
         if not isinstance(down, nn.Linear):
             continue
         producers: list[nn.Linear] = []
-        for attr in ("up_proj",):#, "gate_proj"):
+        for attr in ("up_proj",):  # , "gate_proj"):
             sib = getattr(parent, attr, None)
             if isinstance(sib, nn.Linear) and sib.out_features == down.in_features:
                 producers.append(sib)
         if producers:
             groups.append((parent, down, producers))
     return groups
-
 
 
 # ---------------------------------------------------------------------- #
@@ -99,13 +98,13 @@ def _find_up_gate_groups(model: nn.Module) -> list[tuple[nn.Module, nn.Linear, l
         gate = getattr(mlp, "gate_proj", None)
         if not isinstance(gate, nn.Linear):
             continue
-        
+
         up = getattr(mlp, "up_proj", None)
         if not isinstance(up, nn.Linear):
             continue
 
         producer = None
-        for attr in ("post_attention_layernorm",):#, "gate_proj"):
+        for attr in ("post_attention_layernorm",):  # , "gate_proj"):
             sib = getattr(parent, attr, None)
             producer = sib
 
@@ -124,11 +123,11 @@ def equalize_up_gate_with_layernorm(model: nn.Module, eps: float = 1e-5) -> int:
     for up, gate, producer in groups:
         s_gate = gate.weight.abs().mean(dim=0).clamp_min(eps).to(device=gate.weight.device, dtype=gate.weight.dtype)
         s_up = up.weight.abs().mean(dim=0).clamp_min(eps).to(device=up.weight.device, dtype=up.weight.dtype)
-        
+
         s_gate = s_gate / s_gate.norm(p=2, dim=0, keepdim=True)
         s_up = s_up / s_up.norm(p=2, dim=0, keepdim=True)
 
-        # up_proj theoretically more sensitive to quantization 
+        # up_proj theoretically more sensitive to quantization
         s = 0.1 * s_gate + 0.9 * s_up
         # Divide down_proj input columns by s.
         gate.weight.mul_(1.0 / s.unsqueeze(0))
@@ -251,12 +250,12 @@ def _build_hadamard(n: int, device: torch.device, dtype: torch.dtype) -> Tensor:
     while h.shape[0] < n:
         h = torch.cat(
             [
-                torch.cat([h,  h], dim=1),
+                torch.cat([h, h], dim=1),
                 torch.cat([h, -h], dim=1),
             ],
             dim=0,
         )
-    h = h / (n ** 0.5)
+    h = h / (n**0.5)
     return h.to(device=device, dtype=dtype)
 
 
@@ -362,9 +361,7 @@ def equalize_v_o_with_hadamard(model: nn.Module, seed: int = 0) -> int:
         try:
             h_mat = _build_hadamard(head_dim, device=device, dtype=dtype)
         except ValueError:
-            h_mat = _build_random_orthogonal(
-                head_dim, device=device, dtype=dtype, seed=seed + layer_idx
-            )
+            h_mat = _build_random_orthogonal(head_dim, device=device, dtype=dtype, seed=seed + layer_idx)
         h_t = h_mat.t().contiguous()
 
         # v_proj: rows for KV head h_kv occupy [h_kv*head_dim : (h_kv+1)*head_dim].
@@ -435,14 +432,16 @@ def get_pile(num_samples: int, seqlen: int, tokenizer: Any, device: torch.device
     return trainloader
 
 
-def get_LLM_compression_calibration(num_samples: int, seqlen: int, tokenizer: Any, device: torch.device) -> list[Tensor]:
+def get_LLM_compression_calibration(
+    num_samples: int, seqlen: int, tokenizer: Any, device: torch.device
+) -> list[Tensor]:
     num_samples = 2048
     ds = load_dataset("neuralmagic/LLM_compression_calibration", split="train")
     ds = ds.shuffle().select(range(num_samples))
 
     trainloader = []
     for example in ds:
-        #trainenc = tokenizer(example["text"], return_tensors="pt")
+        # trainenc = tokenizer(example["text"], return_tensors="pt")
         text = tokenizer.apply_chat_template(example["messages"], add_generation_prompt=False, tokenize=False)
 
         trainenc = tokenizer(text, return_tensors="pt")
@@ -691,7 +690,7 @@ def get_argument_parser() -> argparse.ArgumentParser:
         default=0.03,
         help="Fraction of total optimizer steps used for linear warmup before cosine decay.",
     )
-    
+
     parser.add_argument("--int4_ratio", type=float, default=0.5, help="Ratio of output channels to quantize to 4 bits")
     parser.add_argument(
         "--equalize_down_proj",
@@ -705,7 +704,7 @@ def get_argument_parser() -> argparse.ArgumentParser:
         "rotation between v_proj and o_proj. Preserves attention output exactly and "
         "spreads outliers across each head's channels prior to quantization.",
     )
-    
+
     return parser
 
 
@@ -722,7 +721,7 @@ def main(argv) -> float:
     device = "cuda"
     torch_dtype = torch.bfloat16
     compression_config = dict(
-        mode=CompressWeightsMode.INT2_SYM,
+        mode=CompressWeightsMode.INT2_ASYM,
         group_size=32,
         awq=False,  # avoid awq for splitted linear layers
         scale_estimation=not args.basic_init,
@@ -735,7 +734,11 @@ def main(argv) -> float:
     )
     # Configure output and log files.
     output_dir = Path(args.output_dir)
-    tensorboard_dir = output_dir / "tb" / datetime.now().strftime("%Y-%m-%d__%H-%M-%S") if args.description is None else output_dir / "tb" / args.description
+    tensorboard_dir = (
+        output_dir / "tb" / datetime.now().strftime("%Y-%m-%d__%H-%M-%S")
+        if args.description is None
+        else output_dir / "tb" / args.description
+    )
     last_dir = output_dir / "last" if args.description is None else output_dir / ("last_" + args.description)
     if not args.resume:
         shutil.rmtree(last_dir, ignore_errors=True)
@@ -769,7 +772,7 @@ def main(argv) -> float:
         example_input = {k: v.to(device) for k, v in model.dummy_inputs.items()}
         dataset = Dataset([example_input])
     else:
-        #calib_loader = get_pile(num_samples=128, seqlen=128, tokenizer=tokenizer, device=device)
+        # calib_loader = get_pile(num_samples=128, seqlen=128, tokenizer=tokenizer, device=device)
         calib_loader = get_LLM_compression_calibration(num_samples=256, seqlen=512, tokenizer=tokenizer, device=device)
         dataset = Dataset(map(get_model_input, calib_loader))
 
@@ -790,7 +793,7 @@ def main(argv) -> float:
         if torch.cuda.memory_allocated(i) < best_memory:
             best_memory = torch.cuda.memory_allocated(i)
             gpu_id = i
-    
+
     teacher_lm_head = copy.deepcopy(model.lm_head)
     teacher_lm_head.eval().requires_grad_(False)
     if gpu_id is not None:
@@ -812,11 +815,11 @@ def main(argv) -> float:
         print(f"Equalized {n_eq} down_proj layers.")
         print(f"Answer before equalization: {answer_before_equalization}")
         print(f"Answer (post equalization):  {generate_answer(model, tokenizer)}\n")
-        
+
         n_eq = equalize_up_gate_with_layernorm(model)
         print(f"Equalized {n_eq} up_proj/gate_proj layers with preceding LayerNorm.\n")
         print(f"Answer (post equalization):  {generate_answer(model, tokenizer)}\n")
-        
+
     # Optional per-head Hadamard / orthogonal rotation between v_proj and o_proj.
     # Output-invariant; intended to flatten per-channel weight magnitudes seen by
     # the per-group quantizer of v_proj and o_proj.
@@ -826,8 +829,7 @@ def main(argv) -> float:
         print(f"Applied Hadamard rotation to {n_rot} attention layers (v_proj/o_proj).")
         print(f"Answer before Hadamard:    {answer_before_hadamard}")
         print(f"Answer (post Hadamard):    {generate_answer(model, tokenizer)}\n")
-    
-    
+
     # model.save_pretrained('after_equalization_and_hadamard')
     # tokenizer.save_pretrained('after_equalization_and_hadamard')
     # return
@@ -851,11 +853,11 @@ def main(argv) -> float:
     else:
         model = compress_weights(model, dataset=dataset, **compression_config)
         save_checkpoint(model, ckpt_file, model_state=not args.basic_init)
-    fq_lr = args.lr #/ 10
+    fq_lr = args.lr / 10
     weight_decay = args.lr
     param_to_train = set_trainable(model, lora_lr=args.lr, fq_lr=fq_lr)
     opt = torch.optim.AdamW(param_to_train, weight_decay=weight_decay)
-    #opt = torch.optim.Muon(param_to_train, weight_decay=weight_decay)
+    # opt = torch.optim.Muon(param_to_train, weight_decay=weight_decay)
 
     # Run tuning with distillation loss and validation after each epoch.
     grad_accumulation_steps = args.batch_size // args.microbatch_size
@@ -911,7 +913,7 @@ def main(argv) -> float:
                 cur_student_hiddens[:, cur_student_hiddens.shape[1] // 3 :],
                 cur_teacher_hiddens[:, cur_teacher_hiddens.shape[1] // 3 :].to(dtype=torch_dtype, device=device),
             )
-            loss = kl_loss # + 0.1 * l1_loss
+            loss = kl_loss  # + 0.1 * l1_loss
 
             # Perform an optimization step after accumulating gradients over multiple minibatches.
             loss_numerator += loss.item()

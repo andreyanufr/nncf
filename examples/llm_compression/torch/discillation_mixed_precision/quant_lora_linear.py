@@ -42,8 +42,6 @@ If ``log_scale=True`` the underlying trainable parameter stores
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -60,6 +58,22 @@ class _RoundSTE(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: Tensor):  # type: ignore[override]
         return grad_output
+
+
+class ClippedSTE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        # Save the input for the backward pass mask
+        ctx.save_for_backward(x)
+        # Hard clip between -1 and 1
+        return torch.clamp(x, min=-1.0, max=1.0)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (x,) = ctx.saved_tensors
+        # Gradient is passed through only where -1 <= x <= 1
+        mask = (x >= -1.0) & (x <= 1.0)
+        return grad_output * mask.float()
 
 
 def _round_ste(x: Tensor) -> Tensor:
@@ -99,15 +113,13 @@ class QuantizedLoraLinear(nn.Module):
         symmetric: bool = False,
         lora_rank: int = 0,
         log_scale: bool = False,
-        bias: bool = True,
+        module: nn.Linear | None = None,
     ) -> None:
         super().__init__()
         if group_size == -1:
             group_size = in_features
         if in_features % group_size != 0:
-            raise ValueError(
-                f"in_features ({in_features}) must be divisible by group_size ({group_size})."
-            )
+            raise ValueError(f"in_features ({in_features}) must be divisible by group_size ({group_size}).")
         if num_bits < 2:
             raise ValueError(f"num_bits must be >= 2, got {num_bits}.")
 
@@ -128,17 +140,14 @@ class QuantizedLoraLinear(nn.Module):
             self.qmax = 2**num_bits - 1
 
         # Frozen base weight; trainable correction comes from LoRA.
-        self.register_buffer("weight", torch.empty(out_features, in_features))
-        if bias:
-            self.bias: Optional[nn.Parameter] = nn.Parameter(torch.zeros(out_features))
-        else:
-            self.register_parameter("bias", None)
+        self.module = module
+        dtype = module.weight.dtype if module is not None else torch.bfloat16
 
         scale_shape = (out_features, self.num_groups)
-        scale_init = torch.ones(scale_shape)
+        scale_init = torch.ones(scale_shape, dtype=dtype)
         if log_scale:
             # store log(scale); init scale = 1 -> log_scale = 0
-            self._scale_param = nn.Parameter(torch.zeros(scale_shape))
+            self._scale_param = nn.Parameter(torch.zeros(scale_shape, dtype=dtype))
         else:
             self._scale_param = nn.Parameter(scale_init)
 
@@ -147,11 +156,11 @@ class QuantizedLoraLinear(nn.Module):
             zp_init = torch.full(scale_shape, 2 ** (num_bits - 1), dtype=torch.int32)
             self.register_buffer("zero_point", zp_init)
         else:
-            self.zero_point: Optional[Tensor] = None
+            self.zero_point: Tensor | None = None
 
         if lora_rank > 0:
-            self.lora_a = nn.Parameter(torch.zeros(out_features, lora_rank))
-            self.lora_b = nn.Parameter(torch.empty(lora_rank, in_features))
+            self.lora_a = nn.Parameter(torch.zeros(out_features, lora_rank, dtype=dtype))
+            self.lora_b = nn.Parameter(torch.empty(lora_rank, in_features, dtype=dtype))
             nn.init.kaiming_uniform_(self.lora_b, a=5**0.5)
         else:
             self.register_parameter("lora_a", None)
@@ -169,7 +178,7 @@ class QuantizedLoraLinear(nn.Module):
         symmetric: bool = False,
         lora_rank: int = 0,
         log_scale: bool = False,
-    ) -> "QuantizedLoraLinear":
+    ) -> QuantizedLoraLinear:
         """
         Build a ``QuantizedLoraLinear`` from an existing ``nn.Linear``.
         ``scale`` (and ``zero_point`` for asymmetric mode) are initialized
@@ -187,19 +196,16 @@ class QuantizedLoraLinear(nn.Module):
             symmetric=symmetric,
             lora_rank=lora_rank,
             log_scale=log_scale,
-            bias=linear.bias is not None,
+            module=linear,
         )
         with torch.no_grad():
-            w = linear.weight.detach().to(wrapper.weight.dtype)
-            wrapper.weight.copy_(w)
-            if linear.bias is not None:
-                wrapper.bias.copy_(linear.bias.detach())
-            wrapper._init_qparams_from_weight(w)
+            wrapper._init_qparams_from_weight()
         return wrapper
 
     @torch.no_grad()
-    def _init_qparams_from_weight(self, w: Tensor) -> None:
+    def _init_qparams_from_weight(self) -> None:
         """Initialize scale (and zero point) from per-group weight statistics."""
+        w = self.module.weight.clone()
         w_grouped = w.reshape(self.out_features, self.num_groups, self.group_size)
         if self.symmetric:
             absmax = w_grouped.abs().amax(dim=-1).clamp_min(1e-8)
@@ -215,6 +221,18 @@ class QuantizedLoraLinear(nn.Module):
         else:
             self._scale_param.copy_(scale)
 
+        # apply scale for weight to avoid this in forward pass and apply regularization on LoRA to range (-1, 1)
+        w_grouped.div_(scale.unsqueeze(-1))
+        self.module.weight.data = w_grouped.reshape(self.out_features, self.in_features).data
+
+    @torch.no_grad()
+    def rescale_weight(self) -> Tensor:
+        """Rescale the weight by the current scale. Useful before clip search."""
+        w = self.module.weight.clone()
+        w_grouped = w.reshape(self.out_features, self.num_groups, self.group_size)
+        w_grouped.mul_(self.scale.unsqueeze(-1))
+        return w_grouped.reshape(self.out_features, self.in_features)
+
     # ------------------------------------------------------------------ #
     # Quantization
     # ------------------------------------------------------------------ #
@@ -227,9 +245,13 @@ class QuantizedLoraLinear(nn.Module):
 
     def _effective_weight(self) -> Tensor:
         """Apply LoRA correction before quantization."""
-        w = self.weight
+        w = self.module.weight
         if self.lora_rank > 0:
-            w = w + self.lora_a @ self.lora_b
+            lora = self.lora_a @ self.lora_b
+            # restrict LoRA values to range (-1, 1) to avoid instability during quantization and large updates
+            # lora = torch.tanh(lora)
+            lora = 0.5 * ClippedSTE.apply(lora)
+            w = w + lora
         return w
 
     def quantize_dequantize(self) -> Tensor:
@@ -239,55 +261,19 @@ class QuantizedLoraLinear(nn.Module):
         scale = self.scale.unsqueeze(-1)
 
         if self.symmetric:
-            q = _round_ste(w_g / scale)
+            q = _round_ste(w_g)
             q = _clamp_ste(q, self.qmin, self.qmax)
             w_dq = q * scale
         else:
             zp = self.zero_point.to(scale.dtype).unsqueeze(-1)
-            q = _round_ste(w_g / scale + zp)
+            q = _round_ste(w_g + zp)
             q = _clamp_ste(q, self.qmin, self.qmax)
             w_dq = (q - zp) * scale
 
         return w_dq.reshape(self.out_features, self.in_features).to(w.dtype)
 
     def forward(self, x: Tensor) -> Tensor:
-        return F.linear(x, self.quantize_dequantize(), self.bias)
-
-    @torch.no_grad()
-    def init_lora_from_svd(self) -> None:
-        """
-        Initialize LoRA adapters with a truncated SVD of the quantization
-        residual ``Q(W) - W``.
-
-        With ``A @ B`` set to that residual, the corrected pre-quantization
-        weight ``W + A @ B`` equals ``Q(W)`` and therefore quantizes back to
-        itself, yielding zero residual error at initialization. Equivalent to
-        the SVD-based init used by NNCF for FQ_LORA.
-        """
-        if self.lora_rank <= 0:
-            return
-        # Quantization residual without LoRA contribution.
-        w = self.weight
-        w_g = w.reshape(self.out_features, self.num_groups, self.group_size)
-        scale = self.scale.unsqueeze(-1)
-        if self.symmetric:
-            q = torch.round(w_g / scale).clamp(self.qmin, self.qmax)
-            w_q = q * scale
-        else:
-            zp = self.zero_point.to(scale.dtype).unsqueeze(-1)
-            q = torch.round(w_g / scale + zp).clamp(self.qmin, self.qmax)
-            w_q = (q - zp) * scale
-        w_q = w_q.reshape(self.out_features, self.in_features).to(w.dtype)
-        residual = (w_q - w).float() / 100.0  # [out, in]
-
-        # Truncated SVD: residual = U S V^T  ->  A = U sqrt(S), B = sqrt(S) V^T
-        u_full, s_full, v_full = torch.linalg.svd(residual, full_matrices=False)
-        rank = self.lora_rank
-        s_sqrt = torch.sqrt(s_full[:rank])
-        a = u_full[:, :rank] * s_sqrt.unsqueeze(0)        # [out, r]
-        b = v_full[:rank, :] * s_sqrt.unsqueeze(1)        # [r, in]
-        self.lora_a.copy_(a.to(self.lora_a.dtype))
-        self.lora_b.copy_(b.to(self.lora_b.dtype))
+        return F.linear(x, self.quantize_dequantize(), self.module.bias)
 
     def extra_repr(self) -> str:
         return (
@@ -296,244 +282,6 @@ class QuantizedLoraLinear(nn.Module):
             f"symmetric={self.symmetric}, lora_rank={self.lora_rank}, "
             f"log_scale={self.log_scale}, bias={self.bias is not None}"
         )
-
-    # ------------------------------------------------------------------ #
-    # Per-group multiplicative clip search on the scale (AWQ-style).
-    # ------------------------------------------------------------------ #
-    @torch.no_grad()
-    def apply_clip_search(
-        self,
-        num_steps: int = 21,
-        min_factor: float = 0.5,
-        max_factor: float = 1.0,
-        importance: Optional[Tensor] = None,
-        update_zero_point: bool = True,
-    ) -> None:
-        """
-        Search a multiplicative factor ``c in [min_factor, max_factor]`` per
-        ``(out_channel, group)`` that minimizes the per-group MSE between the
-        FP weight and its quantize-dequantize image when the scale is
-        ``c * scale``. For asymmetric quantization, the integer ``zero_point``
-        of each (out, group) is also recomputed for the candidate scale when
-        ``update_zero_point`` is ``True``.
-
-        Especially impactful for INT2, where a small range shrink trades a
-        couple of saturated tails for finer in-range resolution and reduces
-        per-group MSE.
-
-        :param num_steps: Number of grid points in ``[min_factor, max_factor]``.
-        :param min_factor: Smallest multiplicative clip factor.
-        :param max_factor: Largest multiplicative clip factor (``1.0`` keeps
-            the current scale).
-        :param importance: Optional ``[in_features]`` activation importance
-            used to weight the per-group MSE. ``None`` -> uniform.
-        :param update_zero_point: Recompute the per-group integer zero point
-            from the clipped per-group range (asymmetric only).
-        """
-        if num_steps < 2:
-            raise ValueError(f"num_steps must be >= 2, got {num_steps}.")
-
-        out_f = self.out_features
-        n_g, g = self.num_groups, self.group_size
-        device = self.weight.device
-
-        w_g = self.weight.float().reshape(out_f, n_g, g)
-        s_init = self.scale.detach().float()  # [out_f, n_g]
-
-        if importance is None:
-            imp = None
-        else:
-            if importance.numel() != self.in_features:
-                raise ValueError(
-                    f"importance must have {self.in_features} elements, got {importance.numel()}."
-                )
-            imp = importance.detach().to(device=device, dtype=torch.float32).reshape(1, n_g, g)
-
-        # For asymmetric mode, derive (wmin, wmax) per group once.
-        if not self.symmetric:
-            wmin = w_g.amin(dim=-1)  # [out_f, n_g]
-            wmax = w_g.amax(dim=-1)
-            absmax_per_group = w_g.abs().amax(dim=-1).clamp_min(1e-8)
-        else:
-            absmax_per_group = w_g.abs().amax(dim=-1).clamp_min(1e-8)
-
-        factors = torch.linspace(
-            min_factor, max_factor, num_steps, device=device, dtype=torch.float32
-        )
-        best_err = torch.full((out_f, n_g), float("inf"), device=device)
-        best_scale = s_init.clone()
-        if not self.symmetric:
-            best_zp = self.zero_point.detach().clone()
-
-        for c in factors:
-            if self.symmetric:
-                # Symmetric: the natural clip is on absmax -> scale.
-                s_try = (absmax_per_group * c / max(abs(self.qmin), abs(self.qmax))).clamp_min(1e-8)
-                s_try_b = s_try.unsqueeze(-1)
-                q = torch.round(w_g / s_try_b).clamp(self.qmin, self.qmax)
-                w_dq = q * s_try_b
-                zp_try = None
-            else:
-                # Asymmetric: clip both ends symmetrically around the midpoint.
-                mid = 0.5 * (wmax + wmin)
-                half = 0.5 * (wmax - wmin) * c
-                wmin_c = mid - half
-                wmax_c = mid + half
-                s_try = ((wmax_c - wmin_c) / (self.qmax - self.qmin)).clamp_min(1e-8)
-                if update_zero_point:
-                    zp_try = (
-                        (self.qmin - wmin_c / s_try).round().clamp(self.qmin, self.qmax).to(torch.int32)
-                    )
-                else:
-                    zp_try = self.zero_point
-                s_try_b = s_try.unsqueeze(-1)
-                zp_b = zp_try.float().unsqueeze(-1)
-                q = torch.round(w_g / s_try_b + zp_b).clamp(self.qmin, self.qmax)
-                w_dq = (q - zp_b) * s_try_b
-
-            sq = (w_dq - w_g) ** 2
-            if imp is None:
-                err = sq.mean(dim=-1)
-            else:
-                err = (sq * imp).sum(dim=-1) / imp.sum(dim=-1).clamp_min(1e-12)
-
-            improved = err < best_err
-            best_err = torch.where(improved, err, best_err)
-            best_scale = torch.where(improved, s_try, best_scale)
-            if not self.symmetric:
-                best_zp = torch.where(improved, zp_try, best_zp)
-
-        if self.log_scale:
-            self._scale_param.copy_(torch.log(best_scale.clamp_min(1e-8)).to(self._scale_param.dtype))
-        else:
-            self._scale_param.copy_(best_scale.to(self._scale_param.dtype))
-        if not self.symmetric:
-            self.zero_point.copy_(best_zp)
-
-    # ------------------------------------------------------------------ #
-    # GPTQ-style initialization from calibration activations.
-    # ------------------------------------------------------------------ #
-    @torch.no_grad()
-    def init_from_gptq(
-        self,
-        x_calib: Tensor,
-        percdamp: float = 0.01,
-        eps: float = 1e-8,
-    ) -> None:
-        """
-        Initialize the quantizer (scale, zero point) and overwrite the base
-        ``weight`` buffer with the GPTQ/OBQ-compensated dequantized weight.
-
-        Implements the per-group OBQ update of `Frantar et al. 2022/23
-        <https://arxiv.org/abs/2210.17323>`_:
-
-        1. Compute the activation Hessian ``H = (1/N) X^T X`` and add
-           proportional damping.
-        2. Cholesky-invert and Cholesky-decompose ``H^{-1}`` to obtain an
-           upper-triangular ``Hinv`` whose diagonal is used as a per-column
-           normalizer for the OBQ update.
-        3. Walk input columns in order; at the start of each input-channel
-           group, recompute the per-group ``scale`` (and ``zero_point`` for
-           asymmetric quantization) from the *currently compensated* weights
-           in that group; then quantize each column and propagate the
-           quantization error to the remaining columns via ``Hinv``.
-        4. Store the per-group scales/zero-points and replace ``weight`` by
-           the quantized-dequantized values, so a subsequent
-           :meth:`quantize_dequantize` call returns the same tensor (LoRA at
-           ``A=0`` keeps this fixed point).
-
-        :param x_calib: ``[N, in_features]`` calibration input matrix.
-        :param percdamp: Diagonal damping as a fraction of ``mean(diag(H))``.
-            Stabilizes the inverse for ill-conditioned ``H``.
-        :param eps: Numerical stabilizer.
-        """
-        device = self.weight.device
-        out_f, in_f = self.out_features, self.in_features
-        g, n_g = self.group_size, self.num_groups
-
-        x = x_calib.detach().to(device=device, dtype=torch.float32)
-        if x.ndim != 2 or x.shape[1] != in_f:
-            raise ValueError(f"x_calib must have shape [N, {in_f}], got {tuple(x.shape)}.")
-
-        w_full = self.weight.detach().float().clone()  # [out_f, in_f]; mutated in place below
-        h_mat = (x.T @ x) / max(x.shape[0], 1)  # [in_f, in_f]
-
-        # Drop dead input channels (zero column / zero diagonal).
-        diag = torch.arange(in_f, device=device)
-        dead = h_mat[diag, diag] == 0
-        if dead.any():
-            h_mat[dead, dead] = 1.0
-            w_full[:, dead] = 0.0
-
-        damp = percdamp * h_mat.diagonal().mean().clamp_min(eps)
-        h_mat[diag, diag] += damp
-
-        # Hinv (upper triangular Cholesky factor of the inverse Hessian).
-        l_chol = torch.linalg.cholesky(h_mat)
-        h_inv = torch.cholesky_inverse(l_chol)
-        h_inv_chol = torch.linalg.cholesky(h_inv, upper=True)  # upper triangular, [in_f, in_f]
-
-        new_scale = torch.empty((out_f, n_g), device=device, dtype=torch.float32)
-        if not self.symmetric:
-            new_zp = torch.empty((out_f, n_g), device=device, dtype=torch.int32)
-        q_full = torch.empty_like(w_full)
-
-        for grp_idx in range(n_g):
-            i0 = grp_idx * g
-            i1 = i0 + g
-            w_grp = w_full[:, i0:i1].clone()  # [out_f, g] (will be modified locally)
-            hinv_grp = h_inv_chol[i0:i1, i0:i1]  # [g, g] upper triangular
-
-            # Recompute scale (and zero point) from the currently compensated
-            # group weights so later groups benefit from the propagated error.
-            if self.symmetric:
-                absmax = w_grp.abs().amax(dim=-1).clamp_min(eps)
-                s = absmax / max(abs(self.qmin), abs(self.qmax))  # [out_f]
-                zp_row = None
-            else:
-                wmin = w_grp.amin(dim=-1)
-                wmax = w_grp.amax(dim=-1)
-                s = ((wmax - wmin) / (self.qmax - self.qmin)).clamp_min(eps)
-                zp_row = (self.qmin - wmin / s).round().clamp(self.qmin, self.qmax)
-            new_scale[:, grp_idx] = s
-            if not self.symmetric:
-                new_zp[:, grp_idx] = zp_row.to(torch.int32)
-
-            err_grp = torch.zeros_like(w_grp)
-            q_grp = torch.zeros_like(w_grp)
-            for j in range(g):
-                w_col = w_grp[:, j]
-                d = hinv_grp[j, j]
-                if self.symmetric:
-                    q = torch.round(w_col / s).clamp(self.qmin, self.qmax)
-                    w_dq = q * s
-                else:
-                    q = torch.round(w_col / s + zp_row).clamp(self.qmin, self.qmax)
-                    w_dq = (q - zp_row) * s
-                q_grp[:, j] = w_dq
-                err = (w_col - w_dq) / d.clamp_min(eps)
-                err_grp[:, j] = err
-                if j + 1 < g:
-                    w_grp[:, j + 1 :] -= err.unsqueeze(1) * hinv_grp[j, j + 1 :].unsqueeze(0)
-
-            q_full[:, i0:i1] = q_grp
-            # Propagate per-group error to all subsequent groups.
-            if i1 < in_f:
-                w_full[:, i1:] -= err_grp @ h_inv_chol[i0:i1, i1:]
-
-        # Persist quantizer parameters and the compensated dequantized weight.
-        if self.log_scale:
-            self._scale_param.copy_(torch.log(new_scale.clamp_min(eps)).to(self._scale_param.dtype))
-        else:
-            self._scale_param.copy_(new_scale.to(self._scale_param.dtype))
-        if not self.symmetric:
-            self.zero_point.copy_(new_zp)
-
-        self.weight.copy_(q_full.to(self.weight.dtype))
-        # Reset LoRA so that effective_weight == quantized weight at start.
-        if self.lora_rank > 0:
-            self.lora_a.zero_()
-            nn.init.kaiming_uniform_(self.lora_b, a=5**0.5)
 
     # ------------------------------------------------------------------ #
     # Scale estimation (port of NNCF ScaleEstimation.calculate_quantization_params)
@@ -548,15 +296,15 @@ class QuantizedLoraLinear(nn.Module):
             "centered" integer code (``q`` for symmetric, ``q - zp`` for
             asymmetric), matching NNCF's ``get_target_zero_mask`` semantics.
         """
-        w_g = self.weight.float().reshape(self.out_features, self.num_groups, self.group_size)
+        w_g = self.module.weight.float().reshape(self.out_features, self.num_groups, self.group_size)
         s = scale.unsqueeze(-1)
         if self.symmetric:
-            q = torch.round(w_g / s).clamp(self.qmin, self.qmax)
+            q = torch.round(w_g).clamp(self.qmin, self.qmax)
             target = q
             w_dq = q * s
         else:
             zp = self.zero_point.to(s.dtype).unsqueeze(-1)
-            q = torch.round(w_g / s + zp).clamp(self.qmin, self.qmax)
+            q = torch.round(w_g + zp).clamp(self.qmin, self.qmax)
             target = q - zp
             w_dq = target * s
         return w_dq, target
@@ -591,7 +339,7 @@ class QuantizedLoraLinear(nn.Module):
             estimator.
         :param eps: Numerical stabilizer.
         """
-        device = self.weight.device
+        device = self.module.weight.device
         out_f, in_f = self.out_features, self.in_features
         n_g, g = self.num_groups, self.group_size
 
@@ -601,7 +349,8 @@ class QuantizedLoraLinear(nn.Module):
             raise ValueError(f"x_calib must have shape [N, {in_f}], got {tuple(x.shape)}.")
         x_g = x.reshape(x.shape[0], n_g, g)
 
-        w_full = self.weight.float()
+        w_full = self.rescale_weight().float()  # self.module.weight.float()
+
         w_g = w_full.reshape(out_f, n_g, g)
         # FP per-group output contributions: [N, out_f, n_g]
         fp_out_g = torch.einsum("ngk,ogk->nog", x_g, w_g)
@@ -625,7 +374,7 @@ class QuantizedLoraLinear(nn.Module):
         importance_template = s.expand(out_f, n_g, g).clone()  # [out_f, n_g, g]
 
         def estimate_ideal(target_t: Tensor) -> Tensor:
-            zero_mask = (target_t.abs() < eps)
+            zero_mask = target_t.abs() < eps
             zero_mask_f = zero_mask.to(w_g.dtype) * zero_scale
             importance = torch.where(zero_mask, torch.zeros_like(importance_template), importance_template)
             denom = importance.sum(dim=-1, keepdim=True)
@@ -679,7 +428,7 @@ def wrap_linear_layers(
     symmetric: bool = False,
     lora_rank: int = 0,
     log_scale: bool = False,
-    skip_name_substrings: Optional[list[str]] = None,
+    skip_name_substrings: list[str] | None = None,
 ) -> nn.Module:
     """
     Replace every ``nn.Linear`` inside ``model`` with a
@@ -741,11 +490,11 @@ def unwrap_linear_layers(model: nn.Module) -> nn.Module:
         linear = nn.Linear(
             qmod.in_features,
             qmod.out_features,
-            bias=qmod.bias is not None,
+            bias=qmod.module.bias is not None,
         ).to(device=w_dq.device, dtype=w_dq.dtype)
         with torch.no_grad():
             linear.weight.copy_(w_dq)
-            if qmod.bias is not None:
-                linear.bias.copy_(qmod.bias.detach())
+            if qmod.module.bias is not None:
+                linear.bias.copy_(qmod.module.bias.detach())
         _set_submodule(model, name, linear)
     return model

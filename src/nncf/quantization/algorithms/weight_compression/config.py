@@ -80,7 +80,11 @@ class WeightCompressionConfig:
 
     @property
     def is_asym_mode(self) -> bool:
-        return self.mode in [CompressWeightsMode.INT2_ASYM, CompressWeightsMode.INT4_ASYM, CompressWeightsMode.INT8_ASYM]
+        return self.mode in [
+            CompressWeightsMode.INT2_ASYM,
+            CompressWeightsMode.INT4_ASYM,
+            CompressWeightsMode.INT8_ASYM,
+        ]
 
     @property
     def is_integer(self) -> bool:
