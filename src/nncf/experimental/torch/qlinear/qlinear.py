@@ -85,7 +85,7 @@ class NNCFQLinear(torch.nn.Module):
 
         self.out_features = qweight.shape[0]
         if bits in (2, 3, 4):
-            self.in_features = qweight.shape[1] * 2  # packed: two values per byte
+            self.in_features = torch.prod(torch.tensor(qweight.shape[1:])) * 2  # packed: two values per byte
         else:
             self.in_features = qweight.shape[1]
 

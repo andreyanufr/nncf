@@ -19,6 +19,7 @@ from torchao.quantization.pt2e.observer import PerChannelMinMaxObserver
 import nncf
 from nncf.torch.quantization.layers import AsymmetricQuantizer
 from nncf.torch.quantization.layers import BaseQuantizer
+from nncf.torch.quantization.layers import INT2SymmetricWeightsDecompressor
 from nncf.torch.quantization.layers import INT4AsymmetricWeightsDecompressor
 from nncf.torch.quantization.layers import INT4SymmetricWeightsDecompressor
 from nncf.torch.quantization.layers import INT8AsymmetricWeightsDecompressor
@@ -26,7 +27,7 @@ from nncf.torch.quantization.layers import INT8SymmetricWeightsDecompressor
 from nncf.torch.quantization.layers import SymmetricQuantizer
 from nncf.torch.quantization.quantize_functions import TuneRange
 
-SUPPORTED_NUM_BITS_FOR_STRIP_MODEL = [8]
+SUPPORTED_NUM_BITS_FOR_STRIP_MODEL = [8, 4, 3, 2]
 
 
 def convert_to_torch_fakequantizer(nncf_quantizer: BaseQuantizer) -> FakeQuantize:
@@ -83,6 +84,62 @@ def convert_to_torch_fakequantizer(nncf_quantizer: BaseQuantizer) -> FakeQuantiz
     fakequantizer.disable_observer()
 
     return fakequantizer
+
+def get_quantized_weight_for_nncf_linear(quantizer: AsymmetricQuantizer | SymmetricQuantizer, weight: torch.Tensor) -> torch.Tensor:
+    """
+    Get quantized weight from quantizer and original weight tensor.
+
+    :param quantizer: The quantizer instance.
+    :param weight: The weight tensor to be quantized.
+    :return: Quantized weight corresponding to the given quantizer and original weight.
+    """
+    assert isinstance(quantizer, BaseQuantizer)
+
+    weight_dtype = weight.dtype
+    weight_shape = weight.shape
+    float_dtype = torch.float32
+    integer_dtype = torch.uint8
+
+    eps = torch.finfo(float_dtype).eps
+    qdq_weight = quantizer.quantize(weight)
+    group_size = -1
+    if hasattr(quantizer, "_lspec"):
+        # Reshape for group-wise quantization, implemented for classes with lora spec only
+        qdq_weight = qdq_weight.reshape(quantizer._lspec.weight_shape)
+        group_size = quantizer._lspec.weight_shape[-1]
+    qdq_weight = qdq_weight.to(float_dtype)
+    
+    if isinstance(quantizer, AsymmetricQuantizer):
+        input_range_safe = abs(quantizer.input_range) + quantizer.eps
+        input_low, input_range = TuneRange.apply(quantizer.input_low, input_range_safe, quantizer.levels)
+
+        input_low = input_low.to(float_dtype)
+        input_range = input_range.to(float_dtype)
+
+        scale = input_range / quantizer.level_high
+        scale = torch.where(torch.abs(scale) < eps, eps, scale)
+        scale = scale.to(float_dtype)
+
+        zero_point = quantizer.level_low - torch.round(input_low / scale)
+        zero_point = torch.clip(zero_point, quantizer.level_low, quantizer.level_high)
+        zero_point = zero_point.to(float_dtype)
+    else:
+        scale = quantizer.scale.to(float_dtype) / abs(quantizer.level_low)
+        scale = torch.where(torch.abs(scale) < eps, eps, scale)
+        scale = scale.to(float_dtype)
+        zero_point = torch.tensor([-quantizer.level_low], dtype=float_dtype)
+    
+    q_weight = qdq_weight / scale
+    q_weight = q_weight + zero_point
+    q_weight = torch.round(q_weight)
+    q_weight = torch.clip(q_weight, 0, quantizer.level_high - quantizer.level_low)
+
+    q_weight = q_weight.to(integer_dtype)
+    zero_point = zero_point.data.to(integer_dtype)
+    scale = scale.data.to(weight_dtype)
+    sym = isinstance(quantizer, SymmetricQuantizer)
+
+    return q_weight, zero_point, scale, sym, quantizer.num_bits, group_size, None
 
 
 def asym_fq_to_decompressor(
@@ -145,7 +202,10 @@ def asym_fq_to_decompressor(
 
 def sym_fq_to_decompressor(
     quantizer: SymmetricQuantizer, weight: torch.Tensor
-) -> tuple[INT8SymmetricWeightsDecompressor | INT4SymmetricWeightsDecompressor, torch.Tensor]:
+) -> tuple[
+    INT8SymmetricWeightsDecompressor | INT4SymmetricWeightsDecompressor | INT2SymmetricWeightsDecompressor,
+    torch.Tensor,
+]:
     """
     Converts an asymmetric quantizer and original weight tensor to a decompressor and quantized weight tensor.
 
@@ -178,6 +238,15 @@ def sym_fq_to_decompressor(
 
     if quantizer.num_bits == 8:
         decompressor = INT8SymmetricWeightsDecompressor(scale=scale, result_dtype=weight_dtype)
+    elif quantizer.num_bits == 2:
+        # Shift signed weights to unsigned: [-2, 1] -> [0, 3]
+        q_weight = (q_weight + 2).to(torch.uint8)
+        decompressor = INT2SymmetricWeightsDecompressor(
+            scale=scale,
+            compressed_weight_shape=q_weight.shape,
+            result_shape=weight_shape,
+            result_dtype=weight_dtype,
+        )
     else:
         decompressor = INT4SymmetricWeightsDecompressor(
             scale=scale,

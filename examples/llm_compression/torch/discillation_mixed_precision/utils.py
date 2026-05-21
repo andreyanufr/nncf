@@ -1,4 +1,6 @@
+import json
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -184,16 +186,23 @@ class LinearMIXER(nn.Module):
         nn (_type_): _description_
     """
 
-    def __init__(self, model: nn.Module, ratio=0.5, group_size=-1):
+    def __init__(
+        self,
+        model: nn.Module,
+        ratio: float = 0.5,
+        group_size: int = -1,
+        int4_first: bool | None = None,
+    ) -> None:
         super().__init__()
         if not isinstance(model, nn.Linear):
             raise ValueError("LinearMIXER can only be applied to nn.Linear modules.")
         self.ratio = ratio
         self.group_size = group_size
-        int4_first = self.if_first_layers_more_sensitive(model.weight.data)
-        self.register_buffer("int4_first", torch.tensor(int4_first, dtype=torch.bool))
+        if int4_first is None:
+            int4_first = self.if_first_layers_more_sensitive(model.weight.data)
+        self.register_buffer("int4_first", torch.tensor(bool(int4_first), dtype=torch.bool))
 
-        dim_div1 = int(model.in_features * self.ratio)
+        dim_div1 = int((model.in_features * self.ratio) // self.group_size) * self.group_size if self.group_size > 0 else int(model.in_features * self.ratio)
         dim_div2 = model.in_features - dim_div1
 
         device = model.weight.data.device
@@ -218,12 +227,12 @@ class LinearMIXER(nn.Module):
 
     def forward(self, x):
         if self.int4_first:
-            return self.model_int4(x[..., : self.model_int4.in_features]) + self.model_int2(
+            return (self.model_int4(x[..., : self.model_int4.in_features]) + self.model_int2(
                 x[..., self.model_int4.in_features :]
-            )
-        return self.model_int2(x[..., : self.model_int2.in_features]) + self.model_int4(
+            )).to(x.dtype)
+        return (self.model_int2(x[..., : self.model_int2.in_features]) + self.model_int4(
             x[..., self.model_int2.in_features :]
-        )
+        )).to(x.dtype)
 
     def if_first_layers_more_sensitive(
         self,
@@ -251,7 +260,7 @@ class LinearMIXER(nn.Module):
         """
         out_features = weight.shape[0]
         in_features = weight.shape[1]
-        block = int(in_features * self.ratio)
+        block = int((in_features * self.ratio) // self.group_size) * self.group_size if self.group_size > 0 else int(in_features * self.ratio)
         if block <= 0 or block >= in_features:
             raise ValueError(f"Invalid block size {block} for in_features {in_features} and ratio {self.ratio}")
 
@@ -299,35 +308,144 @@ class LinearMIXER(nn.Module):
         return linear_layer
 
 
-def replace_linear_with_mixer(model: nn.Module, parent_name="", ratio=0.5, n_layers=-1) -> nn.Module:
-    """
-    Recursively replaces all nn.Linear modules in the given model with LinearMIXER modules.
-    First v_proj, mlp and last mlp always in 4 bit.
+MixerConfig = dict[str, Any]
 
-    Args:
-        model (nn.Module): The input model to be modified.
-        ratio (float): The ratio of output channels to be quantized to 4 bits in the LinearMIXER. Default is 0.5.
 
-    Returns:
-        nn.Module: The modified model with nn.Linear modules replaced by LinearMIXER modules.
+def save_mixer_config(config: MixerConfig, path: Path) -> None:
     """
+    Persist a mixer configuration produced by :func:`replace_linear_with_mixer`
+    to a JSON file.
+
+    :param config: Mixer configuration dictionary (see :func:`replace_linear_with_mixer`).
+    :param path: Destination JSON file. Parent directories are created as needed.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, sort_keys=True)
+
+
+def load_mixer_config(path: Path) -> MixerConfig:
+    """
+    Load a mixer configuration previously saved by :func:`save_mixer_config`.
+
+    :param path: Path to the JSON config file.
+    :return: Mixer configuration dictionary.
+    """
+    with Path(path).open("r", encoding="utf-8") as f:
+        config = json.load(f)
+    if not isinstance(config, dict) or "layers" not in config or not isinstance(config["layers"], dict):
+        raise ValueError(f"Invalid mixer config at {path}: expected {{'layers': {{...}}}}.")
+    return config
+
+
+def replace_linear_with_mixer(
+    model: nn.Module,
+    parent_name: str = "",
+    group_size: int = -1,
+    ratio: float | None = None,
+    n_layers: int = -1,
+    config: MixerConfig | None = None,
+    config_path: Path | None = None,
+) -> tuple[nn.Module, MixerConfig]:
+    """
+    Recursively replace ``nn.Linear`` modules in ``model`` with
+    :class:`LinearMIXER`, in one of two modes:
+
+    1. **Ratio mode** (``ratio`` is given, ``config_path`` is ``None``):
+       every eligible ``nn.Linear`` (``lm_head`` is always skipped) is wrapped
+       with the same ``ratio``. A configuration dict mapping each replaced
+       layer's qualified name to its per-layer parameters is built and
+       returned alongside the modified model.
+
+    2. **Config mode** (``config_path`` is given, ``ratio`` is ``None``):
+       the config is loaded from ``config_path``; only ``nn.Linear`` modules
+       whose qualified name is listed in the config are replaced, each with
+       its own per-layer ``ratio``.
+
+    Exactly one of ``ratio`` / ``config_path`` must be provided; passing both
+    or neither raises ``ValueError``.
+
+    :param model: Model to modify in place.
+    :param parent_name: Internal parameter used by recursion to build the
+        qualified name of each child module.
+    :param ratio: Fraction of input channels routed to the 4-bit branch
+        (forwarded to :class:`LinearMIXER`).
+    :param n_layers: Number of hidden layers; auto-detected from
+        ``model.config.num_hidden_layers`` when ``-1``.
+    :param config: Internal parameter used by recursion to share the
+        config dict across recursive calls. Callers should not set this.
+    :param config_path: Path to a JSON mixer config produced by
+        :func:`save_mixer_config`.
+    :return: Tuple ``(model, config)`` where ``config`` is the mixer
+        configuration (newly built in ratio mode, or the loaded one in
+        config mode) and can be persisted with :func:`save_mixer_config`.
+    """
+    is_root = parent_name == "" and config is None
+    if is_root:
+        if (ratio is None) == (config_path is None):
+            raise ValueError(
+                "Exactly one of 'ratio' or 'config_path' must be provided "
+                "(got ratio=%r, config_path=%r)." % (ratio, config_path)
+            )
+        if config_path is not None:
+            config = load_mixer_config(config_path)
+        else:
+            config = {"layers": {}}
+
     if n_layers == -1 and hasattr(model, "config") and hasattr(model.config, "num_hidden_layers"):
         n_layers = model.config.num_hidden_layers - 1
+
+    layers_cfg: dict[str, dict[str, Any]] = config["layers"]
+    use_config = ratio is None  # config-driven replacement
+
     for name, module in model.named_children():
         if "lm_head" in name:
             continue
         full_name = parent_name + "." + name if parent_name else name
         if isinstance(module, nn.Linear):
-            # if ("v_proj" in name or "mlp" in parent_name) and ('.0.' in parent_name or f'.{n_layers}.' in parent_name):
-            #     print(f"Replacing {full_name} with LinearINT4")
-            #     setattr(model, name, LinearINT4(module))
-            # else:
-            print(f"Replacing {full_name} with LinearMIXER")
-            setattr(model, name, LinearMIXER(module, ratio))
+            if use_config:
+                layer_cfg = layers_cfg.get(full_name)
+                if layer_cfg is None:
+                    continue
+                layer_ratio = float(layer_cfg["ratio"])
+                layer_group_size = int(layer_cfg.get("group_size", -1))
+                # Reuse the precomputed sensitivity decision when available;
+                # this avoids recomputing `if_first_layers_more_sensitive`.
+                layer_int4_first = layer_cfg.get("int4_first")
+                if layer_int4_first is not None:
+                    layer_int4_first = bool(layer_int4_first)
+            else:
+                layer_ratio = float(ratio)
+                layer_group_size = int(group_size)
+                layer_int4_first = None  # let LinearMIXER compute it once
+
+            print(f"Replacing {full_name} with LinearMIXER (ratio={layer_ratio}, group_size={layer_group_size})")
+            wrapped = LinearMIXER(
+                module,
+                ratio=layer_ratio,
+                group_size=layer_group_size,
+                int4_first=layer_int4_first,
+            )
+            if not use_config:
+                # Persist the computed decision so a later run can skip the heuristic.
+                layers_cfg[full_name] = {
+                    "ratio": layer_ratio,
+                    "group_size": layer_group_size,
+                    "int4_first": bool(wrapped.int4_first.item()),
+                }
+            setattr(model, name, wrapped)
             del module
         else:
-            replace_linear_with_mixer(module, full_name, ratio=ratio, n_layers=n_layers)
-    return model
+            replace_linear_with_mixer(
+                module,
+                parent_name=full_name,
+                ratio=ratio,
+                n_layers=n_layers,
+                group_size=group_size,
+                config=config,
+            )
+    return model, config
 
 
 def replace_mixer_with_linear(model: nn.Module) -> nn.Module:
@@ -349,17 +467,18 @@ def replace_mixer_with_linear(model: nn.Module) -> nn.Module:
 
 
 @torch.no_grad()
-def export_to_pytorch(pretrained: str, ckpt_file: Path, model_dir: Path) -> None:
+def export_to_pytorch(pretrained: str, ckpt_file: Path, model_dir: Path, mixture_file: Path=None) -> None:
     """
     Create a wrapper of OpenVINO model from the checkpoint for evaluation on CPU via WWB.
 
     :param pretrained: The name or path of the pretrained model.
     :param ckpt_file: The path to the checkpoint file to load the model weights and NNCF configurations.
-    :param last_dir: The directory where the OpenVINO model will be saved.
+    :param mixture_file: The path to the mixture file for LinearMIXER configurations.
+    :param model_dir: The directory where the PyTorch model will be saved.
     :return: A wrapper of OpenVINO model ready for evaluation.
     """
     model_to_eval = AutoModelForCausalLM.from_pretrained(pretrained, torch_dtype=torch.bfloat16, device_map="cpu")
-    model_to_eval = replace_linear_with_mixer(model_to_eval, ratio=0.5)
+    model_to_eval, _ = replace_linear_with_mixer(model_to_eval, ratio=0.5) #, config_path=mixture_file)
 
     # ckpt = torch.load(ckpt_file, weights_only=False, map_location="cpu")
     # if "model_state" in ckpt:
@@ -386,7 +505,7 @@ def load_to_pytorch(pretrained: str, ckpt_file: Path) -> None:
     torch_dtype = torch.bfloat16
     tokenizer = AutoTokenizer.from_pretrained(pretrained)
     model_to_eval = AutoModelForCausalLM.from_pretrained(pretrained, torch_dtype=torch_dtype, device_map="cuda")
-    model_to_eval = replace_linear_with_mixer(model_to_eval)
+    model_to_eval, _ = replace_linear_with_mixer(model_to_eval, ratio=0.5)
     model_to_eval = load_checkpoint(model_to_eval, ckpt_file)
     model_to_eval = nncf.strip(model_to_eval, do_copy=False, strip_format=StripFormat.IN_PLACE)
 

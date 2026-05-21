@@ -88,6 +88,10 @@ class CompressWeightsMode(StrEnum):
     :param INT4_ASYM: The same as INT4_SYM mode, but weights are quantized to a primary precision asymmetrically
         with a typical non-fixed zero point.
         https://github.com/openvinotoolkit/nncf/blob/develop/docs/usage/training_time_compression/other_algorithms/LegacyQuantization.md#asymmetric-quantization
+    :param INT2_SYM: Stands for 2-bit integer symmetric quantization without zero point.
+        Similar to INT4_SYM but with a 2-bit primary precision.
+    :param INT2_ASYM: Stands for 2-bit integer asymmetric quantization with a non-fixed zero point.
+        Similar to INT4_ASYM but with a 2-bit primary precision.
     :param NF4: The the same as INT4_SYM mode, but primary precision is NF4 data type without zero point.
     :param MXFP4: MX-compliant FP4 format with E2M1 values sharing group-level E8M0 scale. The size of group is 32.
     :param MXFP8_E4M3: MX-compliant FP8 format with E4M3 values sharing group-level E8M0 scale. The size of group is 32.
@@ -156,11 +160,14 @@ class StripFormat(StrEnum):
         in low-bit precision using fake quantize parameters. This is the default format for deploying models
         with compressed weights.
     :param IN_PLACE: Directly applies NNCF operations to the weights, replacing the original weights.
+    :param OV: Similar to DQ, but with additional transformations to ensure compatibility with OpenVINO. This format is
+        used when exporting models to OpenVINO IR format.
     """
 
     NATIVE = "native"
     DQ = "dequantize"
     IN_PLACE = "in_place"
+    OV = "openvino"
 
 
 @api(canonical_alias="nncf.BackupMode")

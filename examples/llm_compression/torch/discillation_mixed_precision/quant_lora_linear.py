@@ -85,6 +85,240 @@ def _clamp_ste(x: Tensor, lo: float, hi: float) -> Tensor:
     return x + (x.clamp(lo, hi) - x).detach()
 
 
+
+import torch
+import torch.nn as nn
+import math
+
+class LSQQuantizerFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, tensor, scale, q_min, q_max, grad_scale):
+        # Save variables for the backward pass
+        ctx.save_for_backward(tensor, scale)
+        ctx.q_min = q_min
+        ctx.q_max = q_max
+        ctx.grad_scale = grad_scale
+
+        # 1. Scale the input tensor
+        scaled_tensor = tensor / scale
+        
+        # 2. Quantize (Round & Clip)
+        quantized = torch.clamp(torch.round(scaled_tensor), q_min, q_max)
+        
+        # 3. Dequantize
+        dequantized = quantized * scale
+        return dequantized
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        tensor, scale = ctx.saved_tensors
+        q_min = ctx.q_min
+        q_max = ctx.q_max
+        grad_scale = ctx.grad_scale
+
+        scaled_tensor = tensor / scale
+        
+        # Determine clipping regions
+        lower_mask = (scaled_tensor < q_min).float()
+        upper_mask = (scaled_tensor > q_max).float()
+        middle_mask = 1.0 - lower_mask - upper_mask
+
+        # --- Gradient with respect to the Input Tensor (Standard STE) ---
+        grad_tensor = grad_output * middle_mask
+
+        # --- Gradient with respect to the Scale Factor (s) ---
+        # Look at how the masks alter the derivative based on clipping:
+        # Inside bounds: it evaluates to (round(x/s) - x/s) which is the quantization error.
+        # Outside bounds: it evaluates to either q_min or q_max.
+        quantized_or_clipped = torch.where(scaled_tensor < q_min, float(q_min), scaled_tensor)
+        quantized_or_clipped = torch.where(scaled_tensor > q_max, float(q_max), quantized_or_clipped)
+        
+        # LSQ formulation accounts for the exact rounding error inside the grid
+        round_error = torch.round(scaled_tensor) - scaled_tensor
+        derivative_s = torch.where(middle_mask.bool(), round_error, quantized_or_clipped)
+        
+        # Sum across the tensor elements and apply the LSQ gradient scaling factor (grad_scale)
+        grad_scale_param = torch.sum(grad_output * derivative_s) * grad_scale
+
+        # Return gradients matching the order of forward() arguments
+        # (tensor, scale, q_min, q_max, grad_scale)
+        return grad_tensor, grad_scale_param, None, None, None
+
+
+
+class LSQQuantizerFunctionWithLoRA(torch.autograd.Function):
+    """
+    LSQ fake-quantization of a 2D weight ``[out_features, in_features]`` with a
+    LoRA correction (``A @ B``, clipped to ``[-1, 1]``) added in *scaled* space,
+    using per-input-channel grouped scales.
+
+    Shapes:
+        tensor : [O, I]
+        lora_a : [O, r]
+        lora_b : [r, I]
+        scale  : [O, G]  where G = I // group_size
+    """
+
+    @staticmethod
+    def forward(ctx, tensor, lora_a, lora_b, scale, q_min, q_max, grad_scale, group_size):
+        out_f, in_f = tensor.shape
+        if group_size <= 0 or in_f % group_size != 0:
+            raise ValueError(
+                f"in_features ({in_f}) must be a positive multiple of group_size ({group_size})."
+            )
+        num_groups = in_f // group_size
+        if scale.shape != (out_f, num_groups):
+            raise ValueError(
+                f"scale shape {tuple(scale.shape)} does not match expected ({out_f}, {num_groups})."
+            )
+
+        # LoRA correction, clipped to [-1, 1].
+        lora = lora_a @ lora_b  # [O, I]
+        clip_mask = (lora >= -1.0) & (lora <= 1.0)
+        lora_c = torch.clamp(lora, -1.0, 1.0)
+
+        # Group along the input-channel dimension.
+        w_g = tensor.reshape(out_f, num_groups, group_size)
+        l_g = lora_c.reshape(out_f, num_groups, group_size)
+        s_g = scale.unsqueeze(-1)  # [O, G, 1]
+
+        v = w_g / s_g
+        y = v + l_g
+        q = torch.clamp(torch.round(y), q_min, q_max)
+        dequantized = (q * s_g).reshape(out_f, in_f)
+
+        ctx.save_for_backward(tensor, scale, lora_a, lora_b, clip_mask)
+        ctx.q_min = q_min
+        ctx.q_max = q_max
+        ctx.grad_scale = grad_scale
+        ctx.group_size = group_size
+        return dequantized
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        tensor, scale, lora_a, lora_b, clip_mask = ctx.saved_tensors
+        q_min = ctx.q_min
+        q_max = ctx.q_max
+        grad_scale = ctx.grad_scale
+        group_size = ctx.group_size
+
+        out_f, in_f = tensor.shape
+        num_groups = in_f // group_size
+
+        # Recompute forward intermediates (cheap; avoids saving large activations).
+        lora = lora_a @ lora_b
+        lora_c = torch.clamp(lora, -1.0, 1.0)
+        w_g = tensor.reshape(out_f, num_groups, group_size)
+        l_g = lora_c.reshape(out_f, num_groups, group_size)
+        s_g = scale.unsqueeze(-1)
+        v = w_g / s_g
+        y = v + l_g
+
+        lower = y < q_min
+        upper = y > q_max
+        middle = ~(lower | upper)
+        middle_f = middle.to(grad_output.dtype)
+
+        grad_out_g = grad_output.reshape(out_f, num_groups, group_size)
+
+        # --- Gradient w.r.t. the input tensor (STE through round+clamp) ---
+        # d(out)/d(tensor) inside = 1, outside = 0.
+        #grad_tensor = (grad_out_g * middle_f).reshape(out_f, in_f)
+
+        # --- Gradient w.r.t. LoRA factors ---
+        # d(out)/d(L) inside = scale, outside = 0; then masked by the LoRA clip region.
+        grad_lora_eff_g = grad_out_g * middle_f * s_g
+        grad_lora_eff = grad_lora_eff_g.reshape(out_f, in_f)
+        grad_lora_eff = grad_lora_eff * clip_mask.to(grad_lora_eff.dtype)
+        # L = A @ B  =>  dA = dL @ B^T, dB = A^T @ dL
+        grad_lora_a = grad_lora_eff @ lora_b.transpose(-1, -2)
+        grad_lora_b = lora_a.transpose(-1, -2) @ grad_lora_eff
+
+        # --- Gradient w.r.t. scale (LSQ) ---
+        # Inside bounds: derivative = round(y) - v  (quantization residual w.r.t. unscaled weight).
+        # Outside bounds: derivative = q_min or q_max.
+        q_clipped = torch.where(lower, torch.full_like(y, float(q_min)), y)
+        q_clipped = torch.where(upper, torch.full_like(y, float(q_max)), q_clipped)
+        round_err = torch.round(y) - v
+        derivative_s = torch.where(middle, round_err, q_clipped)
+        # Sum across group elements -> per-group scale gradient [O, G].
+        grad_scale_param = (grad_out_g * derivative_s).sum(dim=-1) * grad_scale
+
+        # Order matches forward(): (tensor, lora_a, lora_b, scale, q_min, q_max, grad_scale, group_size)
+        return None, grad_lora_a, grad_lora_b, grad_scale_param, None, None, None, None
+
+
+class LSQQuantizer(nn.Module):
+    def __init__(self, bits=4, signed=True, per_channel=False, channels=1):
+        super().__init__()
+        self.bits = bits
+        self.signed = signed
+        self.per_channel = per_channel
+        
+        if signed:
+            self.q_min = -(2 ** (bits - 1))
+            self.q_max = (2 ** (bits - 1)) - 1
+        else:
+            self.q_min = 0
+            self.q_max = (2 ** bits) - 1
+
+        # Scale parameter initialization
+        # We initialize it as a regular Parameter so PyTorch tracks it
+        if per_channel:
+            self.scale = nn.Parameter(torch.ones(channels, 1))
+        else:
+            self.scale = nn.Parameter(torch.tensor(1.0))
+            
+        self.initialized = False
+
+    def init_scale(self, tensor):
+        """ LSQ initializes the scale as: 2 * E[|v|] / sqrt(Q_max) """
+        with torch.no_grad():
+            if self.per_channel:
+                # Expecting a weight tensor of shape (out_features, in_features)
+                mean_abs = tensor.abs().mean(dim=1, keepdim=True)
+            else:
+                mean_abs = tensor.abs().mean()
+            
+            init_val = 2.0 * mean_abs / math.sqrt(self.q_max)
+            self.scale.copy_(init_val)
+            self.initialized = True
+
+    def forward(self, tensor):
+        if not self.initialized and self.training:
+            self.init_scale(tensor)
+
+        # Calculate the LSQ gradient scaling factor (gamma)
+        num_elements = tensor.numel() if not self.per_channel else tensor.shape[1]
+        grad_scale = 1.0 / math.sqrt(num_elements * self.q_max)
+
+        return LSQQuantizerFunction.apply(
+            tensor, self.scale, self.q_min, self.q_max, grad_scale
+        )
+
+
+class LSQLinear(nn.Module):
+    def __init__(self, in_features, out_features, bias=True, weight_bits=4, act_bits=4):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        
+        # Weights are naturally signed, per-channel quantization is industry standard for LLMs
+        self.weight_quantizer = LSQQuantizer(bits=weight_bits, signed=True, per_channel=True, channels=out_features)
+        
+        # Activations can be unsigned if following a ReLU, signed for GELU/SiLU/linear outputs
+        self.act_quantizer = LSQQuantizer(bits=act_bits, signed=True, per_channel=False)
+
+    def forward(self, x):
+        # 1. Quantize inputs/activations arriving at the layer
+        quant_x = self.act_quantizer(x)
+        
+        # 2. Quantize weights per-channel
+        quant_w = self.weight_quantizer(self.linear.weight)
+        
+        # 3. Perform linear projection with quantized elements
+        return nn.functional.linear(quant_x, quant_w, self.linear.bias)
+
+
 class QuantizedLoraLinear(nn.Module):
     """
     Drop-in replacement for ``nn.Linear`` that performs trainable
@@ -131,6 +365,7 @@ class QuantizedLoraLinear(nn.Module):
         self.symmetric = symmetric
         self.lora_rank = lora_rank
         self.log_scale = log_scale
+        self.forward_orig = False
 
         if symmetric:
             self.qmin = -(2 ** (num_bits - 1))
@@ -221,17 +456,6 @@ class QuantizedLoraLinear(nn.Module):
         else:
             self._scale_param.copy_(scale)
 
-        # apply scale for weight to avoid this in forward pass and apply regularization on LoRA to range (-1, 1)
-        w_grouped.div_(scale.unsqueeze(-1))
-        self.module.weight.data = w_grouped.reshape(self.out_features, self.in_features).data
-
-    @torch.no_grad()
-    def rescale_weight(self) -> Tensor:
-        """Rescale the weight by the current scale. Useful before clip search."""
-        w = self.module.weight.clone()
-        w_grouped = w.reshape(self.out_features, self.num_groups, self.group_size)
-        w_grouped.mul_(self.scale.unsqueeze(-1))
-        return w_grouped.reshape(self.out_features, self.in_features)
 
     # ------------------------------------------------------------------ #
     # Quantization
@@ -250,15 +474,20 @@ class QuantizedLoraLinear(nn.Module):
             lora = self.lora_a @ self.lora_b
             # restrict LoRA values to range (-1, 1) to avoid instability during quantization and large updates
             # lora = torch.tanh(lora)
-            lora = 0.5 * ClippedSTE.apply(lora)
-            w = w + lora
-        return w
+            lora = 2 * ClippedSTE.apply(lora)
+            return w, lora
+        return w, 0
 
     def quantize_dequantize(self) -> Tensor:
         """Return the fake-quantized weight (with LoRA applied)."""
-        w = self._effective_weight()
+        w, lora = self._effective_weight()
         w_g = w.reshape(self.out_features, self.num_groups, self.group_size)
         scale = self.scale.unsqueeze(-1)
+        w_g = w_g / scale
+
+        if self.lora_rank > 0:
+            lora_g = lora.reshape(self.out_features, self.num_groups, self.group_size)
+            w_g = w_g + lora_g
 
         if self.symmetric:
             q = _round_ste(w_g)
@@ -273,6 +502,8 @@ class QuantizedLoraLinear(nn.Module):
         return w_dq.reshape(self.out_features, self.in_features).to(w.dtype)
 
     def forward(self, x: Tensor) -> Tensor:
+        if self.forward_orig:
+            return F.linear(x, self.module.weight, self.module.bias)
         return F.linear(x, self.quantize_dequantize(), self.module.bias)
 
     def extra_repr(self) -> str:
@@ -298,6 +529,8 @@ class QuantizedLoraLinear(nn.Module):
         """
         w_g = self.module.weight.float().reshape(self.out_features, self.num_groups, self.group_size)
         s = scale.unsqueeze(-1)
+        w_g = w_g / s
+
         if self.symmetric:
             q = torch.round(w_g).clamp(self.qmin, self.qmax)
             target = q
@@ -349,7 +582,7 @@ class QuantizedLoraLinear(nn.Module):
             raise ValueError(f"x_calib must have shape [N, {in_f}], got {tuple(x.shape)}.")
         x_g = x.reshape(x.shape[0], n_g, g)
 
-        w_full = self.rescale_weight().float()  # self.module.weight.float()
+        w_full = self.module.weight.float()
 
         w_g = w_full.reshape(out_f, n_g, g)
         # FP per-group output contributions: [N, out_f, n_g]

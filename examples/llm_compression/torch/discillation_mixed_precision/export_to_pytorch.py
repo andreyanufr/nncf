@@ -15,7 +15,7 @@ if __name__ == "__main__":
     # ckpt_file = Path("output_qwen_3_4B_l1/last_sym_no_nncf_equalizing_gs_32_64_distill_vdiv_another_sens_up_09/nncf_checkpoint.pth")
     # model_dir = Path("output_qwen_3_4B_l1/last_sym_no_nncf_equalizing_gs_32_64_distill_vdiv_another_sens_up_09/pt_model_for_eval")
 
-    dst_dir = "output_qwen_3_8B/last_asym_nncf_equalizing_gs_32_64_fq_lr01_ep5"
+    dst_dir = "output_qwen_3_8B/last_sym_nncf_equalizing_gs_64_64_fq_lr01_ep5_safe_scale"
     ckpt_file = Path(f"{dst_dir}/nncf_checkpoint.pth")
     model_dir = Path(f"{dst_dir}/pt_model_for_eval")
 

@@ -534,7 +534,7 @@ def run_scale_estimation(
 
     handles = []
     for name, module in layers:
-
+        module.forward_orig = True
         def make_hook(n: str):
             def hook(_mod, args):
                 x = args[0].detach()
@@ -567,6 +567,7 @@ def run_scale_estimation(
             model.train()
 
     for name, module in tqdm(layers, desc="Scale estimation: refining scales"):
+        module.forward_orig = False
         if name not in abs_sum or samples_count[name] == 0:
             continue
         s = abs_sum[name] / max(counts[name], 1)
@@ -702,7 +703,7 @@ def _wrap_mixer_linears(
                 log_scale=log_scale,
             ).to(device=child.weight.device, dtype=child.weight.dtype)
             setattr(parent, attr_name, wrapped)
-            print(attr_name, wrapped.module.weight.min().item(), wrapped.module.weight.max().item())
+            #print(attr_name, wrapped.module.weight.min().item(), wrapped.module.weight.max().item())
     return model
 
 
@@ -1197,9 +1198,10 @@ def main(argv: list[str]) -> None:
         lora_rank=args.lora_rank,
         log_scale=args.log_scale,
     )
+    print(f"Answer (post min-max init): {generate_answer(model, tokenizer)}\n")
 
     # Optional NNCF-style scale estimation on a small calibration subset.
-    if args.scale_estimation and False:
+    if args.scale_estimation:
         calib_loader = get_pile(
             num_samples=args.se_num_calib_samples,
             seqlen=args.se_calib_seqlen,
@@ -1236,6 +1238,12 @@ def main(argv: list[str]) -> None:
         fq_lr_int2=fq_lr_int2,
     )
     opt = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
+
+    # Map id(param) -> fully qualified parameter name, used to tag abs-mean
+    # gradient TensorBoard scalars for every trainable parameter.
+    trainable_param_names: dict[int, str] = {
+        id(p): name for name, p in model.named_parameters() if p.requires_grad
+    }
 
     grad_accumulation_steps = args.batch_size // args.microbatch_size
     num_samples = len(train_loader)
@@ -1315,6 +1323,16 @@ def main(argv: list[str]) -> None:
             )
 
             if grad_steps == grad_accumulation_steps:
+                # Track abs-mean of accumulated gradients for every trainable
+                # parameter before the optimizer step zeroes them.
+                for pg in opt.param_groups:
+                    for p in pg["params"]:
+                        if p.grad is None:
+                            continue
+                        name = trainable_param_names.get(id(p), f"param_{id(p)}")
+                        abs_mean = p.grad.detach().abs().mean().item() / grad_accumulation_steps
+                        tb.add_scalar(f"grad_abs_mean/{name}", abs_mean, total_steps + 1)
+
                 opt.step()
                 scheduler.step()
                 opt.zero_grad()

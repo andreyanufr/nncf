@@ -30,6 +30,7 @@ from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoModelForCausalLM
 from transformers import AutoTokenizer
 from utils import replace_linear_with_mixer
+from utils import save_mixer_config
 
 import nncf
 from nncf.common.logging.track_progress import track
@@ -112,6 +113,15 @@ def _find_up_gate_groups(model: nn.Module) -> list[tuple[nn.Module, nn.Linear, l
             groups.append((up, gate, producer))
     return groups
 
+# rescale scale to [min, max] to avoid extreme values that cause instability during training or quantization
+def align_scale(s: Tensor, min=0.1, max=1.0) -> Tensor:
+    min_s = s.min()
+    max_s = s.max()
+    if max_s - min_s < 1e-5:
+        return torch.clamp(s, min=min, max=max)
+    s = (s - min_s) / (max_s - min_s) * (max - min) + min
+    return s
+
 
 @torch.no_grad()
 def equalize_up_gate_with_layernorm(model: nn.Module, eps: float = 1e-5) -> int:
@@ -129,9 +139,14 @@ def equalize_up_gate_with_layernorm(model: nn.Module, eps: float = 1e-5) -> int:
 
         # up_proj theoretically more sensitive to quantization
         s = 0.1 * s_gate + 0.9 * s_up
+        s = align_scale(s, min=0.1, max=1.0)
         # Divide down_proj input columns by s.
+        print("Max val before equalization gate:", gate.weight.abs().max().item())
+        print("Max val before equalization up:", up.weight.abs().max().item())
         gate.weight.mul_(1.0 / s.unsqueeze(0))
         up.weight.mul_(1.0 / s.unsqueeze(0))
+        print("Max val after equalization gate:", gate.weight.abs().max().item())
+        print("Max val after equalization up:", up.weight.abs().max().item())
 
         # Scale producer output rows by s.
         s_dev = s.to(device=producer.weight.device, dtype=producer.weight.dtype)
@@ -179,46 +194,15 @@ def equalize_down_proj(
     if not groups:
         return 0
 
-    # abs_sum: dict[int, Tensor] = {}
-    # counts: dict[int, int] = {}
-    # handles = []
-    # for _, down, _ in groups:
-    #     def make_hook(key: int):
-    #         def hook(_mod, args):
-    #             x = args[0].detach()
-    #             x_flat = x.reshape(-1, x.shape[-1]).float()
-    #             a = x_flat.abs().sum(dim=0)
-    #             if key in abs_sum:
-    #                 abs_sum[key] += a
-    #                 counts[key] += x_flat.shape[0]
-    #             else:
-    #                 abs_sum[key] = a
-    #                 counts[key] = x_flat.shape[0]
-    #         return hook
-    #     handles.append(down.register_forward_pre_hook(make_hook(id(down))))
-
-    # was_training = model.training
-    # model.eval()
-    # try:
-    #     for ids in tqdm(calib_inputs, desc="MLP equalization: collecting activations"):
-    #         model(**get_model_input(ids))
-    # finally:
-    #     for h in handles:
-    #         h.remove()
-    #     if was_training:
-    #         model.train()
-
     n_done = 0
     for _, down, producers in groups:
-        key = id(down)
-        # if key not in abs_sum:
-        #     continue
-        # s = (abs_sum[key] / max(counts[key], 1)).clamp_min(eps).to(
-        #     device=down.weight.device, dtype=down.weight.dtype
-        # )
         s = down.weight.abs().mean(dim=0).clamp_min(eps).to(device=down.weight.device, dtype=down.weight.dtype)
-        # Divide down_proj input columns by s.
+        s = align_scale(s, min=0.1, max=1.0)
+        # DEBUG
+        print("Max val before equalization:", down.weight.abs().max().item())
         down.weight.mul_(1.0 / s.unsqueeze(0))
+        print("Max val after equalization:", down.weight.abs().max().item())
+
         # Scale producer output rows by s.
         for prod in producers:
             s_dev = s.to(device=prod.weight.device, dtype=prod.weight.dtype)
@@ -721,8 +705,8 @@ def main(argv) -> float:
     device = "cuda"
     torch_dtype = torch.bfloat16
     compression_config = dict(
-        mode=CompressWeightsMode.INT2_ASYM,
-        group_size=32,
+        mode=CompressWeightsMode.INT2_SYM,
+        group_size=64,
         awq=False,  # avoid awq for splitted linear layers
         scale_estimation=not args.basic_init,
         compression_format=CompressionFormat.FQ_LORA,
@@ -836,7 +820,8 @@ def main(argv) -> float:
 
     answer1 = generate_answer(model, tokenizer)
     print(f"Answer before mixed: {answer1}\n")
-    model = replace_linear_with_mixer(model, ratio=0.5)
+    model, mixer_config = replace_linear_with_mixer(model, ratio=0.5)
+    save_mixer_config(mixer_config, last_dir / "mixer_config.json")
     torch.cuda.empty_cache()
 
     answer2 = generate_answer(model, tokenizer)
