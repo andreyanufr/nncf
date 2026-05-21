@@ -820,7 +820,7 @@ def main(argv) -> float:
 
     answer1 = generate_answer(model, tokenizer)
     print(f"Answer before mixed: {answer1}\n")
-    model, mixer_config = replace_linear_with_mixer(model, ratio=0.5)
+    model, mixer_config = replace_linear_with_mixer(model, ratio=0.5, group_size=64)
     save_mixer_config(mixer_config, last_dir / "mixer_config.json")
     torch.cuda.empty_cache()
 

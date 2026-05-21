@@ -192,17 +192,18 @@ class LinearMIXER(nn.Module):
         ratio: float = 0.5,
         group_size: int = -1,
         int4_first: bool | None = None,
+        split: int | None = None,
     ) -> None:
         super().__init__()
         if not isinstance(model, nn.Linear):
             raise ValueError("LinearMIXER can only be applied to nn.Linear modules.")
         self.ratio = ratio
         self.group_size = group_size
-        if int4_first is None:
-            int4_first = self.if_first_layers_more_sensitive(model.weight.data)
+        if int4_first is None or split is None:
+            int4_first, split = self.find_split_by_sensitive_ratio_maximization(model.weight.data)
         self.register_buffer("int4_first", torch.tensor(bool(int4_first), dtype=torch.bool))
 
-        dim_div1 = int((model.in_features * self.ratio) // self.group_size) * self.group_size if self.group_size > 0 else int(model.in_features * self.ratio)
+        dim_div1 = split if int4_first else model.in_features - split
         dim_div2 = model.in_features - dim_div1
 
         device = model.weight.data.device
@@ -233,13 +234,16 @@ class LinearMIXER(nn.Module):
         return (self.model_int2(x[..., : self.model_int2.in_features]) + self.model_int4(
             x[..., self.model_int2.in_features :]
         )).to(x.dtype)
+    
+        
 
-    def if_first_layers_more_sensitive(
+    def find_split_by_sensitive_ratio_maximization(
         self,
         weight: Tensor,
         *,
         eps: float = 1e-6,
         rel_margin: float = 0.05,
+        edge_skip: float = 0.2,
     ) -> bool:
         """
         Decide whether the first output-channel block is more quantization-sensitive
@@ -260,26 +264,54 @@ class LinearMIXER(nn.Module):
         """
         out_features = weight.shape[0]
         in_features = weight.shape[1]
-        block = int((in_features * self.ratio) // self.group_size) * self.group_size if self.group_size > 0 else int(in_features * self.ratio)
-        if block <= 0 or block >= in_features:
-            raise ValueError(f"Invalid block size {block} for in_features {in_features} and ratio {self.ratio}")
+        
+        if in_features % self.group_size != 0:
+            raise ValueError(f"in_features {in_features} is not divisible by group_size {self.group_size}")
+        
+        hist = []
+        for i in range(0, in_features, self.group_size):
+            w = weight[:, i : i + self.group_size].detach().float().abs()
+            score = (w.amax(dim=1) / (w.mean(dim=1) + eps)).cpu()
+            k = max(1, score.numel() // 10)
+            top_score = torch.topk(score, k).values.mean()
+            hist.append(top_score)
+        hist = torch.tensor(hist)
+        sum = hist.sum()
+        best_ratio = 0.0
+        best_split = -1
+        
+        mid_ratio = (hist[: hist.shape[0] // 2].mean() + eps) / (hist[hist.shape[0] // 2 :].mean() + eps)
+        mid_ratio = max(mid_ratio, 1 / mid_ratio)
+        best_ratio = mid_ratio * (1 + rel_margin)
+        best_split = hist.shape[0] // 2
 
-        w = weight.detach().float().abs()
-        # Per-channel outlier score: peak-to-average ratio.
-        # per_channel = w.amax(dim=0) / (w.mean(dim=0) + eps)
+        left_sum = 0
+        right_sum = sum
+        for i in range(hist.shape[0] - 1):
+            left_sum += hist[i]
+            right_sum -= hist[i]
+            
+            if i < int(edge_skip * hist.shape[0]) or i > int((1 - edge_skip) * hist.shape[0]):
+                continue
 
-        # first = per_channel[:block].flatten()
-        # last = per_channel[-block:].flatten()
-        first = w[:, :block].amax(dim=1) / (w[:, :block].mean(dim=1) + eps)
-        last = w[:, -block:].amax(dim=1) / (w[:, -block:].mean(dim=1) + eps)
+            left_mean = left_sum / (i + 1)
+            right_mean = right_sum / (hist.shape[0] - i - 1)
 
-        # Robust aggregation: average of top-k (k = 10% of the block, at least 1).
-        k = max(1, first.numel() // 10)
-        first_score = torch.topk(first, k).values.mean()
-        last_score = torch.topk(last, k).values.mean()
+            cur_ratio = (left_mean + eps) / (right_mean + eps)
+            cur_ratio = max(cur_ratio, 1 / cur_ratio)
+            
+            if cur_ratio > best_ratio:
+                best_ratio = cur_ratio
+                best_split = i + 1
+
+        if best_split == -1:
+            raise ValueError("Failed to find a valid split point for quantization.")
+        
+        left_score = hist[:best_split].mean().item()
+        right_score = hist[best_split:].mean().item()
 
         # Dead-zone to suppress noise-level flips.
-        return (first_score - last_score).item() > rel_margin * last_score.item()
+        return (left_score - right_score) > rel_margin * right_score, best_split * self.group_size
 
     def to_linear(self) -> nn.Linear:
         """
@@ -420,19 +452,24 @@ def replace_linear_with_mixer(
                 layer_group_size = int(group_size)
                 layer_int4_first = None  # let LinearMIXER compute it once
 
-            print(f"Replacing {full_name} with LinearMIXER (ratio={layer_ratio}, group_size={layer_group_size})")
+            
             wrapped = LinearMIXER(
                 module,
                 ratio=layer_ratio,
                 group_size=layer_group_size,
                 int4_first=layer_int4_first,
             )
+            
+            layer_ratio = wrapped.model_int2.in_features / module.in_features
+            print(f"Replacing {full_name} with LinearMIXER (ratio={layer_ratio}, group_size={layer_group_size})")
+            
             if not use_config:
                 # Persist the computed decision so a later run can skip the heuristic.
                 layers_cfg[full_name] = {
                     "ratio": layer_ratio,
                     "group_size": layer_group_size,
                     "int4_first": bool(wrapped.int4_first.item()),
+                    "split": wrapped.model_int4.in_features if wrapped.int4_first else wrapped.model_int2.in_features,
                 }
             setattr(model, name, wrapped)
             del module
