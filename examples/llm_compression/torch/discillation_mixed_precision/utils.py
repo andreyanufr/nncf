@@ -442,6 +442,7 @@ def replace_linear_with_mixer(
                     continue
                 layer_ratio = float(layer_cfg["ratio"])
                 layer_group_size = int(layer_cfg.get("group_size", -1))
+                layer_split = int(layer_cfg.get("split", -1))
                 # Reuse the precomputed sensitivity decision when available;
                 # this avoids recomputing `if_first_layers_more_sensitive`.
                 layer_int4_first = layer_cfg.get("int4_first")
@@ -451,6 +452,7 @@ def replace_linear_with_mixer(
                 layer_ratio = float(ratio)
                 layer_group_size = int(group_size)
                 layer_int4_first = None  # let LinearMIXER compute it once
+                layer_split = None
 
             
             wrapped = LinearMIXER(
@@ -458,6 +460,7 @@ def replace_linear_with_mixer(
                 ratio=layer_ratio,
                 group_size=layer_group_size,
                 int4_first=layer_int4_first,
+                split=layer_split,
             )
             
             layer_ratio = wrapped.model_int2.in_features / module.in_features
@@ -515,7 +518,7 @@ def export_to_pytorch(pretrained: str, ckpt_file: Path, model_dir: Path, mixture
     :return: A wrapper of OpenVINO model ready for evaluation.
     """
     model_to_eval = AutoModelForCausalLM.from_pretrained(pretrained, torch_dtype=torch.bfloat16, device_map="cpu")
-    model_to_eval, _ = replace_linear_with_mixer(model_to_eval, ratio=0.5) #, config_path=mixture_file)
+    model_to_eval, _ = replace_linear_with_mixer(model_to_eval, ratio=None, group_size=64, config_path=mixture_file)
 
     # ckpt = torch.load(ckpt_file, weights_only=False, map_location="cpu")
     # if "model_state" in ckpt:
