@@ -572,14 +572,14 @@ def set_trainable(model: nn.Module, lora_lr: float, fq_lr: float) -> list[dict[s
             adapters_to_train.extend(adapters.values())
             scales_to_train.extend(param for name, param in params.items() if name not in adapters)
 
-            print(
-                name,
-                module.num_bits,
-                "trainable params:",
-                sum(p.numel() for p in params.values()),
-                "adapters:",
-                len(adapters),
-            )
+            # print(
+            #     name,
+            #     module.num_bits,
+            #     "trainable params:",
+            #     sum(p.numel() for p in params.values()),
+            #     "adapters:",
+            #     len(adapters),
+            # )
 
     params = list(model.parameters())
     trainable_params = sum(p.numel() for p in params if p.requires_grad)
@@ -698,7 +698,7 @@ def get_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--warmup_ratio",
         type=float,
-        default=0.03,
+        default=0,
         help="Fraction of total optimizer steps used for linear warmup before cosine decay.",
     )
 
@@ -728,6 +728,7 @@ def main(argv) -> float:
     args = parser.parse_args(argv)
     assert torch.cuda.is_available()
     transformers.set_seed(42)
+    torch.manual_seed(42)
 
     device = "cuda"
     torch_dtype = torch.bfloat16
@@ -869,7 +870,7 @@ def main(argv) -> float:
     fq_lr = args.lr / 10
     weight_decay = args.lr
     param_to_train = set_trainable(model, lora_lr=args.lr, fq_lr=fq_lr)
-    set_stochastic(model, stochastic=False)
+    set_stochastic(model, stochastic=True)
     opt = torch.optim.AdamW(param_to_train, weight_decay=weight_decay)
     # opt = torch.optim.Muon(param_to_train, weight_decay=weight_decay)
 

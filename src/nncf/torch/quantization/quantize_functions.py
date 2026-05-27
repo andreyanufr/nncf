@@ -131,10 +131,11 @@ class QuantizeSymmetricTorch(torch.autograd.Function):
 
         if stochastic:
             output = RQ.Quantize_forward_stochastic(input_.type(torch.float32), input_low, input_range, levels)
+            ctx.save_for_backward(input_, input_low, input_range, output)
         else:
             output = RQ.Quantize_forward(input_.type(torch.float32), input_low, input_range, levels)
+            ctx.save_for_backward(input_, input_low, input_range, None)
 
-        ctx.save_for_backward(input_, input_low, input_range, output)
         ctx.level_low = level_low
         ctx.level_high = level_high
         ctx.levels = levels

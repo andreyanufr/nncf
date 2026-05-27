@@ -118,7 +118,7 @@ class ReferenceQuantize:
 
     #     return rounded
 
-    def stochastic_round(self, x: torch.Tensor, tolerance: float = 0.3) -> torch.Tensor:
+    def stochastic_round(self, x: torch.Tensor, tolerance: float = 0.4) -> torch.Tensor:
         """
         Applies stochastic rounding to an integer grid.
 
