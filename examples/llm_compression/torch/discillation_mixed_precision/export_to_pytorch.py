@@ -3,19 +3,23 @@ from pathlib import Path
 from transformers import AutoTokenizer
 from utils import export_to_pytorch
 
+
+def parse_args():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Export NNCF compressed model to PyTorch")
+    parser.add_argument("--pretrained", type=str, required=True, help="Pretrained model name or path")
+    parser.add_argument("--ckpt_file", type=str, required=True, help="Path to NNCF checkpoint file")
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    # pretrained = "meta-llama/Llama-3.2-1B-Instruct"
-    # tokenizer = AutoTokenizer.from_pretrained(pretrained)
-    # ckpt_file = Path("output/last/nncf_checkpoint.pth")
-    # model_dir = Path("output/last/pt_model_for_eval")
-    # tokenizer.save_pretrained(model_dir)
+    args = parse_args()
 
-    pretrained = "Qwen/Qwen3-8B"
+    pretrained = args.pretrained
     tokenizer = AutoTokenizer.from_pretrained(pretrained)
-    # ckpt_file = Path("output_qwen_3_4B_l1/last_sym_no_nncf_equalizing_gs_32_64_distill_vdiv_another_sens_up_09/nncf_checkpoint.pth")
-    # model_dir = Path("output_qwen_3_4B_l1/last_sym_no_nncf_equalizing_gs_32_64_distill_vdiv_another_sens_up_09/pt_model_for_eval")
 
-    dst_dir = "output_qwen_3_8B/last_sym_nncf_equalizing_gs_64_64_fq_lr01_ep5_safe_scale"
+    dst_dir = args.ckpt_file
     ckpt_file = Path(f"{dst_dir}/nncf_checkpoint.pth")
     model_dir = Path(f"{dst_dir}/pt_model_for_eval")
 

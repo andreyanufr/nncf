@@ -1170,6 +1170,7 @@ class SymmetricLoraQuantizer(SymmetricQuantizer, LoraMixin):
     def __init__(self, qspec: PTQuantizerSpec, lspec: PTLoraSpec):
         super().__init__(qspec)
         self.init_lora(lspec)
+        self.stochastic = False
 
     def quantize(self, x, execute_traced_op_as_identity: bool = False):
         # TODO(AlexanderDokuchaev): remove within new tracing (ticket-163869)
@@ -1187,6 +1188,7 @@ class SymmetricLoraQuantizer(SymmetricQuantizer, LoraMixin):
             self.levels,
             self.eps,
             skip=execute_traced_op_as_identity,
+            stochastic=self.stochastic,
         )
 
     def enable_gradients(self) -> None:
@@ -1231,6 +1233,7 @@ class SymmetricLoraNLSQuantizer(SymmetricLoraQuantizer, LoraNLSMixin):
             self.levels,
             self.eps,
             skip=execute_traced_op_as_identity,
+            stochastic=self.stochastic,
         )
 
     @classmethod

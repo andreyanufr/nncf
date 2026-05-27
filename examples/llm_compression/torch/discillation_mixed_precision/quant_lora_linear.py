@@ -85,10 +85,10 @@ def _clamp_ste(x: Tensor, lo: float, hi: float) -> Tensor:
     return x + (x.clamp(lo, hi) - x).detach()
 
 
+import math
 
 import torch
-import torch.nn as nn
-import math
+
 
 class LSQQuantizerFunction(torch.autograd.Function):
     @staticmethod
@@ -101,10 +101,10 @@ class LSQQuantizerFunction(torch.autograd.Function):
 
         # 1. Scale the input tensor
         scaled_tensor = tensor / scale
-        
+
         # 2. Quantize (Round & Clip)
         quantized = torch.clamp(torch.round(scaled_tensor), q_min, q_max)
-        
+
         # 3. Dequantize
         dequantized = quantized * scale
         return dequantized
@@ -117,7 +117,7 @@ class LSQQuantizerFunction(torch.autograd.Function):
         grad_scale = ctx.grad_scale
 
         scaled_tensor = tensor / scale
-        
+
         # Determine clipping regions
         lower_mask = (scaled_tensor < q_min).float()
         upper_mask = (scaled_tensor > q_max).float()
@@ -132,18 +132,17 @@ class LSQQuantizerFunction(torch.autograd.Function):
         # Outside bounds: it evaluates to either q_min or q_max.
         quantized_or_clipped = torch.where(scaled_tensor < q_min, float(q_min), scaled_tensor)
         quantized_or_clipped = torch.where(scaled_tensor > q_max, float(q_max), quantized_or_clipped)
-        
+
         # LSQ formulation accounts for the exact rounding error inside the grid
         round_error = torch.round(scaled_tensor) - scaled_tensor
         derivative_s = torch.where(middle_mask.bool(), round_error, quantized_or_clipped)
-        
+
         # Sum across the tensor elements and apply the LSQ gradient scaling factor (grad_scale)
         grad_scale_param = torch.sum(grad_output * derivative_s) * grad_scale
 
         # Return gradients matching the order of forward() arguments
         # (tensor, scale, q_min, q_max, grad_scale)
         return grad_tensor, grad_scale_param, None, None, None
-
 
 
 class LSQQuantizerFunctionWithLoRA(torch.autograd.Function):
@@ -163,14 +162,10 @@ class LSQQuantizerFunctionWithLoRA(torch.autograd.Function):
     def forward(ctx, tensor, lora_a, lora_b, scale, q_min, q_max, grad_scale, group_size):
         out_f, in_f = tensor.shape
         if group_size <= 0 or in_f % group_size != 0:
-            raise ValueError(
-                f"in_features ({in_f}) must be a positive multiple of group_size ({group_size})."
-            )
+            raise ValueError(f"in_features ({in_f}) must be a positive multiple of group_size ({group_size}).")
         num_groups = in_f // group_size
         if scale.shape != (out_f, num_groups):
-            raise ValueError(
-                f"scale shape {tuple(scale.shape)} does not match expected ({out_f}, {num_groups})."
-            )
+            raise ValueError(f"scale shape {tuple(scale.shape)} does not match expected ({out_f}, {num_groups}).")
 
         # LoRA correction, clipped to [-1, 1].
         lora = lora_a @ lora_b  # [O, I]
@@ -223,7 +218,7 @@ class LSQQuantizerFunctionWithLoRA(torch.autograd.Function):
 
         # --- Gradient w.r.t. the input tensor (STE through round+clamp) ---
         # d(out)/d(tensor) inside = 1, outside = 0.
-        #grad_tensor = (grad_out_g * middle_f).reshape(out_f, in_f)
+        # grad_tensor = (grad_out_g * middle_f).reshape(out_f, in_f)
 
         # --- Gradient w.r.t. LoRA factors ---
         # d(out)/d(L) inside = scale, outside = 0; then masked by the LoRA clip region.
@@ -254,13 +249,13 @@ class LSQQuantizer(nn.Module):
         self.bits = bits
         self.signed = signed
         self.per_channel = per_channel
-        
+
         if signed:
             self.q_min = -(2 ** (bits - 1))
             self.q_max = (2 ** (bits - 1)) - 1
         else:
             self.q_min = 0
-            self.q_max = (2 ** bits) - 1
+            self.q_max = (2**bits) - 1
 
         # Scale parameter initialization
         # We initialize it as a regular Parameter so PyTorch tracks it
@@ -268,18 +263,18 @@ class LSQQuantizer(nn.Module):
             self.scale = nn.Parameter(torch.ones(channels, 1))
         else:
             self.scale = nn.Parameter(torch.tensor(1.0))
-            
+
         self.initialized = False
 
     def init_scale(self, tensor):
-        """ LSQ initializes the scale as: 2 * E[|v|] / sqrt(Q_max) """
+        """LSQ initializes the scale as: 2 * E[|v|] / sqrt(Q_max)"""
         with torch.no_grad():
             if self.per_channel:
                 # Expecting a weight tensor of shape (out_features, in_features)
                 mean_abs = tensor.abs().mean(dim=1, keepdim=True)
             else:
                 mean_abs = tensor.abs().mean()
-            
+
             init_val = 2.0 * mean_abs / math.sqrt(self.q_max)
             self.scale.copy_(init_val)
             self.initialized = True
@@ -292,29 +287,27 @@ class LSQQuantizer(nn.Module):
         num_elements = tensor.numel() if not self.per_channel else tensor.shape[1]
         grad_scale = 1.0 / math.sqrt(num_elements * self.q_max)
 
-        return LSQQuantizerFunction.apply(
-            tensor, self.scale, self.q_min, self.q_max, grad_scale
-        )
+        return LSQQuantizerFunction.apply(tensor, self.scale, self.q_min, self.q_max, grad_scale)
 
 
 class LSQLinear(nn.Module):
     def __init__(self, in_features, out_features, bias=True, weight_bits=4, act_bits=4):
         super().__init__()
         self.linear = nn.Linear(in_features, out_features, bias=bias)
-        
+
         # Weights are naturally signed, per-channel quantization is industry standard for LLMs
         self.weight_quantizer = LSQQuantizer(bits=weight_bits, signed=True, per_channel=True, channels=out_features)
-        
+
         # Activations can be unsigned if following a ReLU, signed for GELU/SiLU/linear outputs
         self.act_quantizer = LSQQuantizer(bits=act_bits, signed=True, per_channel=False)
 
     def forward(self, x):
         # 1. Quantize inputs/activations arriving at the layer
         quant_x = self.act_quantizer(x)
-        
+
         # 2. Quantize weights per-channel
         quant_w = self.weight_quantizer(self.linear.weight)
-        
+
         # 3. Perform linear projection with quantized elements
         return nn.functional.linear(quant_x, quant_w, self.linear.bias)
 
@@ -455,7 +448,6 @@ class QuantizedLoraLinear(nn.Module):
             self._scale_param.copy_(torch.log(scale))
         else:
             self._scale_param.copy_(scale)
-
 
     # ------------------------------------------------------------------ #
     # Quantization

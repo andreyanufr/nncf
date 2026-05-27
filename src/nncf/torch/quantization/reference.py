@@ -92,6 +92,74 @@ class ReferenceQuantize:
         output = output / scale
         return output
 
+    # def stochastic_round(self, x: torch.Tensor) -> torch.Tensor:
+    #     """
+    #     Applies stochastic rounding to an integer grid.
+
+    #     Args:
+    #         x (torch.Tensor): Input continuous tensor (e.g., float32).
+
+    #     Returns:
+    #         torch.Tensor: Stochastically rounded integer values (still stored as floats).
+    #     """
+    #     # 1. Extract the floor (x1)
+    #     x_floor = torch.floor(x)
+
+    #     # 2. Compute the fractional part (the distance to x1)
+    #     # This represents the probability of rounding UP to x_floor + 1
+    #     p = x - x_floor
+
+    #     # 3. Generate uniform random noise between 0 and 1
+    #     noise = torch.rand_like(x)
+
+    #     # 4. If the random noise is less than the probability, round up (add 1)
+    #     # Otherwise, keep the floor value.
+    #     rounded = x_floor + (noise < p).to(x.dtype)
+
+    #     return rounded
+
+    def stochastic_round(self, x: torch.Tensor, tolerance: float = 0.3) -> torch.Tensor:
+        """
+        Applies stochastic rounding to an integer grid.
+
+        Args:
+            x (torch.Tensor): Input continuous tensor (e.g., float32).
+
+        Returns:
+            torch.Tensor: Stochastically rounded integer values (still stored as floats).
+        """
+        # 1. Extract the round (x1)
+        x_round = torch.round(x)
+
+        # 2. Compute the fractional part (the distance to x1)
+        # This represents the probability of rounding UP to x_round + 1
+        p = x - x_round
+        sign = torch.sign(p)
+        p = torch.abs(p)
+
+        # 3. Generate uniform random noise between 0 and 1
+        noise = torch.rand_like(x)
+        noise = tolerance + (1.0 - tolerance) * noise
+
+        # 4. If the random noise is less than the probability, round up (add 1)
+        # Otherwise, keep the floor value.
+        rounded = x_round + sign * (noise < p).to(x.dtype)
+
+        return rounded
+
+    def forward_stochastic(
+        self, input_: GeneralizedTensor, input_low: GeneralizedTensor, input_range: GeneralizedTensor, levels: int
+    ) -> GeneralizedTensor:
+        scale = (levels - 1) / input_range
+        output = input_.clip(min=input_low, max=input_low + input_range)
+        zero_point = (-input_low * scale).round()
+        output -= input_low
+        output *= scale
+        output -= zero_point
+        output = self.stochastic_round(output)
+        output = output / scale
+        return output
+
     def backward(
         self,
         grad_output: GeneralizedTensor,
@@ -102,6 +170,7 @@ class ReferenceQuantize:
         level_low: int,
         level_high: int,
         is_asymmetric: bool = False,
+        output: GeneralizedTensor = None,
     ) -> list[GeneralizedTensor]:
         # is_asymmetric is unused, present only to correspond to the CPU signature of calling "backward"
         mask_hi = input_ > (input_low + input_range)
@@ -111,7 +180,8 @@ class ReferenceQuantize:
 
         mask_in = 1 - mask_hi - mask_lo
         range_sign = self._sign(input_range)
-        output = self.forward(input_, input_low, input_range, levels)
+        if output is None:
+            output = self.forward(input_, input_low, input_range, levels)
         err = (output - input_) * self._reciprocal(input_range * range_sign)
         grad_range = grad_output * (err * mask_in + range_sign * (level_low / level_high) * mask_lo + mask_hi)
         grad_range = sum_like(grad_range, input_range)
@@ -150,9 +220,11 @@ class ReferenceQuantize:
 
 torch_executor = ReferenceQuantize(backend_type=ReferenceBackendType.TORCH)
 torch_forward = CompilationWrapper(torch_executor.forward)
+torch_forward_stochastic = CompilationWrapper(torch_executor.forward_stochastic)
 torch_backward = CompilationWrapper(torch_executor.backward)
 
 
 class ReferenceQuantizedFunctions:
     Quantize_forward = torch_forward
+    Quantize_forward_stochastic = torch_forward_stochastic
     Quantize_backward = torch_backward

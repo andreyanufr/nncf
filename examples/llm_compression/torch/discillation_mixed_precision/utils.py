@@ -202,7 +202,11 @@ class LinearMIXER(nn.Module):
             int4_first = self.if_first_layers_more_sensitive(model.weight.data)
         self.register_buffer("int4_first", torch.tensor(bool(int4_first), dtype=torch.bool))
 
-        dim_div1 = int((model.in_features * self.ratio) // self.group_size) * self.group_size if self.group_size > 0 else int(model.in_features * self.ratio)
+        dim_div1 = (
+            int((model.in_features * self.ratio) // self.group_size) * self.group_size
+            if self.group_size > 0
+            else int(model.in_features * self.ratio)
+        )
         dim_div2 = model.in_features - dim_div1
 
         device = model.weight.data.device
@@ -227,12 +231,14 @@ class LinearMIXER(nn.Module):
 
     def forward(self, x):
         if self.int4_first:
-            return (self.model_int4(x[..., : self.model_int4.in_features]) + self.model_int2(
-                x[..., self.model_int4.in_features :]
-            )).to(x.dtype)
-        return (self.model_int2(x[..., : self.model_int2.in_features]) + self.model_int4(
-            x[..., self.model_int2.in_features :]
-        )).to(x.dtype)
+            return (
+                self.model_int4(x[..., : self.model_int4.in_features])
+                + self.model_int2(x[..., self.model_int4.in_features :])
+            ).to(x.dtype)
+        return (
+            self.model_int2(x[..., : self.model_int2.in_features])
+            + self.model_int4(x[..., self.model_int2.in_features :])
+        ).to(x.dtype)
 
     def if_first_layers_more_sensitive(
         self,
@@ -260,7 +266,11 @@ class LinearMIXER(nn.Module):
         """
         out_features = weight.shape[0]
         in_features = weight.shape[1]
-        block = int((in_features * self.ratio) // self.group_size) * self.group_size if self.group_size > 0 else int(in_features * self.ratio)
+        block = (
+            int((in_features * self.ratio) // self.group_size) * self.group_size
+            if self.group_size > 0
+            else int(in_features * self.ratio)
+        )
         if block <= 0 or block >= in_features:
             raise ValueError(f"Invalid block size {block} for in_features {in_features} and ratio {self.ratio}")
 
@@ -467,7 +477,7 @@ def replace_mixer_with_linear(model: nn.Module) -> nn.Module:
 
 
 @torch.no_grad()
-def export_to_pytorch(pretrained: str, ckpt_file: Path, model_dir: Path, mixture_file: Path=None) -> None:
+def export_to_pytorch(pretrained: str, ckpt_file: Path, model_dir: Path, mixture_file: Path = None) -> None:
     """
     Create a wrapper of OpenVINO model from the checkpoint for evaluation on CPU via WWB.
 
@@ -478,7 +488,7 @@ def export_to_pytorch(pretrained: str, ckpt_file: Path, model_dir: Path, mixture
     :return: A wrapper of OpenVINO model ready for evaluation.
     """
     model_to_eval = AutoModelForCausalLM.from_pretrained(pretrained, torch_dtype=torch.bfloat16, device_map="cpu")
-    model_to_eval, _ = replace_linear_with_mixer(model_to_eval, ratio=0.5) #, config_path=mixture_file)
+    model_to_eval, _ = replace_linear_with_mixer(model_to_eval, ratio=0.5)  # , config_path=mixture_file)
 
     # ckpt = torch.load(ckpt_file, weights_only=False, map_location="cpu")
     # if "model_state" in ckpt:

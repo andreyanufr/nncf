@@ -120,7 +120,7 @@ class QuantizeAsymmetric(torch.autograd.Function):
 
 class QuantizeSymmetricTorch(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, input_, input_shape, scale, level_low, level_high, levels):
+    def forward(ctx, input_, input_shape, scale, level_low, level_high, levels, stochastic=False):
         # range: [-scale, 7/8 * scale] if scale > 0 else [7/8 * scale, -scale]
         input_low = torch.where(scale > 0, -scale, -scale / level_low * level_high)
         # 15/8 * scale or (2-1/8) * scale
@@ -129,9 +129,12 @@ class QuantizeSymmetricTorch(torch.autograd.Function):
         original_shape = input_.shape
         input_ = input_.reshape(input_shape)
 
-        output = RQ.Quantize_forward(input_.type(torch.float32), input_low, input_range, levels)
+        if stochastic:
+            output = RQ.Quantize_forward_stochastic(input_.type(torch.float32), input_low, input_range, levels)
+        else:
+            output = RQ.Quantize_forward(input_.type(torch.float32), input_low, input_range, levels)
 
-        ctx.save_for_backward(input_, input_low, input_range)
+        ctx.save_for_backward(input_, input_low, input_range, output)
         ctx.level_low = level_low
         ctx.level_high = level_high
         ctx.levels = levels
@@ -141,7 +144,7 @@ class QuantizeSymmetricTorch(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        input_, input_low, input_range = ctx.saved_tensors
+        input_, input_low, input_range, output = ctx.saved_tensors
         levels = ctx.levels
         level_low = ctx.level_low
         level_high = ctx.level_high
@@ -151,23 +154,26 @@ class QuantizeSymmetricTorch(torch.autograd.Function):
         grad_output = grad_output.reshape(input_shape)
 
         grad_input, _, grad_scale = RQ.Quantize_backward(
-            grad_output, input_, input_low, input_range, levels, level_low, level_high
+            grad_output, input_, input_low, input_range, levels, level_low, level_high, output=output
         )
 
         grad_input = grad_input.reshape(orig_shape)
         grad_scale = grad_scale.float()
         # input, input_shape, scale, level_low, level_high, levels
-        return grad_input, None, grad_scale, None, None, None
+        return grad_input, None, grad_scale, None, None, None, None
 
 
 class QuantizeAsymmetricTorch(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, input_, input_shape, input_low, input_range, level_low, level_high, levels):
+    def forward(ctx, input_, input_shape, input_low, input_range, level_low, level_high, levels, stochastic=False):
         dtype = input_.dtype
         original_shape = input_.shape
         input_ = input_.reshape(input_shape)
 
-        output = RQ.Quantize_forward(input_.type(torch.float32), input_low, input_range, levels)
+        if stochastic:
+            output = RQ.Quantize_forward_stochastic(input_.type(torch.float32), input_low, input_range, levels)
+        else:
+            output = RQ.Quantize_forward(input_.type(torch.float32), input_low, input_range, levels)
 
         # Save tensors for backward pass
         ctx.save_for_backward(input_, input_low, input_range)
@@ -282,7 +288,18 @@ def asymmetric_quantize(input_, levels, level_low, level_high, input_low, input_
 
 
 def asymmetric_quantize_lora(
-    input_, input_shape, A, B, input_low_, input_range_, level_low, level_high, levels, eps, skip: bool = False
+    input_,
+    input_shape,
+    A,
+    B,
+    input_low_,
+    input_range_,
+    level_low,
+    level_high,
+    levels,
+    eps,
+    skip: bool = False,
+    stochastic=False,
 ):
     if has_torch_function_unary(input_):
         return handle_torch_function(
@@ -313,10 +330,13 @@ def asymmetric_quantize_lora(
         level_low,
         level_high,
         levels,
+        stochastic=stochastic,
     )
 
 
-def symmetric_quantize_lora(input_, input_shape, A, B, scale, level_low, level_high, levels, eps, skip: bool = False):
+def symmetric_quantize_lora(
+    input_, input_shape, A, B, scale, level_low, level_high, levels, eps, skip: bool = False, stochastic=False
+):
     if has_torch_function_unary(input_):
         return handle_torch_function(
             symmetric_quantize_lora,
@@ -331,6 +351,7 @@ def symmetric_quantize_lora(input_, input_shape, A, B, scale, level_low, level_h
             levels,
             eps,
             skip,
+            stochastic,
         )
     if skip:
         return input_
@@ -343,6 +364,7 @@ def symmetric_quantize_lora(input_, input_shape, A, B, scale, level_low, level_h
         level_low,
         level_high,
         levels,
+        stochastic,
     )
 
 

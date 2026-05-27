@@ -535,6 +535,7 @@ def run_scale_estimation(
     handles = []
     for name, module in layers:
         module.forward_orig = True
+
         def make_hook(n: str):
             def hook(_mod, args):
                 x = args[0].detach()
@@ -703,7 +704,7 @@ def _wrap_mixer_linears(
                 log_scale=log_scale,
             ).to(device=child.weight.device, dtype=child.weight.dtype)
             setattr(parent, attr_name, wrapped)
-            #print(attr_name, wrapped.module.weight.min().item(), wrapped.module.weight.max().item())
+            # print(attr_name, wrapped.module.weight.min().item(), wrapped.module.weight.max().item())
     return model
 
 
@@ -1241,9 +1242,7 @@ def main(argv: list[str]) -> None:
 
     # Map id(param) -> fully qualified parameter name, used to tag abs-mean
     # gradient TensorBoard scalars for every trainable parameter.
-    trainable_param_names: dict[int, str] = {
-        id(p): name for name, p in model.named_parameters() if p.requires_grad
-    }
+    trainable_param_names: dict[int, str] = {id(p): name for name, p in model.named_parameters() if p.requires_grad}
 
     grad_accumulation_steps = args.batch_size // args.microbatch_size
     num_samples = len(train_loader)

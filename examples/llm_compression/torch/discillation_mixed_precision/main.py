@@ -37,7 +37,6 @@ import nncf
 from nncf.data.dataset import Dataset
 from nncf.parameters import CompressionFormat
 from nncf.parameters import CompressWeightsMode
-from nncf.scopes import IgnoredScope
 from nncf.quantization.advanced_parameters import AdvancedAWQParameters
 from nncf.quantization.advanced_parameters import AdvancedCompressionParameters
 from nncf.quantization.quantize_model import compress_weights
@@ -114,6 +113,7 @@ def _find_up_gate_groups(model: nn.Module) -> list[tuple[nn.Module, nn.Linear, l
             groups.append((up, gate, producer))
     return groups
 
+
 # rescale scale to [min, max] to avoid extreme values that cause instability during training or quantization
 def align_scale(s: Tensor, min=0.1, max=1.0) -> Tensor:
     min_s = s.min()
@@ -142,12 +142,12 @@ def equalize_up_gate_with_layernorm(model: nn.Module, eps: float = 1e-5) -> int:
         s = 0.1 * s_gate + 0.9 * s_up
         s = align_scale(s, min=0.1, max=1.0)
         # Divide down_proj input columns by s.
-        #print("Max val before equalization gate:", gate.weight.abs().max().item())
-        #print("Max val before equalization up:", up.weight.abs().max().item())
+        # print("Max val before equalization gate:", gate.weight.abs().max().item())
+        # print("Max val before equalization up:", up.weight.abs().max().item())
         gate.weight.mul_(1.0 / s.unsqueeze(0))
         up.weight.mul_(1.0 / s.unsqueeze(0))
-        #print("Max val after equalization gate:", gate.weight.abs().max().item())
-        #print("Max val after equalization up:", up.weight.abs().max().item())
+        # print("Max val after equalization gate:", gate.weight.abs().max().item())
+        # print("Max val after equalization up:", up.weight.abs().max().item())
 
         # Scale producer output rows by s.
         s_dev = s.to(device=producer.weight.device, dtype=producer.weight.dtype)
@@ -200,9 +200,9 @@ def equalize_down_proj(
         s = down.weight.abs().mean(dim=0).clamp_min(eps).to(device=down.weight.device, dtype=down.weight.dtype)
         s = align_scale(s, min=0.1, max=1.0)
         # DEBUG
-        #print("Max val before equalization:", down.weight.abs().max().item())
+        # print("Max val before equalization:", down.weight.abs().max().item())
         down.weight.mul_(1.0 / s.unsqueeze(0))
-        #print("Max val after equalization:", down.weight.abs().max().item())
+        # print("Max val after equalization:", down.weight.abs().max().item())
 
         # Scale producer output rows by s.
         for prod in producers:
@@ -529,6 +529,22 @@ def kl_div(student_hiddens: torch.Tensor, teacher_hiddens: torch.Tensor) -> torc
     )
 
 
+def set_stochastic(model: nn.Module, stochastic: bool) -> None:
+    """
+    Sets the stochastic mode for all quantizers in the model.
+
+    This function iterates through all the hooks in the model's hook storage and checks if they are instances of
+    AsymmetricLoraQuantizer or SymmetricLoraQuantizer. If they are, it sets their stochastic mode to the provided value.
+
+    :param model: The model containing the quantizers.
+    :param stochastic: A boolean value indicating whether to enable or disable stochastic mode for the quantizers.
+    """
+    hook_storage = get_hook_storage(model)
+    for _, module in hook_storage.named_hooks():
+        if isinstance(module, (AsymmetricLoraQuantizer, SymmetricLoraQuantizer)) and (module.num_bits == 2):
+            module.stochastic = stochastic
+
+
 def set_trainable(model: nn.Module, lora_lr: float, fq_lr: float) -> list[dict[str, Any]]:
     """
     Sets the trainable parameters of the model for quantization-aware training with LoRA (Low-Rank Adaptation).
@@ -547,14 +563,23 @@ def set_trainable(model: nn.Module, lora_lr: float, fq_lr: float) -> list[dict[s
     scales_to_train = []
     adapters_to_train = []
     hook_storage = get_hook_storage(model)
-    for _, module in hook_storage.named_hooks():
-        #if isinstance(module, (AsymmetricLoraQuantizer, SymmetricLoraQuantizer)) and (module.num_bits == 4):
+    for name, module in hook_storage.named_hooks():
+        # if isinstance(module, (AsymmetricLoraQuantizer, SymmetricLoraQuantizer)) and (module.num_bits == 4):
         if isinstance(module, (AsymmetricLoraQuantizer, SymmetricLoraQuantizer)):
             module.enable_gradients()
             params = module.get_trainable_params()
             adapters = module.get_adapters()
             adapters_to_train.extend(adapters.values())
             scales_to_train.extend(param for name, param in params.items() if name not in adapters)
+
+            print(
+                name,
+                module.num_bits,
+                "trainable params:",
+                sum(p.numel() for p in params.values()),
+                "adapters:",
+                len(adapters),
+            )
 
     params = list(model.parameters())
     trainable_params = sum(p.numel() for p in params if p.requires_grad)
@@ -712,7 +737,7 @@ def main(argv) -> float:
         awq=False,  # avoid awq for splitted linear layers
         scale_estimation=not args.basic_init,
         compression_format=CompressionFormat.FQ_LORA,
-        #ignored_scope=IgnoredScope(names=["*.lm_head"])
+        # ignored_scope=IgnoredScope(names=["*.lm_head"])
     )
     pprint({"CLI arguments": vars(args), "Major compression parameters": compression_config})
     compression_config["advanced_parameters"] = AdvancedCompressionParameters(
@@ -844,6 +869,7 @@ def main(argv) -> float:
     fq_lr = args.lr / 10
     weight_decay = args.lr
     param_to_train = set_trainable(model, lora_lr=args.lr, fq_lr=fq_lr)
+    set_stochastic(model, stochastic=False)
     opt = torch.optim.AdamW(param_to_train, weight_decay=weight_decay)
     # opt = torch.optim.Muon(param_to_train, weight_decay=weight_decay)
 
@@ -866,6 +892,8 @@ def main(argv) -> float:
     aggregated_l1_loss = 0.0
 
     for epoch in range(args.epochs):
+        if epoch == args.epochs:
+            set_stochastic(model, stochastic=False)
         batch_indices_epoch = torch.randperm(num_samples)[:epoch_samples].chunk(microbatches_per_epoch)
         pbar = tqdm(batch_indices_epoch, desc=f"Train epoch {epoch}")
         for indices in pbar:

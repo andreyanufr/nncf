@@ -85,7 +85,10 @@ def convert_to_torch_fakequantizer(nncf_quantizer: BaseQuantizer) -> FakeQuantiz
 
     return fakequantizer
 
-def get_quantized_weight_for_nncf_linear(quantizer: AsymmetricQuantizer | SymmetricQuantizer, weight: torch.Tensor) -> torch.Tensor:
+
+def get_quantized_weight_for_nncf_linear(
+    quantizer: AsymmetricQuantizer | SymmetricQuantizer, weight: torch.Tensor
+) -> torch.Tensor:
     """
     Get quantized weight from quantizer and original weight tensor.
 
@@ -108,7 +111,7 @@ def get_quantized_weight_for_nncf_linear(quantizer: AsymmetricQuantizer | Symmet
         qdq_weight = qdq_weight.reshape(quantizer._lspec.weight_shape)
         group_size = quantizer._lspec.weight_shape[-1]
     qdq_weight = qdq_weight.to(float_dtype)
-    
+
     if isinstance(quantizer, AsymmetricQuantizer):
         input_range_safe = abs(quantizer.input_range) + quantizer.eps
         input_low, input_range = TuneRange.apply(quantizer.input_low, input_range_safe, quantizer.levels)
@@ -128,7 +131,7 @@ def get_quantized_weight_for_nncf_linear(quantizer: AsymmetricQuantizer | Symmet
         scale = torch.where(torch.abs(scale) < eps, eps, scale)
         scale = scale.to(float_dtype)
         zero_point = torch.tensor([-quantizer.level_low], dtype=float_dtype)
-    
+
     q_weight = qdq_weight / scale
     q_weight = q_weight + zero_point
     q_weight = torch.round(q_weight)

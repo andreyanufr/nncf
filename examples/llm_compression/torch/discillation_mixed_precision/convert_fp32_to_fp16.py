@@ -32,14 +32,31 @@ def convert_fp32_constants_to_fp16(model: ov.Model) -> int:
         if fp32_data.size < 100 or len(fp32_data.shape) < 3 or fp32_data.shape[0] < 10:
             # Skip small constants since the overhead of the Convert may outweigh the memory savings.
             continue
-        
+
         fp16_data = fp32_data.astype(np.float16)
-        
+
         if np.abs(fp32_data - fp16_data.astype(np.float32)).max() > 0.05:
-            print(f"Converting Constant '{node.get_friendly_name()}' from fp32 to fp16. Original shape: {fp32_data.shape}, original size: {fp32_data.nbytes} bytes, new size: {fp16_data.nbytes} bytes.")
-            print("Difference stats: mean absolute error =", np.abs(fp32_data - fp16_data.astype(np.float32)).mean(), ", max absolute error =", np.abs(fp32_data - fp16_data.astype(np.float32)).max())
-            print("Max value before conversion:", np.abs(fp32_data).max(), ", max value after conversion:", np.abs(fp16_data).max())
-            print("Min value before conversion:", np.abs(fp32_data).min(), ", min value after conversion:", np.abs(fp16_data).min())
+            print(
+                f"Converting Constant '{node.get_friendly_name()}' from fp32 to fp16. Original shape: {fp32_data.shape}, original size: {fp32_data.nbytes} bytes, new size: {fp16_data.nbytes} bytes."
+            )
+            print(
+                "Difference stats: mean absolute error =",
+                np.abs(fp32_data - fp16_data.astype(np.float32)).mean(),
+                ", max absolute error =",
+                np.abs(fp32_data - fp16_data.astype(np.float32)).max(),
+            )
+            print(
+                "Max value before conversion:",
+                np.abs(fp32_data).max(),
+                ", max value after conversion:",
+                np.abs(fp16_data).max(),
+            )
+            print(
+                "Min value before conversion:",
+                np.abs(fp32_data).min(),
+                ", min value after conversion:",
+                np.abs(fp16_data).min(),
+            )
 
         fp16_const = opset.constant(fp16_data, dtype=ov.Type.f16, name=node.get_friendly_name())
         convert = opset.convert(fp16_const, destination_type=ov.Type.f32)

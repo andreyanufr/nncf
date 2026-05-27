@@ -11,21 +11,19 @@
 from pathlib import Path
 
 import torch
+from optimum.exporters.openvino.convert import export_from_model
+from optimum.intel import OVConfig
+from optimum.intel.openvino import OVModelForCausalLM
 from torch import nn
 from transformers import AutoModelForCausalLM
 from transformers import AutoTokenizer
-import openvino as ov
+from utils import replace_linear_with_mixer
 
 import nncf
 from nncf.parameters import StripFormat
-from nncf.torch.function_hook.wrapper import get_hook_storage
 from nncf.torch import load_from_config
+from nncf.torch.function_hook.wrapper import get_hook_storage
 from nncf.torch.quantization.layers import SymmetricLoraQuantizer  # noqa: F401
-from optimum.intel import OVConfig
-
-from optimum.exporters.openvino.convert import export_from_model
-from optimum.intel.openvino import OVModelForCausalLM
-from utils import replace_linear_with_mixer
 
 
 def load_checkpoint(model: nn.Module, ckpt_file: Path) -> nn.Module:
@@ -76,20 +74,24 @@ with torch.no_grad():
         model_to_eval = nncf.strip(model_to_eval, do_copy=False, strip_format=StripFormat.OV)
         model_to_eval.eval()
 
-        export_from_model(model_to_eval, IR_DIR, device="cpu", compression_option="fp16",
-                        ov_config=OVConfig(dtype="fp16"), model_kwargs={"torch_dtype": "float16"})
+        export_from_model(
+            model_to_eval,
+            IR_DIR,
+            device="cpu",
+            compression_option="fp16",
+            ov_config=OVConfig(dtype="fp16"),
+            model_kwargs={"torch_dtype": "float16"},
+        )
 
-        #ov_model = ov.convert_model(tracing_model, example_input=input_data)
+        # ov_model = ov.convert_model(tracing_model, example_input=input_data)
         output_path = Path(IR_DIR)
         output_path.mkdir(parents=True, exist_ok=True)
-        #ov.save_model(ov_model, output_path / "openvino_model.xml")
+        # ov.save_model(ov_model, output_path / "openvino_model.xml")
         tokenizer.save_pretrained(IR_DIR)
-    
+
     ov_model = OVModelForCausalLM.from_pretrained(IR_DIR)
     ov_model.model = nncf.compress_weights(ov_model.model)
-    
+
     IR_DIR = IR_DIR + "_full_compression"
     ov_model.save_pretrained(IR_DIR)
     tokenizer.save_pretrained(IR_DIR)
-    
-    
