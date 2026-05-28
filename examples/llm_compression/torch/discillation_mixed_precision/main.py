@@ -733,7 +733,7 @@ def main(argv) -> float:
     device = "cuda"
     torch_dtype = torch.bfloat16
     compression_config = dict(
-        mode=CompressWeightsMode.INT2_SYM,
+        mode=CompressWeightsMode.INT2_ASYM,
         group_size=64,
         awq=False,  # avoid awq for splitted linear layers
         scale_estimation=not args.basic_init,

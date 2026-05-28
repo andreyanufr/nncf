@@ -173,11 +173,12 @@ class QuantizeAsymmetricTorch(torch.autograd.Function):
 
         if stochastic:
             output = RQ.Quantize_forward_stochastic(input_.type(torch.float32), input_low, input_range, levels)
+            ctx.save_for_backward(input_, input_low, input_range, output)
         else:
             output = RQ.Quantize_forward(input_.type(torch.float32), input_low, input_range, levels)
+            ctx.save_for_backward(input_, input_low, input_range, None)
 
         # Save tensors for backward pass
-        ctx.save_for_backward(input_, input_low, input_range)
         ctx.level_low = level_low
         ctx.level_high = level_high
         ctx.levels = levels
@@ -187,7 +188,7 @@ class QuantizeAsymmetricTorch(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        input_, input_low, input_range = ctx.saved_tensors
+        input_, input_low, input_range, output = ctx.saved_tensors
         levels = ctx.levels
         level_low = ctx.level_low
         level_high = ctx.level_high
@@ -196,14 +197,14 @@ class QuantizeAsymmetricTorch(torch.autograd.Function):
         grad_output = grad_output.reshape(input_shape)
 
         grad_input, grad_low, grad_range = RQ.Quantize_backward(
-            grad_output, input_, input_low, input_range, levels, level_low, level_high
+            grad_output, input_, input_low, input_range, levels, level_low, level_high, output=output
         )
 
         grad_input = grad_input.reshape(orig_shape)
         grad_low = grad_low.float()
         grad_range = grad_range.float()
         # input, input_size, input_low, input_range, level_low, level_high, levels
-        return grad_input, None, grad_low, grad_range, None, None, None
+        return grad_input, None, grad_low, grad_range, None, None, None, None
 
 
 class ExportQuantizeToFakeQuantize(torch.autograd.Function):
@@ -317,6 +318,7 @@ def asymmetric_quantize_lora(
             levels,
             eps,
             skip,
+            stochastic,
         )
     if skip:
         return input_
@@ -331,7 +333,7 @@ def asymmetric_quantize_lora(
         level_low,
         level_high,
         levels,
-        stochastic=stochastic,
+        stochastic,
     )
 
 
