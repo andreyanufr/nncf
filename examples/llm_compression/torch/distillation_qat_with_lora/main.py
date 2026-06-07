@@ -226,7 +226,11 @@ def export_to_openvino(pretrained: str, ckpt_file: Path, ir_dir: Path) -> OVMode
     :param last_dir: The directory where the OpenVINO model will be saved.
     :return: A wrapper of OpenVINO model ready for evaluation.
     """
-    model_to_eval = AutoModelForCausalLM.from_pretrained(pretrained, torch_dtype=torch.float32, device_map="cpu")
+    if isinstance(pretrained , str):
+        model_to_eval = AutoModelForCausalLM.from_pretrained(pretrained, torch_dtype=torch.float32, device_map="cpu")
+    else:
+        model_to_eval = pretrained
+
     model_to_eval = load_checkpoint(model_to_eval, ckpt_file)
     model_to_eval = nncf.strip(model_to_eval, do_copy=False, strip_format=StripFormat.DQ)
     export_from_model(model_to_eval, ir_dir, device="cpu")
@@ -261,6 +265,12 @@ def get_argument_parser() -> argparse.ArgumentParser:
         type=Path,
         default="output",
         help="Path to the directory for storing logs, tuning checkpoint, compressed model, validation references.",
+    )
+    parser.add_argument(
+        "--description",
+        type=str,
+        default=None,
+        help="Description of the experiment or run. If not specified, the description will be set to the current date and time.",
     )
     parser.add_argument(
         "--resume",
@@ -323,7 +333,7 @@ def main(argv) -> float:
     compression_config = dict(
         mode=CompressWeightsMode.INT4_ASYM,
         group_size=64,
-        awq=not args.basic_init,
+        awq=False,
         scale_estimation=not args.basic_init,
         compression_format=CompressionFormat.FQ_LORA,
     )
@@ -334,8 +344,9 @@ def main(argv) -> float:
     )
     # Configure output and log files.
     output_dir = Path(args.output_dir)
-    tensorboard_dir = output_dir / "tb" / datetime.now().strftime("%Y-%m-%d__%H-%M-%S")
-    last_dir = output_dir / "last"
+    description = args.description or datetime.now().strftime("%Y-%m-%d__%H-%M-%S")
+    tensorboard_dir = output_dir / "tb" / description
+    last_dir = output_dir / description / "last"
     if not args.resume:
         shutil.rmtree(last_dir, ignore_errors=True)
     for path in [output_dir, tensorboard_dir, last_dir]:
