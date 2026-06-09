@@ -387,11 +387,11 @@ def generate_answer(
     """
     messages = [{"role": "user", "content": question}]
     input_ids = tokenizer.apply_chat_template(
-        messages, tokenize=True, add_generation_prompt=True, return_tensors="pt"
+        messages, tokenize=True, add_generation_prompt=True, return_tensors="pt", return_dict=True
     ).to(device=model.device)
-    input_len = len(input_ids[0])
+    input_len = len(input_ids["input_ids"][0])
 
-    output = model.generate(input_ids, max_new_tokens=max_new_tokens, do_sample=False)[0]
+    output = model.generate(**input_ids, max_new_tokens=max_new_tokens, do_sample=False)[0]
     answer = tokenizer.decode(output[input_len:], skip_special_tokens=True)
     return answer
 
@@ -733,7 +733,7 @@ def main(argv) -> float:
     device = "cuda"
     torch_dtype = torch.bfloat16
     compression_config = dict(
-        mode=CompressWeightsMode.INT2_ASYM,
+        mode=CompressWeightsMode.INT2_SYM,
         group_size=64,
         awq=False,  # avoid awq for splitted linear layers
         scale_estimation=not args.basic_init,
@@ -766,6 +766,8 @@ def main(argv) -> float:
         args.pretrained, torch_dtype=torch_dtype, device_map="auto", use_cache=False
     )
     tokenizer = AutoTokenizer.from_pretrained(args.pretrained)
+    
+    generate_answer(model, tokenizer)
 
     # Prepare training and calibration data
     train_loader = get_pile(
@@ -870,7 +872,7 @@ def main(argv) -> float:
     fq_lr = args.lr / 10
     weight_decay = args.lr
     param_to_train = set_trainable(model, lora_lr=args.lr, fq_lr=fq_lr)
-    set_stochastic(model, stochastic=True)
+    #set_stochastic(model, stochastic=True)
     opt = torch.optim.AdamW(param_to_train, weight_decay=weight_decay)
     # opt = torch.optim.Muon(param_to_train, weight_decay=weight_decay)
 

@@ -659,8 +659,8 @@ class WeightCompression(Algorithm):
                     tmp = self._mode
                     self._mode = (
                         CompressWeightsMode.INT4_SYM
-                        if self._mode == CompressWeightsMode.INT2_SYM
-                        else CompressWeightsMode.INT4_ASYM
+                        # if self._mode == CompressWeightsMode.INT2_SYM
+                        # else CompressWeightsMode.INT4_ASYM
                     )
                     weight_param.compression_config = self._get_primary_config(
                         2 * self._group_size if self._group_size < 64 else self._group_size

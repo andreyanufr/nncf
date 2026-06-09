@@ -321,7 +321,7 @@ def main(argv) -> float:
     device = "cuda"
     torch_dtype = torch.bfloat16
     compression_config = dict(
-        mode=CompressWeightsMode.INT4_ASYM,
+        mode=CompressWeightsMode.INT4_SYM,
         group_size=64,
         awq=not args.basic_init,
         scale_estimation=not args.basic_init,
