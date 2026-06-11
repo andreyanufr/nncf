@@ -30,6 +30,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM
 from transformers import AutoTokenizer
+from utils import compute_activation_magnitudes
 from utils import replace_linear_with_mixer
 from utils import save_mixer_config
 
@@ -479,6 +480,32 @@ def get_distill_dataset(
     return trainloader
 
 
+def get_python_code_dataset(num_samples: int,
+                            seqlen: int,
+                            tokenizer: Any,
+                            device: torch.device) -> Dataset:
+    """
+    Load text-only samples from Open-Orca (first 2K samples from the training split).
+    """
+    ds = load_dataset("jtatman/python-code-dataset-500k", split="train", streaming=True)
+    trainloader = []
+    for ex in ds:
+        text = "System: " + ex["system"] + " Instruction: " + ex["instruction"] + " Response: " + ex["output"]
+        trainenc = tokenizer(text, return_tensors="pt")
+        if trainenc.input_ids.shape[1] < seqlen:
+            continue
+        if trainenc.input_ids.shape[1] > seqlen + 1:
+            i = torch.randint(0, trainenc.input_ids.shape[1] - seqlen - 1, (1,)).item()
+        else:
+            i = 0
+        j = i + seqlen
+        inp = trainenc.input_ids[:, i:j].to(device)
+        trainloader.append(inp)
+        if len(trainloader) >= num_samples:
+            break
+    return trainloader
+
+
 @torch.no_grad()
 def calc_hiddens(model: nn.Module, dataloader: list[Tensor]) -> list[Tensor]:
     """
@@ -545,7 +572,19 @@ def set_stochastic(model: nn.Module, stochastic: bool) -> None:
             module.stochastic = stochastic
 
 
-def set_trainable(model: nn.Module, lora_lr: float, fq_lr: float) -> list[dict[str, Any]]:
+def enble_gradients(model: nn.Module, bits=4) -> None:
+    model.requires_grad_(False)
+
+    hook_storage = get_hook_storage(model)
+    for name, module in hook_storage.named_hooks():
+        if isinstance(module, (AsymmetricLoraQuantizer, SymmetricLoraQuantizer)):
+            if module.num_bits == bits:
+                module.enable_gradients()
+            else:
+                module.disable_gradients()
+
+
+def set_trainable(model: nn.Module, lora_lr: float, fq_lr: float, bits=4) -> list[dict[str, Any]]:
     """
     Sets the trainable parameters of the model for quantization-aware training with LoRA (Low-Rank Adaptation).
 
@@ -565,21 +604,12 @@ def set_trainable(model: nn.Module, lora_lr: float, fq_lr: float) -> list[dict[s
     hook_storage = get_hook_storage(model)
     for name, module in hook_storage.named_hooks():
         # if isinstance(module, (AsymmetricLoraQuantizer, SymmetricLoraQuantizer)) and (module.num_bits == 4):
-        if isinstance(module, (AsymmetricLoraQuantizer, SymmetricLoraQuantizer)):
+        if isinstance(module, (AsymmetricLoraQuantizer, SymmetricLoraQuantizer)) and (module.num_bits == bits):
             module.enable_gradients()
             params = module.get_trainable_params()
             adapters = module.get_adapters()
             adapters_to_train.extend(adapters.values())
             scales_to_train.extend(param for name, param in params.items() if name not in adapters)
-
-            # print(
-            #     name,
-            #     module.num_bits,
-            #     "trainable params:",
-            #     sum(p.numel() for p in params.values()),
-            #     "adapters:",
-            #     len(adapters),
-            # )
 
     params = list(model.parameters())
     trainable_params = sum(p.numel() for p in params if p.requires_grad)
@@ -782,6 +812,13 @@ def main(argv) -> float:
             name=args.distill_dataset_name,
         )
         train_loader.extend(dataset)
+        dataset = get_python_code_dataset(
+            num_samples=args.num_train_samples,
+            seqlen=args.train_seqlen,
+            tokenizer=tokenizer,
+            device=device,
+        )
+        train_loader.extend(dataset)
 
     if args.basic_init:
         example_input = {k: v.to(device) for k, v in model.dummy_inputs.items()}
@@ -851,7 +888,8 @@ def main(argv) -> float:
 
     answer1 = generate_answer(model, tokenizer)
     print(f"Answer before mixed: {answer1}\n")
-    model, mixer_config = replace_linear_with_mixer(model, ratio=0.5)
+    activation_magnitudes = compute_activation_magnitudes(model, tokenizer, train_loader)
+    model, mixer_config = replace_linear_with_mixer(model, ratio=0.5, activation_magnitudes=activation_magnitudes)
     save_mixer_config(mixer_config, last_dir / "mixer_config.json")
     torch.cuda.empty_cache()
 
@@ -871,10 +909,11 @@ def main(argv) -> float:
         save_checkpoint(model, ckpt_file, model_state=not args.basic_init)
     fq_lr = args.lr / 10
     weight_decay = args.lr
-    param_to_train = set_trainable(model, lora_lr=args.lr, fq_lr=fq_lr)
-    #set_stochastic(model, stochastic=True)
-    opt = torch.optim.AdamW(param_to_train, weight_decay=weight_decay)
-    # opt = torch.optim.Muon(param_to_train, weight_decay=weight_decay)
+    param_to_train_2bit = set_trainable(model, lora_lr=args.lr, fq_lr=fq_lr, bits=2)
+    param_to_train_4bit = set_trainable(model, lora_lr=args.lr, fq_lr=fq_lr, bits=4)
+
+    opt_2bit = torch.optim.AdamW(param_to_train_2bit, weight_decay=weight_decay)
+    opt_4bit = torch.optim.AdamW(param_to_train_4bit, weight_decay=weight_decay)
 
     # Run tuning with distillation loss and validation after each epoch.
     grad_accumulation_steps = args.batch_size // args.microbatch_size
@@ -884,19 +923,36 @@ def main(argv) -> float:
     optimizer_steps_per_epoch = max(1, microbatches_per_epoch // grad_accumulation_steps)
     total_optimizer_steps = max(1, args.epochs * optimizer_steps_per_epoch)
     warmup_steps = max(1, int(args.warmup_ratio * total_optimizer_steps)) if args.warmup_ratio > 0 else 0
-    scheduler = transformers.get_linear_schedule_with_warmup(
-        opt,
+    scheduler_2bit = transformers.get_linear_schedule_with_warmup(
+        opt_2bit,
         num_warmup_steps=warmup_steps,
-        num_training_steps=total_optimizer_steps,
+        num_training_steps=2 * total_optimizer_steps,
+    )
+    scheduler_4bit = transformers.get_linear_schedule_with_warmup(
+        opt_4bit,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=2 * total_optimizer_steps,
     )
     aggregated_loss = float("nan")
     loss_numerator = grad_steps = total_steps = 0
     aggregated_kl_loss = 0.0
     aggregated_l1_loss = 0.0
 
-    for epoch in range(args.epochs):
-        if epoch == args.epochs:
-            set_stochastic(model, stochastic=False)
+    cur_optimizer = opt_2bit
+    cur_scheduler = scheduler_2bit
+
+    for epoch in range(2 * args.epochs):
+        if epoch % 2 == 0:
+            cur_optimizer = opt_2bit
+            cur_scheduler = scheduler_2bit
+            enble_gradients(model, bits=2)
+        else:
+            cur_optimizer = opt_4bit
+            cur_scheduler = scheduler_4bit
+            enble_gradients(model, bits=4)
+
+        # if epoch == args.epochs:
+        #     set_stochastic(model, stochastic=False)
         batch_indices_epoch = torch.randperm(num_samples)[:epoch_samples].chunk(microbatches_per_epoch)
         pbar = tqdm(batch_indices_epoch, desc=f"Train epoch {epoch}")
         for indices in pbar:
@@ -953,15 +1009,15 @@ def main(argv) -> float:
             )
 
             if grad_steps == grad_accumulation_steps:
-                opt.step()
-                scheduler.step()
-                opt.zero_grad()
+                cur_optimizer.step()
+                cur_scheduler.step()
+                cur_optimizer.zero_grad()
                 aggregated_loss = loss_numerator / grad_steps
                 total_steps += 1
                 tb.add_scalar("loss", aggregated_loss, total_steps)
                 tb.add_scalar("kl_loss", aggregated_kl_loss / grad_steps, total_steps)
                 tb.add_scalar("l1_loss", aggregated_l1_loss / grad_steps, total_steps)
-                for i, pg in enumerate(opt.param_groups):
+                for i, pg in enumerate(cur_optimizer.param_groups):
                     tb.add_scalar(f"lr/group_{i}", pg["lr"], total_steps)
                 loss_numerator = grad_steps = aggregated_kl_loss = aggregated_l1_loss = 0
 

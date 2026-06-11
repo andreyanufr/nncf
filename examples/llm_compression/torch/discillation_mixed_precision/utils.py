@@ -192,6 +192,7 @@ class LinearMIXER(nn.Module):
         ratio: float = 0.5,
         group_size: int = -1,
         int4_first: bool | None = None,
+        activation_magnitudes: Tensor | None = None,
     ) -> None:
         super().__init__()
         if not isinstance(model, nn.Linear):
@@ -199,7 +200,7 @@ class LinearMIXER(nn.Module):
         self.ratio = ratio
         self.group_size = group_size
         if int4_first is None:
-            int4_first = self.if_first_layers_more_sensitive(model.weight.data)
+            int4_first = self.if_first_layers_more_sensitive(model.weight.data, activation_magnitudes=activation_magnitudes)
         self.register_buffer("int4_first", torch.tensor(bool(int4_first), dtype=torch.bool))
 
         dim_div1 = (
@@ -246,6 +247,7 @@ class LinearMIXER(nn.Module):
         *,
         eps: float = 1e-6,
         rel_margin: float = 0.05,
+        activation_magnitudes: Tensor | None = None,
     ) -> bool:
         """
         Decide whether the first output-channel block is more quantization-sensitive
@@ -287,6 +289,14 @@ class LinearMIXER(nn.Module):
         k = max(1, first.numel() // 10)
         first_score = torch.topk(first, k).values.mean()
         last_score = torch.topk(last, k).values.mean()
+        
+        if activation_magnitudes is not None:
+            # Adjust the scores by the mean activation magnitudes of the corresponding input channels.
+            # This gives more weight to channels with higher activations, which are likely more sensitive to quantization.
+            act_first = activation_magnitudes[:block]
+            act_last = activation_magnitudes[-block:]
+            first_score *= act_first.mean().item()
+            last_score *= act_last.mean().item()
 
         # Dead-zone to suppress noise-level flips.
         return (first_score - last_score).item() > rel_margin * last_score.item()
@@ -349,6 +359,95 @@ def load_mixer_config(path: Path) -> MixerConfig:
     return config
 
 
+def compute_activation_magnitudes(model: nn.Module, tokenizer, dataset) -> dict[str, Tensor]:
+    """
+    Compute mean absolute input activations per channel for every ``nn.Linear`` layer.
+
+    For each linear module, the function captures the input tensor passed to the
+    module during forward. It then accumulates per-channel sums of absolute values
+    and element counts over all processed samples, returning ``sum / count`` for
+    each layer.
+
+    :param model: Model to analyze.
+    :param tokenizer: Hugging Face tokenizer used to build model inputs.
+    :param dataset: Iterable with samples. Each item may be a string, a dict with
+        ``"text"``/``"prompt"``/``"input"`` key, or a list/tuple of strings.
+    :return: Mapping from linear-layer qualified name to 1D tensor of mean
+        absolute activation magnitudes per input channel.
+    """
+    model.eval()
+    device = next(model.parameters()).device
+
+    activation_sums: dict[str, Tensor] = {}
+    activation_counts: dict[str, Tensor] = {}
+    hooks: list[torch.utils.hooks.RemovableHandle] = []
+
+    def _hook(name: str):
+        def _collect(_module: nn.Module, inputs: tuple[Tensor, ...], _output: Tensor) -> None:
+            if not inputs:
+                return
+            x = inputs[0]
+            if x is None:
+                return
+
+            # Collapse all non-channel dimensions so each row is one token/sample position.
+            x_abs = x.detach().abs().float().reshape(-1, x.shape[-1])
+            batch_sum = x_abs.sum(dim=0)
+            batch_count = torch.tensor(float(x_abs.shape[0]), device=batch_sum.device)
+
+            if name not in activation_sums:
+                activation_sums[name] = batch_sum
+                activation_counts[name] = batch_count
+            else:
+                activation_sums[name] += batch_sum
+                activation_counts[name] += batch_count
+
+        return _collect
+
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            hooks.append(module.register_forward_hook(_hook(name)))
+
+    def _extract_text(sample: Any) -> list[str]:
+        if isinstance(sample, str):
+            return [sample]
+        if isinstance(sample, dict):
+            for key in ("text", "prompt", "input"):
+                value = sample.get(key)
+                if isinstance(value, str):
+                    return [value]
+                if isinstance(value, (list, tuple)) and value and all(isinstance(v, str) for v in value):
+                    return list(value)
+            raise ValueError(
+                "Dataset dict sample must contain a string or list of strings under one of: "
+                "'text', 'prompt', 'input'."
+            )
+        if isinstance(sample, (list, tuple)) and sample and all(isinstance(v, str) for v in sample):
+            return list(sample)
+        raise ValueError(f"Unsupported dataset sample type: {type(sample)!r}")
+
+    with torch.no_grad():
+        try:
+            for sample in dataset:
+                if isinstance(sample, torch.Tensor):
+                    # Assume the sample is already tokenized and move it to the correct device.
+                    encoded = {"input_ids": sample.to(device)}
+                else:
+                    texts = _extract_text(sample)
+                    encoded = tokenizer(
+                        texts,
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                    )
+                    encoded = {k: v.to(device) for k, v in encoded.items()}
+                _ = model(**encoded)
+        finally:
+            for handle in hooks:
+                handle.remove()
+
+    return {name: activation_sums[name] / activation_counts[name] for name in activation_sums}
+
 def replace_linear_with_mixer(
     model: nn.Module,
     parent_name: str = "",
@@ -357,6 +456,7 @@ def replace_linear_with_mixer(
     n_layers: int = -1,
     config: MixerConfig | None = None,
     config_path: Path | None = None,
+    activation_magnitudes: dict[str, Tensor] | None = None,
 ) -> tuple[nn.Module, MixerConfig]:
     """
     Recursively replace ``nn.Linear`` modules in ``model`` with
@@ -436,6 +536,7 @@ def replace_linear_with_mixer(
                 ratio=layer_ratio,
                 group_size=layer_group_size,
                 int4_first=layer_int4_first,
+                activation_magnitudes=activation_magnitudes.get(full_name) if activation_magnitudes else None,
             )
             if not use_config:
                 # Persist the computed decision so a later run can skip the heuristic.
@@ -454,6 +555,7 @@ def replace_linear_with_mixer(
                 n_layers=n_layers,
                 group_size=group_size,
                 config=config,
+                activation_magnitudes=activation_magnitudes,
             )
     return model, config
 
@@ -488,7 +590,7 @@ def export_to_pytorch(pretrained: str, ckpt_file: Path, model_dir: Path, mixture
     :return: A wrapper of OpenVINO model ready for evaluation.
     """
     model_to_eval = AutoModelForCausalLM.from_pretrained(pretrained, torch_dtype=torch.bfloat16, device_map="cpu")
-    model_to_eval, _ = replace_linear_with_mixer(model_to_eval, ratio=0.5)  # , config_path=mixture_file)
+    model_to_eval, _ = replace_linear_with_mixer(model_to_eval, config_path=mixture_file) #ratio=0.5
 
     # ckpt = torch.load(ckpt_file, weights_only=False, map_location="cpu")
     # if "model_state" in ckpt:

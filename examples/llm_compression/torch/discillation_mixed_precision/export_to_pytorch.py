@@ -22,8 +22,9 @@ if __name__ == "__main__":
     dst_dir = args.ckpt_file
     ckpt_file = Path(f"{dst_dir}/nncf_checkpoint.pth")
     model_dir = Path(f"{dst_dir}/pt_model_for_eval")
+    mixture_file = Path(f"{dst_dir}/mixer_config.json")
 
-    export_to_pytorch(pretrained, ckpt_file, model_dir)
+    export_to_pytorch(pretrained, ckpt_file, model_dir, mixture_file=mixture_file)
     tokenizer.save_pretrained(model_dir)
 
     print(f"Model exported to {model_dir}")
