@@ -414,7 +414,7 @@ def get_pile(num_samples: int, seqlen: int, tokenizer: Any, device: torch.device
         trainloader.append(inp)
         if len(trainloader) >= num_samples:
             break
-
+    print("Load Pile dataset with ", len(trainloader), " samples")
     return trainloader
 
 
@@ -477,6 +477,7 @@ def get_distill_dataset(
         trainloader.append(inp)
         if len(trainloader) >= num_samples:
             break
+    print("Load distill dataset with ", len(trainloader), " samples")
     return trainloader
 
 
@@ -503,6 +504,7 @@ def get_python_code_dataset(num_samples: int,
         trainloader.append(inp)
         if len(trainloader) >= num_samples:
             break
+    print("Load python dataset with ", len(trainloader), " samples")
     return trainloader
 
 
