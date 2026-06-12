@@ -329,7 +329,7 @@ class AdvancedScaleEstimationParameters:
     :type weight_penalty: float
     """
 
-    subset_size: int = 64
+    subset_size: int = -1
     initial_steps: int = 5
     scale_steps: int = 5
     weight_penalty: float = -1.0
