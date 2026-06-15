@@ -55,7 +55,7 @@ def process_stats(stats: WCTensorStatistic, subset_size: int, act_ch_axis: int =
     # Result: [HiddenDim] or [No. of Experts, HiddenDim]
 
     shape_axis = 1
-    avg = X_full[:, 0] * stats.shape_values[0][shape_axis]
+    avg = X_full[..., 0] * stats.shape_values[0][shape_axis]
     for i in range(1, X_full.shape[sample_axis]):
         avg += X_full[..., i] * stats.shape_values[i][shape_axis]
     avg /= sum(shape[shape_axis] for shape in stats.shape_values)
