@@ -240,8 +240,8 @@ def check_user_compression_configuration(
                 raise nncf.ValidationError(msg)
 
     for size in values_to_check:
-        if size <= 0:
-            msg = f"The subset_size value should be positive, but subset_size={size} is given."
+        if size < -1:
+            msg = f"The subset_size value should be positive or -1, but subset_size={size} is given."
             raise nncf.ValidationError(msg)
 
     for rank in ranks:
