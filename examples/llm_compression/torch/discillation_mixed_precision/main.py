@@ -10,6 +10,7 @@
 # limitations under the License.
 import argparse
 import copy
+import random
 import shutil
 import sys
 import warnings
@@ -479,6 +480,64 @@ def get_distill_dataset(
     return trainloader
 
 
+def format_openthoughts_sample(example):
+    """Convert OpenThoughts format to HuggingFace chat format"""
+    messages = []
+    for item in example:
+        if item["from"] == "human":
+            messages.append({
+                "role": "user",
+                "content": item["value"]
+            })
+        elif item["from"] == "gpt":
+            messages.append({
+                "role": "assistant", 
+                "content": item["value"]
+            })
+    return {
+        "messages": messages
+    }
+
+def get_openthoughts_shuffled(tokenizer, train_size, val_size, seed, seqlen, device: torch.device):
+    print("get_openthoughts shuffled")
+    traindata = load_dataset("open-thoughts/OpenThoughts3-1.2M", split="train")
+    random.seed(seed)
+    traindata = traindata.shuffle(seed=seed)
+
+    trainloader = []
+    valloader = []
+    
+    target_seqlen = seqlen  # Fixed sequence length for all samples
+    
+    for i, sample in enumerate(traindata):
+        if len(trainloader) >= train_size and len(valloader) >= val_size:
+            break
+        
+        # Format conversation using the same method as main_e2e_distill.py
+        try:
+            formatted_sample = format_openthoughts_sample(sample['conversations'])
+            trainchat = tokenizer.apply_chat_template(formatted_sample['messages'], tokenize=False)
+            trainenc = tokenizer(trainchat, return_tensors='pt')
+            
+            # Only use samples with at least target_seqlen tokens
+            if trainenc.input_ids.shape[1] >= target_seqlen:
+                # Truncate to exactly target_seqlen tokens from beginning
+                inp = trainenc.input_ids[:, :target_seqlen]
+                tar = inp.clone()
+                
+                if len(trainloader) < train_size:
+                    trainloader.append(tar.to(device))
+                elif len(valloader) < val_size:
+                    valloader.append((inp.to(device), tar.to(device)))
+        except Exception as e:
+            # Skip samples that cause tokenization errors
+            continue
+    
+    print(f"OpenThoughts: collected {len(trainloader)} train samples and {len(valloader)} val samples")
+    return trainloader, valloader
+
+
+
 @torch.no_grad()
 def calc_hiddens(model: nn.Module, dataloader: list[Tensor]) -> list[Tensor]:
     """
@@ -770,9 +829,19 @@ def main(argv) -> float:
     generate_answer(model, tokenizer)
 
     # Prepare training and calibration data
-    train_loader = get_pile(
-        num_samples=args.num_train_samples, seqlen=args.train_seqlen, tokenizer=tokenizer, device=device
+    # train_loader = get_pile(
+    #     num_samples=args.num_train_samples, seqlen=args.train_seqlen, tokenizer=tokenizer, device=device
+    # )
+    
+    train_loader, val_loader = get_openthoughts_shuffled(
+        tokenizer=tokenizer,
+        train_size=args.num_train_samples,
+        val_size=128,
+        seed=42,
+        seqlen=args.train_seqlen,
+        device=device
     )
+    
     if args.distill_dataset_name:
         dataset = get_distill_dataset(
             num_samples=args.num_train_samples,
@@ -887,7 +956,7 @@ def main(argv) -> float:
     scheduler = transformers.get_linear_schedule_with_warmup(
         opt,
         num_warmup_steps=warmup_steps,
-        num_training_steps=total_optimizer_steps,
+        num_training_steps=2 * total_optimizer_steps,
     )
     aggregated_loss = float("nan")
     loss_numerator = grad_steps = total_steps = 0
