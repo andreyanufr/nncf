@@ -32,6 +32,7 @@ from nncf.openvino.graph.metatypes.openvino_metatypes import OVAddMetatype
 from nncf.openvino.graph.metatypes.openvino_metatypes import OVConvolutionMetatype
 from nncf.openvino.graph.metatypes.openvino_metatypes import OVDepthwiseConvolutionMetatype
 from nncf.openvino.graph.metatypes.openvino_metatypes import OVGroupConvolutionMetatype
+from nncf.openvino.graph.metatypes.openvino_metatypes import OVGroupedMatMulMetatype
 from nncf.openvino.graph.metatypes.openvino_metatypes import OVMatMulMetatype
 from nncf.openvino.graph.metatypes.openvino_metatypes import OVSubtractMetatype
 from nncf.openvino.graph.node_utils import create_bias_tensor
@@ -70,7 +71,7 @@ class OVChannelAlignmentAlgoBackend(ChannelAlignmentAlgoBackend):
 
     @staticmethod
     def get_linear_metatypes():
-        return [OVMatMulMetatype]
+        return [OVMatMulMetatype, OVGroupedMatMulMetatype]
 
     @staticmethod
     def get_add_metatypes():

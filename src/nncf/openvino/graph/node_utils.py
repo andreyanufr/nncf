@@ -38,6 +38,7 @@ from nncf.openvino.graph.metatypes.openvino_metatypes import OVConstantMetatype
 from nncf.openvino.graph.metatypes.openvino_metatypes import OVConvertMetatype
 from nncf.openvino.graph.metatypes.openvino_metatypes import OVConvolutionBackpropDataMetatype
 from nncf.openvino.graph.metatypes.openvino_metatypes import OVGroupConvolutionBackpropDataMetatype
+from nncf.openvino.graph.metatypes.openvino_metatypes import OVGroupedMatMulMetatype
 from nncf.openvino.graph.metatypes.openvino_metatypes import OVIfMetatype
 from nncf.openvino.graph.metatypes.openvino_metatypes import OVMatMulMetatype
 from nncf.openvino.graph.metatypes.openvino_metatypes import OVOpMetatype
@@ -535,6 +536,8 @@ def get_weight_channel_axes(node: NNCFNode) -> list[int]:
         weights_layout = get_conv_weights_layout_from_node(node)
         return [idx for idx, elem in enumerate(weights_layout) if elem in [OVLayoutElem.GROUPS, OVLayoutElem.C_OUT]]
     if node.metatype == OVMatMulMetatype:
+        return get_matmul_channel_axes(node)
+    if node.metatype == OVGroupedMatMulMetatype:
         return get_matmul_channel_axes(node)
     return node.metatype.const_channel_axis
 

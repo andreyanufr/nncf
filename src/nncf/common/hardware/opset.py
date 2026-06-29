@@ -77,3 +77,4 @@ class HWOpName(StrEnum):
     TRANSPOSE = auto()
     UNSQUEEZE = auto()
     VARIADIC_SPLIT = auto()
+    GROUPED_MAT_MUL = auto()

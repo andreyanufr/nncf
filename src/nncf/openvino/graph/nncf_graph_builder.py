@@ -20,6 +20,7 @@ from nncf.openvino.graph.layer_attributes import OVLayerAttributes
 from nncf.openvino.graph.metatypes.groups import OPERATIONS_WITH_CONST_PORT_ID
 from nncf.openvino.graph.metatypes.openvino_metatypes import OVConvolutionBackpropDataMetatype
 from nncf.openvino.graph.metatypes.openvino_metatypes import OVGroupConvolutionBackpropDataMetatype
+from nncf.openvino.graph.metatypes.openvino_metatypes import OVGroupedMatMulMetatype
 from nncf.openvino.graph.metatypes.openvino_metatypes import OVGRUSequenceMetatype
 from nncf.openvino.graph.metatypes.openvino_metatypes import OVLSTMSequenceMetatype
 from nncf.openvino.graph.metatypes.openvino_metatypes import OVMatMulMetatype
@@ -214,6 +215,8 @@ class GraphConverter:
                     elif metatype == OVGRUSequenceMetatype:
                         node_attributes = node.get_attributes()
                         act_attrs["linear_before_reset"] = node_attributes["linear_before_reset"]
+                    elif metatype == OVGroupedMatMulMetatype:
+                        act_attrs["dummy"] = "dummy"
 
                     if const_attrs or act_attrs:
                         nncf_node = nncf_graph.get_node_by_name(node_name)

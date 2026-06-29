@@ -530,6 +530,8 @@ class WeightCompression(Algorithm):
 
         ordered_nodes_to_compress = []
         for node in nncf_graph.topological_sort():
+            if 'model.language_model.layers.0.mlp.experts/aten::_grouped_mm' in node.node_name:
+                print(f"Skipping {node.node_name} of type {node.metatype} for weight compression.")
             is_node_with_weights = self._backend_entity.is_node_with_weights(node, nncf_graph)
             if node.metatype in weighted_metatypes and is_node_with_weights:
                 ordered_nodes_to_compress.append(node)
