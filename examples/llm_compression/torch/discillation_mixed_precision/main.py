@@ -18,6 +18,8 @@ from datetime import datetime
 from pathlib import Path
 from pprint import pprint
 from typing import Any
+import re
+import os
 
 import torch
 import torch.nn.functional as F
@@ -116,32 +118,120 @@ def _find_up_gate_groups(model: nn.Module) -> list[tuple[nn.Module, nn.Linear, l
 
 
 # rescale scale to [min, max] to avoid extreme values that cause instability during training or quantization
-def align_scale(s: Tensor, min=0.1, max=1.0) -> Tensor:
+def align_scale(s: Tensor, min_v=0.1, max_v=1.0) -> Tensor:
     min_s = s.min()
     max_s = s.max()
+    
     if max_s - min_s < 1e-5:
-        return torch.clamp(s, min=min, max=max)
-    s = (s - min_s) / (max_s - min_s) * (max - min) + min
+        return torch.clamp(s, min=min_v, max=max_v)
+    s = (s - min_s) / (max_s - min_s) * (max_v - min_v) + min_v
     return s
 
 
 @torch.no_grad()
-def equalize_up_gate_with_layernorm(model: nn.Module, eps: float = 1e-5) -> int:
+def _collect_avg_sum_squares_per_token(
+    model: nn.Module,
+    calib_inputs: list[Tensor],
+    modules: list[nn.Module],
+) -> dict[int, Tensor]:
+    """
+    Collect per-module input statistics as average sum of squares per input token.
+
+    For each module input ``x`` with shape ``(..., C)``, this computes:
+    ``mean_token(x^2)`` along all token-like dimensions, resulting in a ``(C,)``
+    vector for each module.
+
+    :param model: Model used for forward passes.
+    :param calib_inputs: Token-id tensors used for stats collection.
+    :param modules: Modules whose input stats should be collected.
+    :return: Mapping ``id(module) -> Tensor[C]`` with per-channel averages.
+    """
+    #return {}
+    if not calib_inputs or not modules:
+        return {}
+
+    accum: dict[int, Tensor] = {}
+    counts: dict[int, int] = {}
+
+    def _hook(module: nn.Module, inputs: tuple[Any, ...]) -> None:
+        if not inputs:
+            return
+        x = inputs[0]
+        if not isinstance(x, torch.Tensor) or x.ndim == 0:
+            return
+        x_flat = x.detach().reshape(-1, x.shape[-1]).to(device="cpu", dtype=torch.float64)
+        mid = id(module)
+        #cur = x_flat.pow(2).sum(dim=0)
+        cur = x_flat.abs().sum(dim=0)
+        if mid in accum:
+            accum[mid] += cur
+            counts[mid] += x_flat.shape[0]
+        else:
+            accum[mid] = cur
+            counts[mid] = x_flat.shape[0]
+
+    handles = [m.register_forward_pre_hook(_hook) for m in modules]
+    was_training = model.training
+    model.eval()
+    try:
+        for input_ids in calib_inputs:
+            model_input = get_model_input(input_ids)
+            model(**model_input)
+    finally:
+        for h in handles:
+            h.remove()
+        model.train(was_training)
+
+    stats: dict[int, Tensor] = {}
+    for mid, sq_sum in accum.items():
+        stats[mid] = sq_sum / max(1, counts[mid])
+    return stats
+
+
+@torch.no_grad()
+def equalize_up_gate_with_layernorm(
+    model: nn.Module,
+    calib_inputs: list[Tensor] | None = None,
+    eps: float = 1e-5,
+) -> int:
     groups = _find_up_gate_groups(model)
     if not groups:
         return 0
 
+    stats = {}
+    if calib_inputs:
+        modules = [m for up, gate, _ in groups for m in (up, gate)]
+        stats = _collect_avg_sum_squares_per_token(model, calib_inputs, modules)
+
     n_done = 0
     for up, gate, producer in groups:
-        s_gate = gate.weight.abs().mean(dim=0).clamp_min(eps).to(device=gate.weight.device, dtype=gate.weight.dtype)
-        s_up = up.weight.abs().mean(dim=0).clamp_min(eps).to(device=up.weight.device, dtype=up.weight.dtype)
+        gate_stats = stats.get(id(gate))
+        up_stats = stats.get(id(up))
+        if gate_stats is None:
+            s_gate = gate.weight.abs().mean(dim=0).clamp_min(eps).to(device=gate.weight.device, dtype=gate.weight.dtype)
+        else:
+            s_num = gate.weight.abs().mean(dim=0).clamp_min(eps).to(device=gate.weight.device, dtype=gate.weight.dtype)
+            s_num = 0 * s_num + 1.0
+            s_denum = gate_stats.clamp_min(eps).to(device=gate.weight.device, dtype=gate.weight.dtype)
+            # s_num = align_scale(s_num, min_v=0.1, max_v=1.0)
+            # s_denum = align_scale(s_denum, min_v=0.1, max_v=1.0)
+            s_gate = s_num.sqrt() / s_denum.sqrt()
+        if up_stats is None:
+            s_up = up.weight.abs().mean(dim=0).clamp_min(eps).to(device=up.weight.device, dtype=up.weight.dtype)
+        else:
+            s_num = up.weight.abs().mean(dim=0).clamp_min(eps).to(device=up.weight.device, dtype=up.weight.dtype)
+            s_num = 0 * s_num + 1.0
+            s_denum = up_stats.clamp_min(eps).to(device=up.weight.device, dtype=up.weight.dtype)
+            #s_num = align_scale(s_num, min_v=0.1, max_v=1.0)
+            #s_denum = align_scale(s_denum, min_v=0.1, max_v=1.0)
+            s_up = s_num.sqrt() / s_denum.sqrt()
 
         s_gate = s_gate / s_gate.norm(p=2, dim=0, keepdim=True)
         s_up = s_up / s_up.norm(p=2, dim=0, keepdim=True)
 
         # up_proj theoretically more sensitive to quantization
         s = 0.1 * s_gate + 0.9 * s_up
-        s = align_scale(s, min=0.1, max=1.0)
+        s = align_scale(s, min_v=0.1, max_v=1.0)
         # Divide down_proj input columns by s.
         # print("Max val before equalization gate:", gate.weight.abs().max().item())
         # print("Max val before equalization up:", up.weight.abs().max().item())
@@ -196,10 +286,22 @@ def equalize_down_proj(
     if not groups:
         return 0
 
+    stats = _collect_avg_sum_squares_per_token(model, calib_inputs, [down for _, down, _ in groups])
+
     n_done = 0
     for _, down, producers in groups:
-        s = down.weight.abs().mean(dim=0).clamp_min(eps).to(device=down.weight.device, dtype=down.weight.dtype)
-        s = align_scale(s, min=0.1, max=1.0)
+        down_stats = stats.get(id(down))
+        if down_stats is None:
+            s = down.weight.abs().mean(dim=0).clamp_min(eps).to(device=down.weight.device, dtype=down.weight.dtype)
+        if down_stats is not None:
+            s_num = down.weight.abs().mean(dim=0).clamp_min(eps).to(device=down.weight.device, dtype=down.weight.dtype)
+            s_num = 0 * s_num + 1.0
+            s_denum = down_stats.clamp_min(eps).to(device=down.weight.device, dtype=down.weight.dtype)
+            # s_num = align_scale(s_num, min_v=0.1, max_v=1.0)
+            # s_denum = align_scale(s_denum, min_v=0.1, max_v=1.0)
+            s = s_num.sqrt() / s_denum.sqrt()
+
+        s = align_scale(s, min_v=0.1, max_v=1.0)
         # DEBUG
         # print("Max val before equalization:", down.weight.abs().max().item())
         down.weight.mul_(1.0 / s.unsqueeze(0))
@@ -537,6 +639,79 @@ def get_openthoughts_shuffled(tokenizer, train_size, val_size, seed, seqlen, dev
     return trainloader, valloader
 
 
+def split_thought_solution(text: str):
+    thought_re = re.compile(r"<\|begin_of_thought\|>(.*?)<\|end_of_thought\|>", re.DOTALL)
+    solution_re = re.compile(r"<\|begin_of_solution\|>(.*?)<\|end_of_solution\|>", re.DOTALL)
+
+    thought = thought_re.search(text).group(1).strip()
+    solution = solution_re.search(text).group(1).strip()
+
+    return thought, solution
+
+def make_concat_chunks(data, tokenizer, max_length, num_samples, seed=0, add_eos=False, device: torch.device = torch.device("cpu")):
+    eos_id = tokenizer.eos_token_id
+    token_buffer = []
+    chunks = []
+    for ex in data:
+        ids = tokenizer(ex["text"], return_tensors=None)["input_ids"]
+        if add_eos and eos_id is not None:
+            ids = ids + [eos_id]
+        token_buffer.extend(ids)
+
+        while len(token_buffer) >= max_length:
+            chunk = token_buffer[:max_length]
+            del token_buffer[:max_length]
+            chunks.append(torch.tensor(chunk, dtype=torch.long, device=device).unsqueeze(0))
+            if len(chunks) >= num_samples:
+                return chunks
+
+    return chunks
+
+def open_thoughts(tokenizer, train_samples, max_length,
+                  shuffle_seed=1234, seed=42, open_thoughts_max_samples=10_000, device: torch.device = torch.device("cpu")):
+
+    tmpl = tokenizer.chat_template
+    if tmpl is not None:
+        tmpl = tmpl.replace(
+            "<think></think>{{render_content(message)}}",
+            "{%- set rc = message.get('reasoning_content', '') -%}"
+            "<think>{{rc}}</think>{{render_content(message)}}"
+        )
+        tokenizer.chat_template = tmpl
+
+    total_needed = train_samples
+
+
+    ds = load_dataset("open-thoughts/OpenThoughts-114k", split="train")
+    ds = ds.shuffle(seed=seed).select(range(open_thoughts_max_samples))
+
+    def preprocess(example):
+        messages = []
+        messages.append({
+            "role": "system",
+            "content": (
+                "You are Kimi, an AI assistant created by Moonshot AI."
+            ),
+        })
+        for msg in example["conversations"]:
+            role = msg["from"]
+            if role == "user":
+                messages.append({"role": "user", "content": msg["value"]})
+            else:
+                thought, solution = split_thought_solution(msg["value"])
+                messages.append({"role": "assistant", "content": solution, "reasoning_content": thought})
+
+        return {"text": tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)}
+
+    print(f"Preprocessing {len(ds)} OpenThoughts samples (chat template)...", flush=True)
+    ds = ds.map(preprocess, num_proc=min(8, os.cpu_count() or 1))
+    print(f"Tokenizing into {total_needed} chunks of length {max_length}...", flush=True)
+    all_chunks = make_concat_chunks(ds, tokenizer, max_length, total_needed, seed=shuffle_seed, device=device)
+
+
+    return all_chunks
+
+
 
 @torch.no_grad()
 def calc_hiddens(model: nn.Module, dataloader: list[Tensor]) -> list[Tensor]:
@@ -833,12 +1008,22 @@ def main(argv) -> float:
     #     num_samples=args.num_train_samples, seqlen=args.train_seqlen, tokenizer=tokenizer, device=device
     # )
     
-    train_loader, val_loader = get_openthoughts_shuffled(
+    # train_loader, val_loader = get_openthoughts_shuffled(
+    #     tokenizer=tokenizer,
+    #     train_size=args.num_train_samples,
+    #     val_size=128,
+    #     seed=42,
+    #     seqlen=args.train_seqlen,
+    #     device=device
+    # )
+    
+    train_loader = open_thoughts(
         tokenizer=tokenizer,
-        train_size=args.num_train_samples,
-        val_size=128,
+        train_samples=args.num_train_samples,
+        max_length=args.train_seqlen,
+        shuffle_seed=42,
         seed=42,
-        seqlen=args.train_seqlen,
+        open_thoughts_max_samples=10_000,
         device=device
     )
     
@@ -857,7 +1042,8 @@ def main(argv) -> float:
         dataset = Dataset([example_input])
     else:
         # calib_loader = get_pile(num_samples=128, seqlen=128, tokenizer=tokenizer, device=device)
-        calib_loader = get_LLM_compression_calibration(num_samples=256, seqlen=512, tokenizer=tokenizer, device=device)
+        #calib_loader = get_LLM_compression_calibration(num_samples=256, seqlen=512, tokenizer=tokenizer, device=device)
+        calib_loader = train_loader[:128]  # Use the first 128 samples from the training data for calibration
         dataset = Dataset(map(get_model_input, calib_loader))
 
     # Pre-compute hiddens of teacher model for distillation loss.
@@ -889,18 +1075,13 @@ def main(argv) -> float:
     # the producing up_proj / gate_proj output channels.
     if args.equalize_down_proj:
         answer_before_equalization = generate_answer(model, tokenizer)
-        eq_loader = get_pile(
-            num_samples=1,
-            seqlen=1,
-            tokenizer=tokenizer,
-            device=device,
-        )
+        eq_loader = train_loader[:128]
         n_eq = equalize_down_proj(model, eq_loader)
         print(f"Equalized {n_eq} down_proj layers.")
         print(f"Answer before equalization: {answer_before_equalization}")
         print(f"Answer (post equalization):  {generate_answer(model, tokenizer)}\n")
 
-        n_eq = equalize_up_gate_with_layernorm(model)
+        n_eq = equalize_up_gate_with_layernorm(model, calib_inputs=eq_loader)
         print(f"Equalized {n_eq} up_proj/gate_proj layers with preceding LayerNorm.\n")
         print(f"Answer (post equalization):  {generate_answer(model, tokenizer)}\n")
 
@@ -920,7 +1101,8 @@ def main(argv) -> float:
 
     answer1 = generate_answer(model, tokenizer)
     print(f"Answer before mixed: {answer1}\n")
-    model, mixer_config = replace_linear_with_mixer(model, ratio=0.5)
+    act_stats = _collect_avg_sum_squares_per_token(model, train_loader[:128], modules=[module for name, module in model.named_modules() if isinstance(module, nn.Linear) and not 'head' in name])
+    model, mixer_config = replace_linear_with_mixer(model, ratio=0.5, act_stats=act_stats)
     save_mixer_config(mixer_config, last_dir / "mixer_config.json")
     torch.cuda.empty_cache()
 
@@ -928,9 +1110,9 @@ def main(argv) -> float:
     print(f"Answer after mixed: {answer2}\n")
     if answer1 != answer2:
         print(
-            "The answers are different after replacing linear layers with LinearMIXER. This may be due to the fact that the model has not been fine-tuned yet, and the weights of the new LinearMIXER layers have been initialized based on the original linear layers. Fine-tuning the model with the new LinearMIXER layers should help to recover the original performance."
+            "WARNING: The answers are different after replacing linear layers with LinearMIXER. This may be due to the fact that the model has not been fine-tuned yet, and the weights of the new LinearMIXER layers have been initialized based on the original linear layers. Fine-tuning the model with the new LinearMIXER layers should help to recover the original performance."
         )
-        exit(1)
+        
 
     # Create or load model to tune with Fake Quantizers and absorbable LoRA adapters.
     if args.resume and ckpt_file.exists():

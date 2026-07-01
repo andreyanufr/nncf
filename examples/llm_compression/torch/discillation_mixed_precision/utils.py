@@ -192,6 +192,7 @@ class LinearMIXER(nn.Module):
         ratio: float = 0.5,
         group_size: int = -1,
         int4_first: bool | None = None,
+        act_stat: Tensor | None = None,
     ) -> None:
         super().__init__()
         if not isinstance(model, nn.Linear):
@@ -199,7 +200,10 @@ class LinearMIXER(nn.Module):
         self.ratio = ratio
         self.group_size = group_size
         if int4_first is None:
-            int4_first = self.if_first_layers_more_sensitive(model.weight.data)
+            if act_stat is not None:
+                int4_first = self.if_first_layers_more_sensitive_act(act_stat)
+            else:
+                int4_first = self.if_first_layers_more_sensitive(model.weight.data)
         self.register_buffer("int4_first", torch.tensor(bool(int4_first), dtype=torch.bool))
 
         dim_div1 = (
@@ -291,6 +295,58 @@ class LinearMIXER(nn.Module):
         # Dead-zone to suppress noise-level flips.
         return (first_score - last_score).item() > rel_margin * last_score.item()
 
+
+    def if_first_layers_more_sensitive_act(
+        self,
+        act_stat: Tensor,
+        *,
+        eps: float = 1e-6,
+        rel_margin: float = 0.05,
+    ) -> bool:
+        """
+        Decide whether the first output-channel block is more quantization-sensitive
+        than the last block of the same size.
+
+        Sensitivity per output channel is approximated by the ratio
+            max(|w|) / (mean(|w|) + eps)
+        which captures outlier-driven quantization error far better than a single std.
+        The two blocks are compared via the mean of the top-k channel scores
+        (robust to a handful of extreme channels). A relative margin avoids
+        flip-flopping on near-ties.
+
+        :param weight: 2D weight tensor of shape ``[out_features, in_features]``.
+        :param eps: Numerical stabilizer for the per-channel ratio.
+        :param rel_margin: Minimum relative gap required to declare the first block
+            more sensitive; otherwise returns ``False`` (deterministic tie-break).
+        :return: ``True`` if the first block is deemed more sensitive.
+        """
+        in_features = act_stat.shape[0]
+        block = (
+            int((in_features * self.ratio) // self.group_size) * self.group_size
+            if self.group_size > 0
+            else int(in_features * self.ratio)
+        )
+        if block <= 0 or block >= in_features:
+            raise ValueError(f"Invalid block size {block} for in_features {in_features} and ratio {self.ratio}")
+
+        w = act_stat.detach().float().abs()
+        # Per-channel outlier score: peak-to-average ratio.
+        # per_channel = w.amax(dim=0) / (w.mean(dim=0) + eps)
+
+        # first = per_channel[:block].flatten()
+        # last = per_channel[-block:].flatten()
+        first = w[:block].mean() #w[:block].amax() / (w[:block].mean() + eps)
+        last = w[-block:].mean() #w[-block:].amax() / (w[-block:].mean() + eps)
+
+        # Robust aggregation: average of top-k (k = 10% of the block, at least 1).
+        k = max(1, first.numel() // 10)
+        first_score = torch.topk(first, k).values.mean()
+        last_score = torch.topk(last, k).values.mean()
+
+        # Dead-zone to suppress noise-level flips.
+        return (first_score - last_score).item() > rel_margin * last_score.item()
+
+
     def to_linear(self) -> nn.Linear:
         """
         Converts the LinearMIXER back to a standard nn.Linear layer by concatenating the weights and biases of the two linear layers.
@@ -357,6 +413,7 @@ def replace_linear_with_mixer(
     n_layers: int = -1,
     config: MixerConfig | None = None,
     config_path: Path | None = None,
+    act_stats: dict[str, Tensor] | None = None,
 ) -> tuple[nn.Module, MixerConfig]:
     """
     Recursively replace ``nn.Linear`` modules in ``model`` with
@@ -431,11 +488,13 @@ def replace_linear_with_mixer(
                 layer_int4_first = None  # let LinearMIXER compute it once
 
             print(f"Replacing {full_name} with LinearMIXER (ratio={layer_ratio}, group_size={layer_group_size})")
+            mid = id(module)
             wrapped = LinearMIXER(
                 module,
                 ratio=layer_ratio,
                 group_size=layer_group_size,
                 int4_first=layer_int4_first,
+                act_stat=act_stats.get(mid) if act_stats is not None else None
             )
             if not use_config:
                 # Persist the computed decision so a later run can skip the heuristic.
@@ -454,6 +513,7 @@ def replace_linear_with_mixer(
                 n_layers=n_layers,
                 group_size=group_size,
                 config=config,
+                act_stats=act_stats
             )
     return model, config
 

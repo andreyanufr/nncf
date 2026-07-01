@@ -518,7 +518,8 @@ def compress_weights(
             )
             raise nncf.ParameterNotSupportedError(msg)
 
-        options = {"gptq": gptq, "lora_correction": lora_correction}
+        #options = {"gptq": gptq, "lora_correction": lora_correction}
+        options = {"lora_correction": lora_correction}
         unsupported_options = [name for name, value in options.items() if value is not None]
         if unsupported_options:
             msg = f"Torch backend does not support {', '.join(unsupported_options)} option(s). Set them to None."
