@@ -324,9 +324,9 @@ class PTWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
             lora_dtype = quantizer.lora_A.dtype
             svd_residual = torch.rand(weight_shape).to(device) * scale / 100  # value on [0,1] * (1/100 of quant size)
             svd_residual = svd_residual.reshape(orig_weight_shape)
-            B, A = PTWeightCompressionAlgoBackend.init_lora_adapters(svd_residual, rank=lora_adapter_rank)
-            quantizer.lora_A = torch.nn.Parameter(A.type(dtype=lora_dtype))
-            quantizer.lora_B = torch.nn.Parameter(B.type(dtype=lora_dtype))
+            #B, A = PTWeightCompressionAlgoBackend.init_lora_adapters(svd_residual, rank=lora_adapter_rank)
+            #quantizer.lora_A = torch.nn.Parameter(A.type(dtype=lora_dtype))
+            #quantizer.lora_B = torch.nn.Parameter(B.type(dtype=lora_dtype))
         else:
             quantizer = quantizer_cls(quantizer_spec)
 

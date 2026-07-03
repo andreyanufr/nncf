@@ -204,13 +204,13 @@ def register_accumulating_hooks(
             def hook_fn(mod, inp, name=name):
                 x = inp[0].detach().cpu().abs()
                 # Sum over token dimension to get per-channel statistics: shape (channels,)
-                channel_sum = x.squeeze(0).sum(dim=0)
+                channel_sum = x.squeeze(0) #.sum(dim=0)
                 if name in sum_activations:
                     sum_activations[name] += channel_sum
-                    sample_counts[name] += x.shape[-2]  # number of tokens
+                    sample_counts[name] += 1 #x.shape[-2]  # number of tokens
                 else:
                     sum_activations[name] = channel_sum
-                    sample_counts[name] = x.shape[-2]
+                    sample_counts[name] = 1 #x.shape[-2]
 
             handle = module.register_forward_pre_hook(hook_fn)
             hooks.append(handle)
@@ -342,6 +342,111 @@ def render_activation_image(activation: torch.Tensor, layer_name: str) -> str:
     return base64.b64encode(buf.read()).decode("utf-8")
 
 
+def render_aggregated_activation_image(
+    activation: torch.Tensor, layer_name: str, threshold_factor: float = 6.0
+) -> str:
+    """
+    Renders a bar chart of per-channel aggregated (mean) activation with outlier highlighting.
+
+    :param activation: 1D tensor of shape (channels,) — per-channel mean abs activation.
+    :param layer_name: Name of the layer for the title.
+    :param threshold_factor: Threshold for marking outlier channels.
+    :return: Base64-encoded PNG.
+    """
+    data = activation.numpy()
+    n_channels = len(data)
+    median_val = np.median(data)
+    threshold = threshold_factor * median_val
+    is_outlier = data > threshold
+
+    fig, ax = plt.subplots(1, 1, figsize=(14, 3))
+
+    colors = np.where(is_outlier, "red", "steelblue")
+    ax.bar(range(n_channels), data, color=colors, width=1.0, edgecolor="none")
+    ax.axhline(y=threshold, color="lime", linestyle="--", linewidth=1.0, label=f"threshold ({threshold_factor}×median)")
+    ax.axhline(y=median_val, color="yellow", linestyle=":", linewidth=0.8, label="median")
+
+    n_outliers = int(is_outlier.sum())
+    ax.set_xlabel("Channel index")
+    ax.set_ylabel("Mean |activation|")
+    ax.set_title(f"{layer_name} | {n_channels} channels, {n_outliers} outliers (red)")
+    ax.legend(loc="upper right", fontsize=8)
+    ax.set_xlim(0, n_channels)
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return base64.b64encode(buf.read()).decode("utf-8")
+
+
+def generate_aggregated_html(
+    calibration_stats: Dict[str, torch.Tensor], output_path: str, threshold_factor: float = 6.0
+) -> None:
+    """
+    Generates an HTML file visualizing aggregated per-channel activations used for permutation.
+    Only includes down_proj layers.
+    """
+    down_proj_stats = {name: act for name, act in calibration_stats.items() if "down_proj" in name}
+
+    html_parts = [
+        "<!DOCTYPE html>",
+        "<html><head>",
+        "<meta charset='utf-8'>",
+        "<title>Aggregated Activation Stats (down_proj) for Permutation</title>",
+        "<style>",
+        "body { font-family: monospace; background: #1a1a1a; color: #e0e0e0; padding: 20px; }",
+        ".layer { margin-bottom: 30px; border: 1px solid #444; padding: 15px; border-radius: 8px; }",
+        ".layer img { max-width: 100%; }",
+        ".info { font-size: 13px; margin-top: 8px; padding: 5px 10px; background: #222; border-radius: 4px; }",
+        "h2 { color: #aaa; font-size: 13px; margin: 0 0 10px 0; word-break: break-all; }",
+        "h1 { color: #fff; }",
+        ".summary { margin-bottom: 20px; padding: 10px; background: #222; border-radius: 4px; }",
+        "</style>",
+        "</head><body>",
+        "<h1>Aggregated Per-Channel Mean |Activation| for down_proj (used for permutation)</h1>",
+        f"<div class='summary'>Layers: {len(down_proj_stats)} | "
+        f"Threshold: {threshold_factor}× median | "
+        f"Red bars = outlier channels moved to the left by permutation</div>",
+    ]
+
+    for layer_name, act in down_proj_stats.items():
+        # Original activation visualization
+        img_b64 = render_activation_image(act, layer_name)
+        median_val = act.median().item()
+        max_val = act.max().item()
+        n_outliers = (act > threshold_factor * median_val).sum().item()
+        ratio = n_outliers / act.shape[0] * 100
+
+        # Permuted activation visualization (outliers moved to the left)
+        perm = compute_outlier_permutation(act, threshold_factor)
+        act_permuted = act[:, perm]
+        img_permuted_b64 = render_activation_image(act_permuted, f"{layer_name} [PERMUTED]")
+
+        html_parts.append(f"<div class='layer'>")
+        html_parts.append(f"<h2>{layer_name}</h2>")
+        html_parts.append("<h3 style='color:#888; font-size:12px; margin:5px 0;'>Original channel order:</h3>")
+        html_parts.append(f"<img src='data:image/png;base64,{img_b64}' />")
+        html_parts.append(
+            f"<div class='info'>outliers: {n_outliers}/{act.shape[0]} ({ratio:.1f}%) | "
+            f"median: {median_val:.4f} | max: {max_val:.4f} | max/median: {max_val/median_val:.1f}x</div>"
+        )
+        html_parts.append("<h3 style='color:#888; font-size:12px; margin:10px 0 5px 0;'>After permutation (outliers → left):</h3>")
+        html_parts.append(f"<img src='data:image/png;base64,{img_permuted_b64}' />")
+        html_parts.append(
+            f"<div class='info'>First {n_outliers} channels are outliers | "
+            f"remaining {act.shape[0] - n_outliers} channels are normal</div>"
+        )
+        html_parts.append("</div>")
+
+    html_parts.append("</body></html>")
+
+    output = Path(output_path)
+    output.write_text("\n".join(html_parts), encoding="utf-8")
+    print(f"Aggregated stats HTML saved to: {output.resolve()}")
+
+
 def generate_html(activations: Dict[str, torch.Tensor], output_path: str) -> None:
     """
     Generates an HTML file with activation visualizations and outlier classifications.
@@ -414,19 +519,26 @@ def compute_outlier_permutation(
 
     if activation.dim() == 2:
         # Per-channel max across token dimension
-        channel_stat = activation.max(dim=0).values
+        # channel_stat = activation.max(dim=0).values
+        # channel_median = activation.median(dim=0).values
+        # order = torch.argsort(channel_stat**2 / (channel_median + 1e-6), descending=True)
+        
+        channel_stat = activation.mean(dim=0)
+        order = torch.argsort(channel_stat, descending=True)
+        
+        perm = order
     else:
         # Already per-channel (1D from aggregated stats)
         channel_stat = activation
+        channel_median = channel_stat.median()
 
-    channel_median = channel_stat.median()
-    is_outlier = channel_stat > threshold_factor * channel_median
+        is_outlier = channel_stat > threshold_factor * channel_median
 
-    outlier_indices = torch.where(is_outlier)[0]
-    normal_indices = torch.where(~is_outlier)[0]
+        outlier_indices = torch.where(is_outlier)[0]
+        normal_indices = torch.where(~is_outlier)[0]
 
-    # Outliers first, then normal channels
-    perm = torch.cat([outlier_indices, normal_indices], dim=0)
+        # Outliers first, then normal channels
+        perm = torch.cat([outlier_indices, normal_indices], dim=0)
     return perm
 
 
@@ -540,7 +652,7 @@ def generate_text(model, tokenizer, device: str, max_new_tokens: int = 128) -> s
 
 def run_permutation_experiment(
     model, tokenizer, activations: Dict[str, torch.Tensor], args
-) -> None:
+) -> Dict[str, torch.Tensor]:
     """
     Runs the full permutation experiment using aggregated OpenThoughts calibration stats:
     1. Generate text before permutation
@@ -548,6 +660,8 @@ def run_permutation_experiment(
     3. Apply permutation based on aggregated stats
     4. Generate text after permutation
     5. Compare outputs
+
+    :return: The calibration_stats dict (per-channel mean activations) for visualization.
     """
     print("\n" + "=" * 80)
     print("PERMUTATION EXPERIMENT (using OpenThoughts calibration)")
@@ -586,6 +700,8 @@ def run_permutation_experiment(
         print(f"  After  ({len(text_after)} chars): {text_after[:200]}...")
     print("-" * 80)
 
+    return calibration_stats
+
 
 def main() -> None:
     args = parse_args()
@@ -618,13 +734,17 @@ def main() -> None:
         h.remove()
 
     print("Generating visualization...")
-    generate_html(activations, args.output)
+    #generate_html(activations, args.output)
 
     if args.permute:
-        run_permutation_experiment(model, tokenizer, activations, args)
+        calibration_stats = run_permutation_experiment(model, tokenizer, activations, args)
 
-        model.save_pretrained(args.model_id + "_permuted")
-        tokenizer.save_pretrained(args.model_id + "_permuted")
+        # Visualize aggregated down_proj stats used for permutation
+        aggregated_output = args.output.replace(".html", "_aggregated_stats.html")
+        generate_aggregated_html(calibration_stats, aggregated_output, args.threshold)
+
+        model.save_pretrained(args.model_id + "_permuted_mean")
+        tokenizer.save_pretrained(args.model_id + "_permuted_mean")
         
         print("Registering hooks after permutation...")
         activations, hooks = register_hooks(model)

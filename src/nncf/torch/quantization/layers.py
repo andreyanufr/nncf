@@ -1036,6 +1036,7 @@ class LoraMixin:
             raise nncf.ValidationError(msg)
         self.lora_A = torch.nn.Parameter(torch.ones((rank, in_features), dtype=default_lora_dtype))
         self.lora_B = torch.nn.Parameter(torch.zeros((out_features, rank), dtype=default_lora_dtype))
+        torch.nn.init.kaiming_uniform_(self.lora_A, a=1.0/rank)
 
     def enable_gradients(self):
         self.lora_A.requires_grad = True
