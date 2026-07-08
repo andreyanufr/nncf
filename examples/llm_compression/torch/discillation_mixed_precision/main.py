@@ -774,8 +774,9 @@ def set_stochastic(model: nn.Module, stochastic: bool) -> None:
     :param stochastic: A boolean value indicating whether to enable or disable stochastic mode for the quantizers.
     """
     hook_storage = get_hook_storage(model)
-    for _, module in hook_storage.named_hooks():
+    for name, module in hook_storage.named_hooks():
         if isinstance(module, (AsymmetricLoraQuantizer, SymmetricLoraQuantizer)) and (module.num_bits == 2):
+            print(f"Setting stochastic mode for {name} to {stochastic}")
             module.stochastic = stochastic
 
 
@@ -1075,7 +1076,7 @@ def main(argv) -> float:
     # the producing up_proj / gate_proj output channels.
     if args.equalize_down_proj:
         answer_before_equalization = generate_answer(model, tokenizer)
-        eq_loader = train_loader[:128]
+        eq_loader = {} #train_loader[:128]
         n_eq = equalize_down_proj(model, eq_loader)
         print(f"Equalized {n_eq} down_proj layers.")
         print(f"Answer before equalization: {answer_before_equalization}")
@@ -1123,7 +1124,7 @@ def main(argv) -> float:
     fq_lr = args.lr / 10
     weight_decay = args.lr
     param_to_train = set_trainable(model, lora_lr=args.lr, fq_lr=fq_lr)
-    #set_stochastic(model, stochastic=True)
+    set_stochastic(model, stochastic=True)
     opt = torch.optim.AdamW(param_to_train, weight_decay=weight_decay)
     # opt = torch.optim.Muon(param_to_train, weight_decay=weight_decay)
 

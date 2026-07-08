@@ -50,17 +50,6 @@ def get_compressed_weight(shape, bits, group_size=-1, symmetric=True):
     raise NotImplementedError(err)
 
 
-class NNCFQLinearStorage(torch.nn.Module):
-    def __init__(self, qweight, qzeros, scales, bits, group_size, sym):
-        super().__init__()
-        self.qweight = qweight
-        self.qzeros = qzeros
-        self.scales = scales
-        self.bits = bits
-        self.group_size = group_size if group_size > 0 else 0
-        self.sym = sym
-
-
 class NNCFQLinear(torch.nn.Module):
     """
     A wrapper for `torch.nn.Linear` that allows replacing it with a single
@@ -77,7 +66,7 @@ class NNCFQLinear(torch.nn.Module):
         super().__init__(*args, **kwargs)
         self.qweight = qweight
         self.qzeros = qzeros
-        self.scales = scales
+        self.scales = scales.to(torch.float16)
         self.bits = bits
         self.group_size = group_size if group_size > 0 else 0
         self.sym = sym
@@ -112,57 +101,6 @@ class NNCFQLinear(torch.nn.Module):
             weight = weight * self.scales.to(input.dtype).to(input.device)
         return F.linear(input, weight, self.bias)
 
-
-class NNCFQLinearDequantizer(torch.nn.Module):
-    """
-    A wrapper for `torch.nn.Linear` that allows replacing it with a single
-    operation during model tracing.
-
-    This class is used in NNCF quantization to replace `torch.nn.Linear` with
-    a single operation that represents the quantized linear layer. It is not
-    intended for direct use by users.
-    """
-
-    def __init__(
-        self, qweight=None, qzeros=None, scales=None, bits=None, group_size=None, sym=False, bias=None, *args, **kwargs
-    ):
-        super().__init__(*args, **kwargs)
-        self.qweight = qweight
-        self.qzeros = qzeros
-        self.scales = scales
-        self.bits = bits
-        self.group_size = group_size if group_size > 0 else 0
-        self.sym = sym
-        self.bias = bias
-
-        self.out_features = qweight.shape[0]
-        if bits in (2, 3, 4):
-            self.in_features = qweight.shape[1] * 2  # packed: two values per byte
-        else:
-            self.in_features = qweight.shape[1]
-
-    def unpack_weights(self):
-        if self.bits in (6, 8):
-            return self.qweight
-        if self.bits in (2, 3, 4):
-            return unpack_uint4(self.qweight)
-        err = f"Unsupported bit width: {self.bits}"
-        raise NotImplementedError(err)
-
-    def forward(self, input):
-        weight = self.unpack_weights().to(input.dtype).to(input.device)
-        if self.group_size > 0:
-            if self.qzeros is not None:
-                zeros = self.qzeros.float().to(input.dtype).to(input.device)
-                weight = weight - zeros
-            weight = weight * self.scales.to(input.dtype).to(input.device)
-            weight = weight.view(self.out_features, -1)
-        else:
-            if self.qzeros is not None:
-                zeros = self.qzeros.float().to(input.dtype).to(input.device)
-                weight = weight - zeros
-            weight = weight * self.scales.to(input.dtype).to(input.device)
-        return weight
 
 
 def create_random_nncf_qlinear(shape, bits, group_size=-1, symmetric=True):

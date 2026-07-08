@@ -33,6 +33,7 @@ from nncf.torch.strip import strip as strip
 from nncf.torch.extensions import force_build_cpu_extensions as force_build_cpu_extensions
 from nncf.torch.extensions import force_build_cuda_extensions as force_build_cuda_extensions
 
+from nncf.experimental.torch.qlinear import NNCFQLinear as NNCFQLinear
 # This is required since torchvision changes a dictionary inside of pytorch mapping
 # different ops and their role in torch fx graph. Once the nncf mapping is done, it is
 # represented as a different custom operation which is how it is changed in

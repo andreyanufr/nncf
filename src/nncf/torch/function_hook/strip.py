@@ -181,6 +181,7 @@ def replace_quantizer_to_compressed_weight_with_nncf_linear(model: TModel) -> TM
     from nncf.experimental.torch.qlinear import create_nncf_qlinear  # Importing here to avoid circular import
 
     hook_storage = get_hook_storage(model)
+    hooks_for_remove = []
 
     for hook_name, hook_module in track(
         list(hook_storage.named_hooks()), description="Converting to OV conversion format"
@@ -210,6 +211,17 @@ def replace_quantizer_to_compressed_weight_with_nncf_linear(model: TModel) -> TM
             # quantization error while keeping the weight as float.
             weight_param.requires_grad = False
             weight_param.data = hook_module.quantize(weight_param)
+            
+            if isinstance(hook_module, AsymmetricQuantizer):
+                decompressor, q_weight = asym_fq_to_decompressor(hook_module, weight_param)
+            else:
+                decompressor, q_weight = sym_fq_to_decompressor(hook_module, weight_param)  # type: ignore[assignment]
+            packed_tensor = decompressor.pack_weight(q_weight)
+
+            weight_param.requires_grad = False
+            weight_param.data = packed_tensor
+
+            hook_storage.set_submodule(hook_name, decompressor)
             continue
 
         q_weight, zero_point, scale, sym, num_bits, group_size, bias = get_quantized_weight_for_nncf_linear(
@@ -218,7 +230,8 @@ def replace_quantizer_to_compressed_weight_with_nncf_linear(model: TModel) -> TM
 
         new_linear = create_nncf_qlinear(q_weight, zero_point, scale, num_bits, group_size, bias, symmetric=sym)
 
-        del hook_module
+        #del hook_module
+        hooks_for_remove.append(hook_name)
 
         if module_name.count(".") == 0:
             # Top-level module
@@ -228,9 +241,11 @@ def replace_quantizer_to_compressed_weight_with_nncf_linear(model: TModel) -> TM
             parent_module = get_module_by_name(parent_module_name, model)
             setattr(parent_module, module_child_name, new_linear)
 
+    for hook_name in hooks_for_remove:
+        hook_storage.delete_hook(hook_name)
     # Unwrap the model to avoid conflicts with TorchFunctionMode
-    model.forward = model.forward.orig_forward
-    delattr(model, ATR_HOOK_STORAGE)
+    #model.forward = model.forward.orig_forward
+    #delattr(model, ATR_HOOK_STORAGE)
 
     if not hasattr(model, "config"):
         model.config = type("", (), {})()  # Create an empty object for config

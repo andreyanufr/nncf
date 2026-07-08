@@ -44,10 +44,14 @@ def load_checkpoint(model: nn.Module, ckpt_file: Path) -> nn.Module:
     return model
 
 
-PRETRAINED = "Qwen/Qwen3-8B"
-CHECKPOINT_FILE = "output_qwen_3_8B/last_sym_nncf_equalizing_gs_64_64_fq_lr01_ep5_safe_scale/nncf_checkpoint.pth"
-IR_DIR = "output_qwen_3_8B/last_sym_nncf_equalizing_gs_64_64_fq_lr01_ep5_safe_scale/ov_model_fp16/"
+# PRETRAINED = "Qwen/Qwen3-8B"
+# CHECKPOINT_FILE = "output_qwen_3_8B/last_sym_nncf_equalizing_gs_64_64_fq_lr01_ep5_safe_scale/nncf_checkpoint.pth"
+# IR_DIR = "output_qwen_3_8B/last_sym_nncf_equalizing_gs_64_64_fq_lr01_ep5_safe_scale/ov_model_fp16/"
 
+
+PRETRAINED = "Qwen/Qwen3-4B"
+CHECKPOINT_FILE = "output_qwen_3_4B/last_sym4_sym2_nncf_equalizing_open_thought_data_aware_mix_permuted_wider_kaiming/nncf_checkpoint.pth"
+IR_DIR = "output_qwen_3_4B/last_sym4_sym2_nncf_equalizing_open_thought_data_aware_mix_permuted_wider_kaiming/ov_model_fp16_one____/"
 
 def get_input_data(hf_tokenizer: AutoTokenizer, text: str = "Hello world!") -> dict[str, torch.Tensor]:
     """
@@ -67,20 +71,30 @@ def get_input_data(hf_tokenizer: AutoTokenizer, text: str = "Hello world!") -> d
 with torch.no_grad():
     tokenizer = AutoTokenizer.from_pretrained(PRETRAINED)
     if True:
-        model_to_eval = AutoModelForCausalLM.from_pretrained(PRETRAINED, torch_dtype=torch.float16, device_map="cpu")
+        model_to_eval = AutoModelForCausalLM.from_pretrained(PRETRAINED, torch_dtype=torch.float32, device_map="cpu")
         model_to_eval, _ = replace_linear_with_mixer(model_to_eval, ratio=0.5)
         model_to_eval = load_checkpoint(model_to_eval, CHECKPOINT_FILE)
 
         model_to_eval = nncf.strip(model_to_eval, do_copy=False, strip_format=StripFormat.OV)
         model_to_eval.eval()
+        
+        example_input = get_input_data(tokenizer, "Hello world!")
+        # output = model_to_eval.generate(**example_input, max_new_tokens=128, do_sample=False)[0]
+        # answer = tokenizer.decode(output, skip_special_tokens=True)
+        # print(f"Answer from the model: {answer}")
+        
+        
 
+        # with torch.inference_mode():
+        #     with torch.autocast(device_type="cpu", dtype=torch.float32):
         export_from_model(
             model_to_eval,
             IR_DIR,
             device="cpu",
-            compression_option="fp16",
-            ov_config=OVConfig(dtype="fp16"),
-            model_kwargs={"torch_dtype": "float16"},
+            # compression_option="fp16",
+            # ov_config=OVConfig(dtype="fp16"),
+            # model_kwargs={"torch_dtype": "float16"},
+            # input_data=example_input,
         )
 
         # ov_model = ov.convert_model(tracing_model, example_input=input_data)
@@ -89,9 +103,10 @@ with torch.no_grad():
         # ov.save_model(ov_model, output_path / "openvino_model.xml")
         tokenizer.save_pretrained(IR_DIR)
 
-    ov_model = OVModelForCausalLM.from_pretrained(IR_DIR)
-    ov_model.model = nncf.compress_weights(ov_model.model)
+    # ov_model = OVModelForCausalLM.from_pretrained(IR_DIR)
+    # ov_model.config.quantization_config = None
+    # ov_model.model = nncf.compress_weights(ov_model.model)
 
-    IR_DIR = IR_DIR + "_full_compression"
-    ov_model.save_pretrained(IR_DIR)
-    tokenizer.save_pretrained(IR_DIR)
+    # IR_DIR = IR_DIR + "_full_compression"
+    # ov_model.save_pretrained(IR_DIR)
+    # tokenizer.save_pretrained(IR_DIR)

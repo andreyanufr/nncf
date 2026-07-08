@@ -10,7 +10,6 @@
 # limitations under the License.
 
 from .qlinear import NNCFQLinear as NNCFQLinear
-from .qlinear import NNCFQLinearDequantizer as NNCFQLinearDequantizer
 from .qlinear import create_nncf_qlinear as create_nncf_qlinear
 from .qlinear import create_nncf_qlinear_dequantizer as create_nncf_qlinear_dequantizer
 from .qlinear import create_random_nncf_qlinear as create_random_nncf_qlinear

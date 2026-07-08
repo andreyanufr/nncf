@@ -10,10 +10,183 @@ import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from torch import Tensor
+import torch.nn as nn
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+
 matplotlib.use("Agg")
+
+
+# ---------------------------------------------------------------------- #
+# MLP equalization (down_proj input scale absorbed into up_proj/gate_proj)
+# ---------------------------------------------------------------------- #
+def _find_mlp_groups(model: nn.Module) -> list[tuple[nn.Module, nn.Linear, list[nn.Linear]]]:
+    """
+    Collect ``(parent, down_proj, [producers])`` triples where ``producers``
+    are the sibling linears whose outputs are consumed by ``down_proj`` along
+    its input-channel dimension.
+
+    Recognized layouts:
+      * Llama-style: ``down_proj`` consumes ``up_proj`` * SiLU(``gate_proj``);
+        producers = ``[up_proj, gate_proj]``.
+      * Generic: only ``up_proj`` present -> producers = ``[up_proj]``.
+    """
+    groups: list[tuple[nn.Module, nn.Linear, list[nn.Linear]]] = []
+    for parent in model.modules():
+        down = getattr(parent, "down_proj", None)
+        if not isinstance(down, nn.Linear):
+            continue
+        producers: list[nn.Linear] = []
+        for attr in ("up_proj",):  # , "gate_proj"):
+            sib = getattr(parent, attr, None)
+            if isinstance(sib, nn.Linear) and sib.out_features == down.in_features:
+                producers.append(sib)
+        if producers:
+            groups.append((parent, down, producers))
+    return groups
+
+# ---------------------------------------------------------------------- #
+# MLP equalization (average up_proj/gate_proj input scale absorbed into layer norm weights)
+# ---------------------------------------------------------------------- #
+def _find_up_gate_groups(model: nn.Module) -> list[tuple[nn.Module, nn.Linear, list[nn.Linear]]]:
+    """
+    Collect ``(parent, down_proj, [producers])`` triples where ``producers``
+    are the sibling linears whose outputs are consumed by ``down_proj`` along
+    its input-channel dimension.
+
+    Recognized layouts:
+      * Llama-style: ``down_proj`` consumes ``up_proj`` * SiLU(``gate_proj``);
+        producers = ``[up_proj, gate_proj]``.
+      * Generic: only ``up_proj`` present -> producers = ``[up_proj]``.
+    """
+    groups: list[tuple[nn.Module, nn.Linear, list[nn.Linear]]] = []
+    for parent in model.modules():
+        if not hasattr(parent, "mlp"):
+            continue
+        mlp = getattr(parent, "mlp")
+        gate = getattr(mlp, "gate_proj", None)
+        if not isinstance(gate, nn.Linear):
+            continue
+
+        up = getattr(mlp, "up_proj", None)
+        if not isinstance(up, nn.Linear):
+            continue
+
+        producer = None
+        for attr in ("post_attention_layernorm",):  # , "gate_proj"):
+            sib = getattr(parent, attr, None)
+            producer = sib
+
+        if producer:
+            groups.append((up, gate, producer))
+    return groups
+
+
+# rescale scale to [min, max] to avoid extreme values that cause instability during training or quantization
+def align_scale(s: Tensor, min_v=0.1, max_v=1.0) -> Tensor:
+    min_s = s.min()
+    max_s = s.max()
+    
+    if max_s - min_s < 1e-5:
+        return torch.clamp(s, min=min_v, max=max_v)
+    s = (s - min_s) / (max_s - min_s) * (max_v - min_v) + min_v
+    return s
+
+
+@torch.no_grad()
+def equalize_up_gate_with_layernorm(
+    model: nn.Module,
+    eps: float = 1e-5,
+) -> int:
+    groups = _find_up_gate_groups(model)
+    if not groups:
+        return 0
+
+
+
+    n_done = 0
+    for up, gate, producer in groups:
+        s_gate = gate.weight.abs().mean(dim=0).clamp_min(eps).to(device=gate.weight.device, dtype=gate.weight.dtype)
+        s_up = up.weight.abs().mean(dim=0).clamp_min(eps).to(device=up.weight.device, dtype=up.weight.dtype)
+
+        s_gate = s_gate / s_gate.norm(p=2, dim=0, keepdim=True)
+        s_up = s_up / s_up.norm(p=2, dim=0, keepdim=True)
+
+        # up_proj theoretically more sensitive to quantization
+        s = 0.1 * s_gate + 0.9 * s_up
+        s = align_scale(s, min_v=0.1, max_v=1.0)
+        # Divide down_proj input columns by s.
+        # print("Max val before equalization gate:", gate.weight.abs().max().item())
+        # print("Max val before equalization up:", up.weight.abs().max().item())
+        gate.weight.mul_(1.0 / s.unsqueeze(0))
+        up.weight.mul_(1.0 / s.unsqueeze(0))
+        # print("Max val after equalization gate:", gate.weight.abs().max().item())
+        # print("Max val after equalization up:", up.weight.abs().max().item())
+
+        # Scale producer output rows by s.
+        s_dev = s.to(device=producer.weight.device, dtype=producer.weight.dtype)
+        producer.weight.mul_(s_dev)
+        if hasattr(producer, "bias") and producer.bias is not None:
+            producer.bias.mul_(s_dev)
+        n_done += 1
+    return n_done
+
+
+@torch.no_grad()
+def equalize_down_proj(
+    model: nn.Module,
+    eps: float = 1e-5,
+) -> int:
+    """
+    Equalize each ``down_proj`` layer by absorbing the per-input-channel
+    activation magnitude into its producers (``up_proj`` and, when present,
+    ``gate_proj``).
+
+    For every MLP block let ``s = mean(|x|, dim=batch_seq)`` measured at the
+    input of ``down_proj`` over the calibration set. Then:
+
+    * ``down_proj.weight  /= s[None, :]`` (divide along input channels)
+    * For each producer ``L`` (e.g. ``up_proj``, ``gate_proj``):
+      ``L.weight *= s[:, None]``  (scale output channels)
+      ``L.bias   *= s``           (if a bias exists)
+
+    Mathematically, ``down(up(x) * silu(gate(x))) = down((up(x)*s) * (silu(gate(x)*s)/s))``
+    is *not* exact for the SiLU branch in general, but in practice this
+    pre-quantization equalization (cf. SmoothQuant / AWQ) significantly
+    flattens the weight magnitudes seen by the per-group quantizer. The
+    transformation is exact when no SiLU is present (``producers == [up_proj]``).
+
+    :param model: Model whose MLP blocks expose ``down_proj`` (and optional
+        ``up_proj``/``gate_proj`` siblings) as direct attributes. Must be
+        called on plain ``nn.Linear`` layers (i.e. **before** wrapping them
+        with :class:`QuantizedLoraLinear`).
+    :param calib_inputs: Token-id tensors used for activation statistics.
+    :param eps: Lower bound for ``s`` to avoid division by zero.
+    :return: Number of equalized MLP groups.
+    """
+    groups = _find_mlp_groups(model)
+    if not groups:
+        return 0
+
+    n_done = 0
+    for _, down, producers in groups:
+        s = down.weight.abs().mean(dim=0).clamp_min(eps).to(device=down.weight.device, dtype=down.weight.dtype)
+        s = align_scale(s, min_v=0.1, max_v=1.0)
+        # DEBUG
+        # print("Max val before equalization:", down.weight.abs().max().item())
+        down.weight.mul_(1.0 / s.unsqueeze(0))
+        # print("Max val after equalization:", down.weight.abs().max().item())
+
+        # Scale producer output rows by s.
+        for prod in producers:
+            s_dev = s.to(device=prod.weight.device, dtype=prod.weight.dtype)
+            prod.weight.mul_(s_dev.unsqueeze(1))
+            if prod.bias is not None:
+                prod.bias.mul_(s_dev)
+        n_done += 1
+    return n_done
 
 
 def parse_args() -> argparse.Namespace:
@@ -24,6 +197,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--permute", action="store_true",
         help="Compute and apply outlier permutation to down_proj/up_proj/gate_proj, then compare generation.",
+    )
+    parser.add_argument(
+        "--equalize", action="store_true",
+        help="Compute and apply outlier equalization to down_proj/up_proj/gate_proj, then compare generation.",
     )
     parser.add_argument("--threshold", type=float, default=6.0, help="Threshold factor for outlier detection.")
     parser.add_argument("--max_new_tokens", type=int, default=128, help="Max new tokens for generation check.")
@@ -650,6 +827,11 @@ def generate_text(model, tokenizer, device: str, max_new_tokens: int = 128) -> s
     return tokenizer.decode(generated, skip_special_tokens=True)
 
 
+def equalize(model):
+    equalize_down_proj(model)
+    equalize_up_gate_with_layernorm(model)
+
+
 def run_permutation_experiment(
     model, tokenizer, activations: Dict[str, torch.Tensor], args
 ) -> Dict[str, torch.Tensor]:
@@ -715,6 +897,11 @@ def main() -> None:
     )
     model.eval()
 
+    if args.equalize:
+        print("Applying outlier equalization to down_proj/up_proj/gate_proj...")
+        equalize(model)
+        print("Equalization complete.")
+
     print("Preparing input...")
     inputs = create_chain_of_thought_input(tokenizer)
     inputs = {k: v.to(args.device) for k, v in inputs.items()}
@@ -743,8 +930,8 @@ def main() -> None:
         aggregated_output = args.output.replace(".html", "_aggregated_stats.html")
         generate_aggregated_html(calibration_stats, aggregated_output, args.threshold)
 
-        model.save_pretrained(args.model_id + "_permuted_mean")
-        tokenizer.save_pretrained(args.model_id + "_permuted_mean")
+        model.save_pretrained(args.model_id + "_eq_permuted_mean")
+        tokenizer.save_pretrained(args.model_id + "_eq_permuted_mean")
         
         print("Registering hooks after permutation...")
         activations, hooks = register_hooks(model)
