@@ -160,6 +160,68 @@ class ReferenceQuantize:
         output = output / scale
         return output
 
+    def forward_stochastic_sparse(
+        self, input_: torch.Tensor, input_low: torch.Tensor, input_range: torch.Tensor, levels: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Stochastic quantization that returns the output and a sparse int8 correction tensor.
+
+        The correction represents the difference between stochastic and deterministic rounding
+        on the integer grid (values in {-1, 0, +1}). This allows reconstructing the stochastic
+        output in backward without saving the full float tensor.
+
+        :param input_: Input tensor.
+        :param input_low: Lower bound of quantization range.
+        :param input_range: Range of quantization.
+        :param levels: Number of quantization levels.
+        :return: Tuple of (quantized output, sparse int8 correction on the integer grid).
+        """
+        scale = (levels - 1) / input_range
+        output = input_.clip(min=input_low, max=input_low + input_range)
+        zero_point = (-input_low * scale).round()
+        output -= input_low
+        output *= scale
+        output -= zero_point
+        # Deterministic rounding on the integer grid
+        output_det = output.round()
+        # Stochastic rounding on the integer grid
+        output_stoch = self.stochastic_round(output)
+        # Sparse correction: mostly zeros, values in {-1, 0, +1}
+        correction = (output_stoch - output_det).to(torch.int8).to_sparse()
+        output_stoch = output_stoch / scale
+        return output_stoch, correction
+
+    @staticmethod
+    def reconstruct_from_correction(
+        input_: torch.Tensor,
+        input_low: torch.Tensor,
+        input_range: torch.Tensor,
+        levels: int,
+        correction: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Reconstruct the stochastic quantization output from a sparse correction tensor.
+
+        Used in backward pass to avoid saving the full float output.
+
+        :param input_: Original input tensor.
+        :param input_low: Lower bound of quantization range.
+        :param input_range: Range of quantization.
+        :param levels: Number of quantization levels.
+        :param correction: Sparse int8 correction from forward_stochastic_sparse.
+        :return: Reconstructed quantized output (identical to forward_stochastic output).
+        """
+        scale = (levels - 1) / input_range
+        output = input_.clip(min=input_low, max=input_low + input_range)
+        zero_point = (-input_low * scale).round()
+        output -= input_low
+        output *= scale
+        output -= zero_point
+        # Deterministic rounding + sparse correction = stochastic rounding result
+        output = output.round() + correction.to_dense().to(output.dtype)
+        output = output / scale
+        return output
+
     def backward(
         self,
         grad_output: GeneralizedTensor,
@@ -221,10 +283,14 @@ class ReferenceQuantize:
 torch_executor = ReferenceQuantize(backend_type=ReferenceBackendType.TORCH)
 torch_forward = CompilationWrapper(torch_executor.forward)
 torch_forward_stochastic = CompilationWrapper(torch_executor.forward_stochastic)
+torch_forward_stochastic_sparse = CompilationWrapper(torch_executor.forward_stochastic_sparse)
+torch_reconstruct_from_correction = CompilationWrapper(torch_executor.reconstruct_from_correction)
 torch_backward = CompilationWrapper(torch_executor.backward)
 
 
 class ReferenceQuantizedFunctions:
     Quantize_forward = torch_forward
     Quantize_forward_stochastic = torch_forward_stochastic
+    Quantize_forward_stochastic_sparse = torch_forward_stochastic_sparse
+    Quantize_reconstruct_from_correction = torch_reconstruct_from_correction
     Quantize_backward = torch_backward

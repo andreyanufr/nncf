@@ -130,11 +130,15 @@ class QuantizeSymmetricTorch(torch.autograd.Function):
         input_ = input_.reshape(input_shape)
 
         if stochastic:
-            output = RQ.Quantize_forward_stochastic(input_.type(torch.float32), input_low, input_range, levels)
-            ctx.save_for_backward(input_, input_low, input_range, output)
+            output, correction = RQ.Quantize_forward_stochastic_sparse(
+                input_.type(torch.float32), input_low, input_range, levels
+            )
+            ctx.save_for_backward(input_, input_low, input_range, correction)
+            ctx.stochastic = True
         else:
             output = RQ.Quantize_forward(input_.type(torch.float32), input_low, input_range, levels)
-            ctx.save_for_backward(input_, input_low, input_range, None)
+            ctx.save_for_backward(input_, input_low, input_range)
+            ctx.stochastic = False
 
         ctx.level_low = level_low
         ctx.level_high = level_high
@@ -145,10 +149,18 @@ class QuantizeSymmetricTorch(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        input_, input_low, input_range, output = ctx.saved_tensors
         levels = ctx.levels
         level_low = ctx.level_low
         level_high = ctx.level_high
+
+        if ctx.stochastic:
+            input_, input_low, input_range, correction = ctx.saved_tensors
+            output = RQ.Quantize_reconstruct_from_correction(
+                input_, input_low, input_range, levels, correction
+            )
+        else:
+            input_, input_low, input_range = ctx.saved_tensors
+            output = None
 
         input_shape = input_.shape
         orig_shape = grad_output.shape
@@ -172,11 +184,15 @@ class QuantizeAsymmetricTorch(torch.autograd.Function):
         input_ = input_.reshape(input_shape)
 
         if stochastic:
-            output = RQ.Quantize_forward_stochastic(input_.type(torch.float32), input_low, input_range, levels)
-            ctx.save_for_backward(input_, input_low, input_range, output)
+            output, correction = RQ.Quantize_forward_stochastic_sparse(
+                input_.type(torch.float32), input_low, input_range, levels
+            )
+            ctx.save_for_backward(input_, input_low, input_range, correction)
+            ctx.stochastic = True
         else:
             output = RQ.Quantize_forward(input_.type(torch.float32), input_low, input_range, levels)
-            ctx.save_for_backward(input_, input_low, input_range, None)
+            ctx.save_for_backward(input_, input_low, input_range)
+            ctx.stochastic = False
 
         # Save tensors for backward pass
         ctx.level_low = level_low
@@ -188,10 +204,19 @@ class QuantizeAsymmetricTorch(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        input_, input_low, input_range, output = ctx.saved_tensors
         levels = ctx.levels
         level_low = ctx.level_low
         level_high = ctx.level_high
+
+        if ctx.stochastic:
+            input_, input_low, input_range, correction = ctx.saved_tensors
+            output = RQ.Quantize_reconstruct_from_correction(
+                input_, input_low, input_range, levels, correction
+            )
+        else:
+            input_, input_low, input_range = ctx.saved_tensors
+            output = None
+
         input_shape = input_.shape
         orig_shape = grad_output.shape
         grad_output = grad_output.reshape(input_shape)
