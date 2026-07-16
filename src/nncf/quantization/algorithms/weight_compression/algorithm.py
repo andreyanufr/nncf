@@ -1102,6 +1102,18 @@ class WeightCompression(Algorithm):
         all_weight_params, ratio_defining_params, skipped_weight_params = self.get_weight_compression_parameters(
             model, graph
         )
+
+        backup_config = None
+        for weight_param in all_weight_params:
+            if weight_param.compression_config is not None and weight_param not in ratio_defining_params:
+                backup_config = weight_param.compression_config
+                break
+        for weight_param in skipped_weight_params:
+            weight_param.compression_config = backup_config
+            all_weight_params.append(weight_param)
+
+        skipped_weight_params = []
+
         # Collect statistics for the weights compression
         statistics, statistic_points = self.collect_statistics_and_statistic_points(
             model, graph, statistic_points, dataset, ratio_defining_params, all_weight_params
