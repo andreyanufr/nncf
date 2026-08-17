@@ -329,6 +329,7 @@ def compress_weights_impl(
     backup_mode: BackupMode,
     compression_format: CompressionFormat,
     advanced_parameters: AdvancedCompressionParameters | None = None,
+    precision_scope: dict[str, CompressWeightsMode] | None = None,
 ) -> onnx.ModelProto:
     if model.opset_import[0].version < 13:
         msg = "ONNX models with opset version < 13 do not support per-channel quantization."
@@ -361,6 +362,7 @@ def compress_weights_impl(
         backup_mode,
         compression_format,
         advanced_parameters,
+        precision_scope,
     )
     graph = build_graph(model)
 

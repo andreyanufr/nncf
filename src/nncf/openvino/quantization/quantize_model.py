@@ -379,6 +379,7 @@ def compress_weights_impl(
     backup_mode: BackupMode,
     compression_format: CompressionFormat,
     advanced_parameters: AdvancedCompressionParameters | None = None,
+    precision_scope: dict[str, CompressWeightsMode] | None = None,
 ) -> ov.Model:
     """
     Implementation of the `compress_weights()` method for the OpenVINO backend.
@@ -400,6 +401,7 @@ def compress_weights_impl(
         backup_mode,
         compression_format,
         advanced_parameters,
+        precision_scope,
     )
 
     statistics_points = None

@@ -13,6 +13,7 @@ import dataclasses
 import operator
 from collections import OrderedDict
 from collections import defaultdict
+from fnmatch import fnmatch
 from functools import reduce
 from typing import Any, TypeVar
 
@@ -82,6 +83,7 @@ def get_weight_compression_configuration(
     gptq: bool | None = None,
     lora_correction: bool | None = None,
     ignored_scope: IgnoredScope | None = None,
+    precision_scope: dict[str, CompressWeightsMode] | None = None,
     sensitivity_metric: SensitivityMetric | None = None,
     backup_mode: BackupMode | None = None,
     advanced_parameters: AdvancedCompressionParameters | None = None,
@@ -123,6 +125,7 @@ def get_weight_compression_configuration(
         "gptq": gptq or False,
         "lora_correction": lora_correction or False,
         "ignored_scope": ignored_scope or IgnoredScope(),
+        "precision_scope": precision_scope or {},
         "sensitivity_metric": (
             (
                 SensitivityMetric.WEIGHT_QUANTIZATION_ERROR
@@ -149,6 +152,7 @@ def check_user_compression_configuration(
     gptq: bool | None,
     lora_correction: bool | None,
     ignored_scope: IgnoredScope | None,
+    precision_scope: dict[str, CompressWeightsMode] | None,
     sensitivity_metric: SensitivityMetric | None,
     backup_mode: BackupMode | None,
     compression_format: CompressionFormat | None,
@@ -294,6 +298,21 @@ def check_user_compression_configuration(
             )
             raise nncf.ValidationError(msg)
 
+    if precision_scope:
+        if ratio is not None and ratio != 1:
+            msg = "precision_scope is only supported when ratio is 1 or None."
+            raise nncf.ValidationError(msg)
+
+        if ignored_scope:
+            ignored_patterns = set(ignored_scope.names + ignored_scope.patterns)
+            conflicting = set(precision_scope.keys()) & ignored_patterns
+            if conflicting:
+                msg = (
+                    f"Conflicting entries found in both ignored_scope and precision_scope: {conflicting}. "
+                    "A layer cannot be both ignored and assigned a specific precision."
+                )
+                raise nncf.ValidationError(msg)
+
 
 class WeightCompression(Algorithm):
     """
@@ -319,6 +338,7 @@ class WeightCompression(Algorithm):
         backup_mode: BackupMode,
         compression_format: CompressionFormat = CompressionFormat.DQ,
         advanced_parameters: AdvancedCompressionParameters | None = None,
+        precision_scope: dict[str, CompressWeightsMode] | None = None,
     ):
         """
         :param mode: Defines a mode for weight compression.
@@ -365,12 +385,14 @@ class WeightCompression(Algorithm):
             FP8_E4M3 stands for FP8 format with E4M3 values sharing group-level fp16 scale.
         :param compression_format: Describes the format in which the model is saved after weight compression.
         :param advanced_parameters: advanced parameters for algorithms in compression pipeline.
+        :param precision_scope: A dictionary mapping layer name glob patterns to compression modes.
         """
         super().__init__()
         self._mode = mode
         self._group_size = group_size
         self._ratio = ratio
         self._ignored_scope = ignored_scope
+        self._precision_scope = precision_scope or {}
         self._backend_entity = None
         self._algorithm_key = f"CW_{hash(self)}"
         self._statistics = {}
@@ -1086,6 +1108,17 @@ class WeightCompression(Algorithm):
         # Set each ratio defining parameter to primary config
         for weight_param in ratio_defining_params:
             weight_param.compression_config = self._get_primary_config(group_size_values[weight_param.weight_name])
+
+        # Apply precision_scope overrides to all compressible weight params
+        if self._precision_scope:
+            for weight_param in all_weight_params:
+                for pattern, override_mode in self._precision_scope.items():
+                    if fnmatch(weight_param.weight_name, pattern):
+                        weight_param.compression_config = WeightCompressionConfig(
+                            mode=override_mode,
+                            group_size=(group_size_values.get(weight_param.weight_name, self._group_size)),
+                        )
+                        break
 
         return all_weight_params, ratio_defining_params, skipped_weight_params
 

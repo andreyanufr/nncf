@@ -132,6 +132,7 @@ def compress_weights_impl(
     backup_mode: BackupMode,
     compression_format: CompressionFormat,
     advanced_parameters: AdvancedCompressionParameters | None = None,
+    precision_scope: dict[str, CompressWeightsMode] | None = None,
 ) -> torch.fx.GraphModule:
     """
     Implementation of the `compress_weights()` method for the Torch Fx backend.
@@ -151,6 +152,7 @@ def compress_weights_impl(
         backup_mode,
         compression_format,
         advanced_parameters,
+        precision_scope,
     )
     graph = build_graph(model)
     compressed_model = compression_algorithm.apply(model, graph, dataset=dataset)

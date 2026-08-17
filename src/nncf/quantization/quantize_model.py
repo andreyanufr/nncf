@@ -413,6 +413,7 @@ def compress_weights(
     ratio: float | None = None,
     group_size: int | None = None,
     ignored_scope: IgnoredScope | None = None,
+    precision_scope: dict[str, CompressWeightsMode] | None = None,
     all_layers: bool | None = None,
     dataset: Dataset | None = None,
     sensitivity_metric: SensitivityMetric | None = None,
@@ -459,6 +460,11 @@ def compress_weights(
     :param ignored_scope: An ignored scope that defined the list of model control
         flow graph nodes to be ignored during quantization.
     :type ignored_scope: nncf.IgnoredScope
+    :param precision_scope: A dictionary mapping layer name patterns to compression modes.
+        Keys are glob patterns (e.g. "*.down_proj.*") matched against layer names.
+        Values are CompressWeightsMode values to apply to matched layers.
+        Only applicable when ratio is 1 or None. Conflicts with ignored_scope raise an error.
+    :type precision_scope: Optional[dict[str, nncf.CompressWeightsMode]]
     :param all_layers: Indicates whether embeddings and last MatMul layers should be compressed to a primary
         precision. By default, the backup precision is assigned for the embeddings and last MatMul layers.
     :type all_layers: bool
@@ -667,6 +673,7 @@ def compress_weights(
         gptq,
         lora_correction,
         ignored_scope,
+        precision_scope,
         sensitivity_metric,
         backup_mode,
         compression_format,
@@ -683,6 +690,7 @@ def compress_weights(
         gptq,
         lora_correction,
         ignored_scope,
+        precision_scope,
         sensitivity_metric,
         backup_mode,
         advanced_parameters,
