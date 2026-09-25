@@ -177,7 +177,9 @@ def kl_div(student_hiddens: torch.Tensor, teacher_hiddens: torch.Tensor) -> torc
     )
 
 
-def set_trainable(model: nn.Module, lora_lr: float, fq_lr: float, scales_only: bool = False) -> list[dict[str, Any]]:
+def set_trainable(
+    model: nn.Module, lora_lr: float, fq_lr: float, scales_only: bool = False, adapters_only: bool = False
+) -> list[dict[str, Any]]:
     """
     Sets the trainable parameters of the model for quantization-aware training with LoRA (Low-Rank Adaptation).
 
@@ -190,6 +192,7 @@ def set_trainable(model: nn.Module, lora_lr: float, fq_lr: float, scales_only: b
     :param lora_lr: Learning rate for the LoRA adapters.
     :param fq_lr: Learning rate for the quantizer scales.
     :param scales_only: If True, only quantizer scales are trainable; LoRA adapters are frozen.
+    :param adapters_only: If True, only LoRA adapters are trainable; quantizer scales are frozen.
     :return: A list of dictionaries containing the parameters to be optimized and their corresponding learning rates.
     """
     model.requires_grad_(False)
@@ -204,9 +207,16 @@ def set_trainable(model: nn.Module, lora_lr: float, fq_lr: float, scales_only: b
             if scales_only:
                 for adapter in adapters.values():
                     adapter.requires_grad_(False)
+            elif adapters_only:
+                for name, param in params.items():
+                    if name not in adapters:
+                        param.requires_grad_(False)
+                adapters_to_train.extend(adapters.values())
             else:
                 adapters_to_train.extend(adapters.values())
-            scales_to_train.extend(param for name, param in params.items() if name not in adapters)
+            scales_to_train.extend(
+                param for name, param in params.items() if name not in adapters and not adapters_only
+            )
 
     params = list(model.parameters())
     trainable_params = sum(p.numel() for p in params if p.requires_grad)
@@ -219,6 +229,8 @@ def set_trainable(model: nn.Module, lora_lr: float, fq_lr: float, scales_only: b
     model.train()
     if scales_only:
         return [{"params": scales_to_train, "lr": fq_lr}]
+    if adapters_only:
+        return [{"params": adapters_to_train, "lr": lora_lr}]
     return [{"params": adapters_to_train, "lr": lora_lr}, {"params": scales_to_train, "lr": fq_lr}]
 
 
@@ -399,6 +411,12 @@ def get_argument_parser() -> argparse.ArgumentParser:
         default=0,
         help="Number of additional epochs after the main training loop during which only the quantizer scales are "
         "finetuned (LoRA adapters are frozen). Set to 0 to skip this phase.",
+    )
+    parser.add_argument(
+        "--adapters_epochs",
+        type=int,
+        default=0,
+        help="Number of epochs during which only LoRA adapters are trainable; quantizer scales are frozen.",
     )
     parser.add_argument(
         "--linear_lr_scheduler",
@@ -800,8 +818,6 @@ def main(argv) -> float:
         save_checkpoint(model, ckpt_file, model_state=not args.basic_init)
     fq_lr = args.lr / 10
     weight_decay = args.lr
-    param_to_train = set_trainable(model, lora_lr=args.lr, fq_lr=fq_lr)
-    opt = torch.optim.AdamW(param_to_train, weight_decay=weight_decay)
 
     # Run tuning with distillation loss and validation after each epoch.
     grad_accumulation_steps = args.batch_size // args.microbatch_size
@@ -810,6 +826,35 @@ def main(argv) -> float:
     microbatches_per_epoch = epoch_samples // args.microbatch_size
 
     save_model_state = not args.basic_init or args.equalize_mlp
+    total_steps = 0
+
+    if args.adapters_epochs > 0:
+        adapter_params = set_trainable(model, lora_lr=args.lr, fq_lr=fq_lr, adapters_only=True)
+        opt = torch.optim.AdamW(adapter_params, weight_decay=weight_decay)
+        total_steps = run_training(
+            model=model,
+            train_loader=train_loader,
+            orig_hiddens=orig_hiddens,
+            optimizer=opt,
+            scheduler=get_linear_lr_scheduler(
+                opt, args.linear_lr_scheduler, args.adapters_epochs, microbatches_per_epoch, grad_accumulation_steps
+            ),
+            ckpt_file=ckpt_file,
+            tb=tb,
+            num_epochs=args.adapters_epochs,
+            phase_desc="Adapters-only epoch",
+            start_total_steps=total_steps,
+            device=device,
+            torch_dtype=torch_dtype,
+            grad_accumulation_steps=grad_accumulation_steps,
+            num_samples=num_samples,
+            epoch_samples=epoch_samples,
+            microbatches_per_epoch=microbatches_per_epoch,
+            model_state=save_model_state,
+        )
+
+    param_to_train = set_trainable(model, lora_lr=args.lr, fq_lr=fq_lr)
+    opt = torch.optim.AdamW(param_to_train, weight_decay=weight_decay)
     total_steps = run_training(
         model=model,
         train_loader=train_loader,
@@ -822,7 +867,7 @@ def main(argv) -> float:
         tb=tb,
         num_epochs=args.epochs,
         phase_desc="Train epoch",
-        start_total_steps=0,
+        start_total_steps=total_steps,
         device=device,
         torch_dtype=torch_dtype,
         grad_accumulation_steps=grad_accumulation_steps,
