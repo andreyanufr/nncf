@@ -17,6 +17,8 @@ from nncf.torch.quantization.layers import QUANTIZATION_MODULES
 from nncf.torch.quantization.layers import PTLoraNLSSpec
 from nncf.torch.quantization.layers import PTLoraSpec
 from nncf.torch.quantization.layers import PTQuantizerSpec
+from nncf.torch.quantization.layers import SymmetricLoraQuantizer
+from nncf.torch.quantization.reference import ReferenceQuantizedFunctions as RQ
 
 
 @pytest.mark.parametrize("registred", list(QUANTIZATION_MODULES.registry_dict.items()))
@@ -58,3 +60,44 @@ def test_quantizer_layers_accepts_return_type(registred):
     quantizer._forward_impl = check_types(quantizer._forward_impl)
     quantizer(input_)
     assert visited
+
+
+def test_symmetric_lora_quantizer_negative_scale_gradient():
+    """
+    Verifies that a symmetric LoRA quantizer differentiates its negative scale through both quantization bounds.
+    """
+    input_ = torch.tensor([[-2.0, -0.5, 0.5, 2.0]])
+    qspec = PTQuantizerSpec(
+        num_bits=3,
+        mode=QuantizationMode.SYMMETRIC,
+        signedness_to_force=True,
+        narrow_range=False,
+        half_range=False,
+        scale_shape=(1, 1),
+        logarithm_scale=False,
+    )
+    lspec = PTLoraSpec(lora_rank=1, orig_weight_shape=list(input_.shape), weight_shape=list(input_.shape))
+    lora_quantizer = SymmetricLoraQuantizer(qspec, lspec)
+
+    with torch.no_grad():
+        lora_quantizer.scale.fill_(-1.0)
+        lora_quantizer.lora_A.zero_()
+        lora_quantizer.lora_B.zero_()
+
+    lora_quantizer(input_).sum().backward()
+    scale = lora_quantizer.scale.detach()
+    input_low = -scale / lora_quantizer.level_low * lora_quantizer.level_high
+    input_range = torch.abs((2 + 1 / lora_quantizer.level_low) * scale)
+    _, grad_input_low, grad_input_range = RQ.Quantize_backward(
+        torch.ones_like(input_),
+        input_,
+        input_low,
+        input_range,
+        lora_quantizer.levels,
+        lora_quantizer.level_low,
+        lora_quantizer.level_high,
+    )
+    expected_gradient = grad_input_low * (-lora_quantizer.level_high / lora_quantizer.level_low)
+    expected_gradient -= grad_input_range * (2 + 1 / lora_quantizer.level_low)
+
+    torch.testing.assert_close(lora_quantizer.scale.grad, expected_gradient.float())

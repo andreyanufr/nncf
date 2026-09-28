@@ -41,7 +41,7 @@ class QuantizeSymmetric(torch.autograd.Function):
         else:
             output = QuantizedFunctionsCPU.get("Quantize_forward")(input_, input_low, input_range, levels)
 
-        ctx.save_for_backward(input_, input_low, input_range)
+        ctx.save_for_backward(input_, input_low, input_range, scale)
         ctx.levels = levels
         ctx.level_low = level_low
         ctx.level_high = level_high
@@ -51,7 +51,7 @@ class QuantizeSymmetric(torch.autograd.Function):
     @staticmethod
     def backward(ctx: Any, *grad_outputs: Any) -> Any:
         grad_output = grad_outputs[0]
-        input_, input_low, input_range = ctx.saved_tensors
+        input_, input_low, input_range, scale = ctx.saved_tensors
         levels = ctx.levels
         level_low = ctx.level_low
         level_high = ctx.level_high
@@ -131,7 +131,7 @@ class QuantizeSymmetricTorch(torch.autograd.Function):
 
         output = RQ.Quantize_forward(input_.type(torch.float32), input_low, input_range, levels)
 
-        ctx.save_for_backward(input_, input_low, input_range)
+        ctx.save_for_backward(input_, input_low, input_range, scale)
         ctx.level_low = level_low
         ctx.level_high = level_high
         ctx.levels = levels
@@ -141,7 +141,7 @@ class QuantizeSymmetricTorch(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        input_, input_low, input_range = ctx.saved_tensors
+        input_, input_low, input_range, scale = ctx.saved_tensors
         levels = ctx.levels
         level_low = ctx.level_low
         level_high = ctx.level_high
@@ -150,12 +150,19 @@ class QuantizeSymmetricTorch(torch.autograd.Function):
         orig_shape = grad_output.shape
         grad_output = grad_output.reshape(input_shape)
 
-        grad_input, _, grad_scale = RQ.Quantize_backward(
+        grad_input, grad_input_low, grad_input_range = RQ.Quantize_backward(
             grad_output, input_, input_low, input_range, levels, level_low, level_high
         )
 
         grad_input = grad_input.reshape(orig_shape)
-        grad_scale = grad_scale.float()
+        input_low_scale_gradient = torch.where(
+            scale > 0,
+            -torch.ones_like(scale),
+            torch.full_like(scale, -level_high / level_low),
+        )
+        input_range_scale_gradient = (2 + 1 / level_low) * torch.sign(scale)
+        negative_scale_gradient = grad_input_low * input_low_scale_gradient + grad_input_range * input_range_scale_gradient
+        grad_scale = torch.where(scale < 0, negative_scale_gradient, grad_input_range).float()
         # input, input_shape, scale, level_low, level_high, levels
         return grad_input, None, grad_scale, None, None, None
 
