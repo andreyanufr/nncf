@@ -447,6 +447,8 @@ def do_integer_dequantization(compressed_weights: CompressedWeight, reduction_ax
 
     decompressed_weight = tensor.astype(TensorDataType.int32) - zero_point if zero_point is not None else tensor
     decompressed_weight = decompressed_weight.astype(scale.dtype) * scale
+    if compressed_weights.subscale is not None:
+        decompressed_weight = decompressed_weight * compressed_weights.subscale.astype(scale.dtype)
 
     if reduction_axis > -1:
         decompressed_weight = ungroup_weights(decompressed_weight, reduction_axis)
@@ -482,6 +484,9 @@ def do_integer_quantization(
         )
         raise ValueError(msg)
 
+    if config.mode == CompressWeightsMode.DC_INT4_SYM:
+        return _do_dc_int4_symmetric_quantization(weight, config, reduction_axes, precomputed_scale)
+
     # When reduction axes are not provided, assuming that the weights are already reshaped
     if config.group_size != -1 and reduction_axes is not None:
         # weights are reshaped from [a1, r, a2] to [a1, r//gs, gs, a2]
@@ -514,6 +519,48 @@ def do_integer_quantization(
     return CompressedWeight(compressed_weights, scale, zero_point)
 
 
+def _do_dc_int4_symmetric_quantization(
+    weight: Tensor,
+    config: WeightCompressionConfig,
+    reduction_axes: ReductionAxes | None,
+    precomputed_scale: Tensor | None = None,
+) -> CompressedWeight:
+    if config.group_size != 128:
+        msg = f"DC_INT4_SYM requires group_size=128, but group_size={config.group_size} is given."
+        raise InvalidGroupSizeError(msg)
+
+    if weight.backend == TensorBackend.ov:
+        weight = weight.as_numpy_tensor()
+    if weight.dtype != TensorDataType.float32:
+        weight = weight.astype(TensorDataType.float32)
+
+    if reduction_axes is None:
+        grouped_weight = weight
+        reduction_axis = grouped_weight.ndim - 1
+    else:
+        grouped_weight, reduction_axis = reshape_weight_for_grouped_quantization(weight, reduction_axes, config.group_size)
+    primary_scale = precomputed_scale
+    if primary_scale is None:
+        primary_scale = _calculate_signed_scale(grouped_weight, reduction_axis, num_bits=8)
+    int8_config = WeightCompressionConfig(mode=CompressWeightsMode.INT8_SYM, group_size=-1)
+    int8_weight = _calculate_integer_quantized_weight(grouped_weight, int8_config, primary_scale)
+
+    subscale_shape = list(int8_weight.shape)
+    subscale_shape[reduction_axis : reduction_axis + 1] = (4, 32)
+    int8_weight = int8_weight.reshape(subscale_shape)
+    subscale = fns.ceil(fns.max(fns.abs(int8_weight), axis=reduction_axis + 1, keepdims=True) / 7.0)
+    subscale = fns.clip(subscale, 1, 15).astype(TensorDataType.uint8)
+
+    int4_weight = fns.round(int8_weight / subscale.astype(TensorDataType.float32))
+    int4_weight = fns.clip(int4_weight, -8, 7).astype(TensorDataType.int8)
+    primary_scale = fns.unsqueeze(primary_scale, reduction_axis)
+    return CompressedWeight(
+        int4_weight,
+        primary_scale.astype(TensorDataType.float16),
+        subscale=subscale,
+    )
+
+
 def integer_quantize_dequantize_weight(
     weight: Tensor,
     config: WeightCompressionConfig,
@@ -535,6 +582,19 @@ def integer_quantize_dequantize_weight(
     :return: Dequantized weight tensor, or a tuple of the dequantized weight tensor and CompressedWeight instance
         if return_compressed_weight is True.
     """
+    if config.mode == CompressWeightsMode.DC_INT4_SYM:
+        compressed_weight = do_integer_quantization(
+            weight, config, reduction_axes, precomputed_scale, precomputed_zero_point
+        )
+        decompressed_weight = do_integer_dequantization(compressed_weight)
+        dequantized_shape = list(decompressed_weight.shape)
+        dequantized_shape[-2] *= dequantized_shape[-1]
+        del dequantized_shape[-1]
+        decompressed_weight = decompressed_weight.reshape(dequantized_shape)
+        if return_compressed_weight:
+            return decompressed_weight, compressed_weight
+        return decompressed_weight
+
     # Optimized implementation
     if _can_run_optimized(weight, config.mode):
         from nncf.openvino.optimized_functions import (

@@ -252,7 +252,19 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         elif compression_config.mode == CompressWeightsMode.NVFP4:
             scale_dtype = ov.Type.f8e4m3
 
-        if compression_config.is_codebook:
+        if compression_config.mode == CompressWeightsMode.DC_INT4_SYM:
+            compressed_const = create_ov_const_from_tensor(
+                compressed_weight.tensor, compression_dtype, name=const_node_name
+            )
+            converted_const = opset.convert(compressed_const, ov.Type.f16)
+            subscale_const = create_ov_const_from_tensor(
+                compressed_weight.subscale, ov.Type.u4, name=f"{const_node_name}/subscale"
+            )
+            subscale_const = opset.convert(subscale_const, ov.Type.f16)
+            converted_const = opset.multiply(
+                converted_const, subscale_const, name=f"{const_node_name}/dequantized_subscale_{weight_port_id}"
+            )
+        elif compression_config.is_codebook:
             converted_const = create_ov_codebook_subgraph(
                 codebook=compressed_weight.codebook
                 if compression_config.mode in [CompressWeightsMode.CODEBOOK, CompressWeightsMode.ADAPTIVE_CODEBOOK]

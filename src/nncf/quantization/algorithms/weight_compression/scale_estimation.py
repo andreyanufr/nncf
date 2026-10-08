@@ -230,10 +230,20 @@ class ScaleEstimation:
                 weight, cur_config, reduction_axis, return_compressed_weight=True
             )
             zp = compressed_weight.zero_point
+            if config.mode == nncf.CompressWeightsMode.DC_INT4_SYM:
+                scale = fns.squeeze(compressed_weight.scale, axis=-2)
+            else:
+                scale = compressed_weight.scale
             if zp is not None:
                 zp = zp.astype(compressed_weight.scale.dtype)
-        scale = compressed_weight.scale
+        if not config.is_integer:
+            scale = compressed_weight.scale
         compressed_weight = compressed_weight.get_unscaled_tensor()
+        if config.mode == nncf.CompressWeightsMode.DC_INT4_SYM:
+            compressed_shape = list(compressed_weight.shape)
+            compressed_shape[-2] *= compressed_shape[-1]
+            del compressed_shape[-1]
+            compressed_weight = compressed_weight.reshape(compressed_shape)
 
         s = fns.unsqueeze(s, -2)
         s, _ = reshape_weight_for_grouped_quantization(s, reduction_axis, group_size)
@@ -316,6 +326,11 @@ class ScaleEstimation:
                         precomputed_zero_point=zp,
                     )
                 compressed_weight = compressed_weight.get_unscaled_tensor()
+                if config.mode == nncf.CompressWeightsMode.DC_INT4_SYM:
+                    compressed_shape = list(compressed_weight.shape)
+                    compressed_shape[-2] *= compressed_shape[-1]
+                    del compressed_shape[-1]
+                    compressed_weight = compressed_weight.reshape(compressed_shape)
                 target, zero_mask = get_target_zero_mask(compressed_weight, zp)
                 zero_mask = zero_scale * zero_mask.astype(weight.dtype)
 
@@ -334,6 +349,11 @@ class ScaleEstimation:
                     precomputed_zero_point=zp,
                 )
             compressed_weight = compressed_weight.get_unscaled_tensor()
+            if config.mode == nncf.CompressWeightsMode.DC_INT4_SYM:
+                compressed_shape = list(compressed_weight.shape)
+                compressed_shape[-2] *= compressed_shape[-1]
+                del compressed_shape[-1]
+                compressed_weight = compressed_weight.reshape(compressed_shape)
 
             target, zero_mask = get_target_zero_mask(compressed_weight, zp)
             zero_mask = zero_scale * zero_mask.astype(weight.dtype)

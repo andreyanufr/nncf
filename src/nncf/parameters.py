@@ -78,6 +78,8 @@ class CompressWeightsMode(StrEnum):
     :param INT4_ASYM: The same as INT4_SYM mode, but weights are quantized to a primary precision asymmetrically
         with a typical non-fixed zero point.
         https://github.com/openvinotoolkit/nncf/blob/develop/docs/usage/training_time_compression/other_algorithms/LegacyQuantization.md#asymmetric-quantization
+    :param DC_INT4_SYM: Double-compressed symmetric INT4 format. Each group of 128 weights has one FP16 primary
+        scale and four UINT4 subscales, one per 32 INT4 weights.
     :param INT3_SYM: Stands for a mixed-precision weights quantization with 3-bit integer as a primary precision.
         Weights are quantized to a primary precision symmetrically without zero point.
     :param INT2_SYM: Stands for a mixed-precision weights quantization with 2-bit integer as a primary precision.
@@ -98,6 +100,7 @@ class CompressWeightsMode(StrEnum):
     INT8_ASYM = "int8_asym"
     INT4_SYM = "int4_sym"
     INT4_ASYM = "int4_asym"
+    DC_INT4_SYM = "dc_int4_sym"
     INT3_SYM = "int3_sym"
     INT2_SYM = "int2_sym"
     NF4 = "nf4"
