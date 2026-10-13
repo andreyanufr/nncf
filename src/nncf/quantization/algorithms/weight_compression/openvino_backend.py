@@ -19,6 +19,7 @@ from nncf.common.graph.operator_metatypes import OperatorMetatype
 from nncf.common.graph.patterns.patterns import GraphPattern
 from nncf.common.graph.transformations.commands import TargetType
 from nncf.common.graph.utils import get_reduction_axes
+from nncf.common.logging import nncf_logger
 from nncf.common.tensor_statistics.collectors import MeanAggregator
 from nncf.common.tensor_statistics.collectors import NoopAggregator
 from nncf.common.tensor_statistics.collectors import TensorCollector
@@ -119,15 +120,10 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
 
         ov_node = self.name_to_node_mapping[node.node_name]
 
-        supported_src_types = {ov.Type.u4: 4, ov.Type.i4: 4, ov.Type.u8: 8, ov.Type.i8: 8}
+        supported_src_types = {ov.Type.i4: 4, ov.Type.i8: 8}
         if ov_node.tensor_view.element_type not in supported_src_types:
             return False, 0, 0
-        bits = supported_src_types[ov_node.tensor_view.element_type]
-        asym = ov_node.tensor_view.element_type in [ov.Type.u8, ov.Type.u4]
-
-        # only repack for sym types are supported for now: i3, i2
-        if asym:
-            return False, 0, 0
+        bits = ov_node.tensor_view.element_type.get_bitwidth()
 
         weight_tensor = Tensor(get_const_value_as_ov_tensor(ov_node))
         weight_tensor = weight_tensor.as_numpy_tensor().astype(TensorDataType.int32)
@@ -153,11 +149,13 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         # representation [u2/u3] - zero_point per tensor
         offset = 2 ** (optimal_bits - 1)
         compressed_tensor = weight_tensor + offset
+
+        target_type = self.name_to_node_mapping[next_nodes[0].node_name].get_element_type()
         compressed_const = create_ov_const_from_tensor(compressed_tensor, compression_dtype, name=const_node_name)
-        converted_const = opset.convert(compressed_const, ov.Type.f16)
+        converted_const = opset.convert(compressed_const, target_type)
 
         zero_point_const = opset.constant(offset, dtype=ov.Type.i8, name=f"{const_node_name}/zero_point")
-        zero_point_const = opset.convert(zero_point_const, ov.Type.f16)
+        zero_point_const = opset.convert(zero_point_const, target_type)
 
         converted_const = opset.subtract(
             converted_const, zero_point_const, name=f"{const_node_name}/zero_point/subtract"
@@ -543,3 +541,37 @@ class OVMixedPrecisionAlgoBackend(MixedPrecisionAlgoBackend, OVWeightCompression
         collector = TensorCollector(MeanMagnitudeTensorStatistic)
         collector.register_statistic_branch(MeanMagnitudeTensorStatistic.MEAN_MAGNITUDE_STAT, reducer, aggregator)
         return collector
+
+
+def repack_weights(
+    model: ov.Model,
+    graph: NNCFGraph,
+) -> ov.Model:
+    """
+    Looking for 4 and 8 bit weights in OV model and repack them if maximal absolute value corresponds
+    to the supported type with lower bits.
+
+    :param model: A model to be repacked.
+    :type model: ov.Model
+    :param graph: The NNCF graph corresponding to the model.
+    :type graph: NNCFGraph
+    :return: The non-trainable model with repacked weights or the same model.
+    """
+    backend_entity = OVWeightCompressionAlgoBackend(model)
+
+    n_repacked_tensors = 0
+    bits_before = 0
+    bits_after = 0
+
+    for node in graph.topological_sort():
+        is_repacked, bits_before_node, bits_after_node = backend_entity.try_repack(node, graph)
+        if is_repacked:
+            n_repacked_tensors += 1
+            bits_before += bits_before_node
+            bits_after += bits_after_node
+    nncf_logger.info(
+        f"\nTotal repacked tensors: {n_repacked_tensors}; "
+        f"\ntotal MB before: {bits_before / 8 / 1024 / 1024}; "
+        f"\ntotal MB after: {bits_after / 8 / 1024 / 1024}"
+    )
+    return model

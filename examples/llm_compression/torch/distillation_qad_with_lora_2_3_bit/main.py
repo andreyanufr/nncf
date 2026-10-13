@@ -41,7 +41,6 @@ from nncf.parameters import StripFormat
 from nncf.quantization.advanced_parameters import AdvancedAWQParameters
 from nncf.quantization.advanced_parameters import AdvancedCompressionParameters
 from nncf.quantization.quantize_model import compress_weights
-from nncf.quantization.quantize_model import repack_weights
 from nncf.torch import load_from_config
 from nncf.torch.function_hook.wrapper import get_hook_storage
 from nncf.torch.quantization.layers import AsymmetricLoraQuantizer
@@ -283,24 +282,26 @@ def load_checkpoint(model: nn.Module, ckpt_file: Path) -> nn.Module:
 
 
 @torch.no_grad()
-def export_to_openvino(pretrained: str, ckpt_file: Path, ir_dir: Path):
+def export_to_openvino(pretrained: str, ckpt_file: Path, ir_dir: Path, tokenizer: AutoTokenizer):
     """
     Export the quantized model to OpenVINO IR format.
 
     :param pretrained: The name or path of the pretrained model.
     :param ckpt_file: The path to the checkpoint file to load the model weights and NNCF configurations.
     :param ir_dir: The directory where the OpenVINO model will be saved.
-    :return: A wrapper of OpenVINO model ready for evaluation.
+    :return: None. The OpenVINO model is exported and saved to the specified directory.
     """
     model_to_eval = AutoModelForCausalLM.from_pretrained(pretrained, torch_dtype=torch.float32, device_map="cpu")
     model_to_eval = load_checkpoint(model_to_eval, ckpt_file)
     model_to_eval = nncf.strip(model_to_eval, do_copy=False, strip_format=StripFormat.DQ)
     export_from_model(model_to_eval, ir_dir, device="cpu")
     print(f"The OpenVINO model has been exported and saved to: {ir_dir}")
+    tokenizer.save_pretrained(ir_dir)
 
     model_to_eval = OVModelForCausalLM.from_pretrained(ir_dir)
-    model_to_eval.model = repack_weights(model_to_eval.model)
+    model_to_eval.model = nncf.repack_weights(model_to_eval.model)
     model_to_eval.save_pretrained(ir_dir / "repacked")
+    tokenizer.save_pretrained(ir_dir / "repacked")
     print(f"The OpenVINO model has been repacked and saved to: {ir_dir / 'repacked'}")
 
 
@@ -329,7 +330,6 @@ def get_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--pretrained",
         type=str,
-        # default="Qwen/Qwen3-8B",
         default="meta-llama/Llama-3.2-1B-Instruct",
         help="The model id or path of a pretrained HF model configuration.",
     )
@@ -559,7 +559,9 @@ def equalize_up_gate_with_layernorm(model: nn.Module, eps: float = 1e-5, use_ali
         # Standard RMSNorm (e.g. Llama) uses weight*x (weight initialized to ones):
         #   effective multiplier = weight
         #   to scale output by s: w_new = s * w_old
-        if "gemma" in type(producer).__name__.lower():
+        ln_type = type(producer).__name__.lower()
+        not_linear = "gemma" in ln_type or "qwen3nextrmsnorm" in ln_type or "qwen3_5rmsnorm" in ln_type
+        if not_linear:
             _set_weight_data(producer, s_dev * (1.0 + w_prod) - 1.0)
         else:
             _set_weight_data(producer, w_prod * s_dev)
@@ -692,7 +694,8 @@ def run_training(
                         targets = targets / fls
                         targets = torch.tanh(targets)
                         targets = targets * fls
-            outputs = model(**inputs).logits
+            with torch.autocast(device_type=device, dtype=torch_dtype):
+                outputs = model(**inputs).logits
             loss = kl_div(outputs, targets.to(dtype=torch_dtype, device=device))
 
             # Perform an optimization step after accumulating gradients over multiple minibatches.
@@ -719,6 +722,15 @@ def run_training(
     return total_steps
 
 
+def check_args(args):
+    if args.lora_rank <= 0:
+        msg = f"Invalid LoRA rank: {args.lora_rank}. LoRA rank must be a positive integer."
+        raise ValueError(msg)
+    if args.microbatch_size <= 0 or args.batch_size < args.microbatch_size or args.batch_size % args.microbatch_size:
+        msg = "batch_size must be a positive multiple of microbatch_size"
+        raise ValueError(msg)
+
+
 def main(argv) -> float:
     """
     Fine-tunes the specified model and returns the difference between initial and best validation perplexity in Torch,
@@ -726,6 +738,8 @@ def main(argv) -> float:
     """
     parser = get_argument_parser()
     args = parser.parse_args(argv)
+    check_args(args)
+
     assert torch.cuda.is_available()
     if args.full_determinism:
         transformers.enable_full_determinism(42)
@@ -872,7 +886,7 @@ def main(argv) -> float:
         print(f"The finetuned model has been exported to torch and saved to: {ckpt_file.parent / 'dequantized'}\n")
 
     # Export the best tuned model to OpenVINO.
-    export_to_openvino(args.pretrained, ckpt_file, ckpt_file.parent)
+    export_to_openvino(args.pretrained, ckpt_file, ckpt_file.parent, tokenizer)
 
 
 if __name__ == "__main__":

@@ -321,7 +321,14 @@ class PTWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
             quantizer = quantizer_cls(quantizer_spec, lora_spec)
             lora_dtype = quantizer.lora_A.dtype
             svd_residual = torch.rand(weight_shape).to(device) * scale / 100  # value on [0,1] * (1/100 of quant size)
-            svd_residual = svd_residual.reshape(orig_weight_shape)
+            stable_add = 1e-4 * torch.eye(
+                *orig_weight_shape[-2:],
+                device=device,
+                dtype=svd_residual.dtype,
+            )
+            # avoid ill-conditioned matrices by adding a small identity matrix to the residual
+            svd_residual = svd_residual.reshape(orig_weight_shape) + stable_add
+
             B, A = PTWeightCompressionAlgoBackend.init_lora_adapters(svd_residual, rank=lora_adapter_rank)
             quantizer.lora_A = torch.nn.Parameter(A.type(dtype=lora_dtype))
             quantizer.lora_B = torch.nn.Parameter(B.type(dtype=lora_dtype))
@@ -441,13 +448,10 @@ class PTWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
 
         transformation_layout = TransformationLayout()
 
-        if hasattr(weight_compression_parameters, "sequence"):
-            # avoid track
-            is_all_8bit = all(
-                wc_params.compression_config.num_bits == 8 for wc_params in weight_compression_parameters.sequence
-            )
-        else:
-            is_all_8bit = all(wc_params.compression_config.num_bits == 8 for wc_params in weight_compression_parameters)
+        is_all_8bit = all(
+            wc_params.compression_config.num_bits == 8
+            for wc_params in getattr(weight_compression_parameters, "sequence", weight_compression_parameters)
+        )
         for wc_params in weight_compression_parameters:
             compression_config = wc_params.compression_config
             if compression_config.mode in [
