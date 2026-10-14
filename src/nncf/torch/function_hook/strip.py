@@ -119,6 +119,9 @@ def replace_quantizer_to_compressed_weight_with_decompressor(model: TModel) -> T
     :return: The modified NNCF network.
     """
     hook_storage = get_hook_storage(model)
+    hooks_to_delete = []
+
+    params_with_8_bit = {}
 
     for hook_name, hook_module in hook_storage.named_hooks():
         if not isinstance(hook_module, (SymmetricQuantizer, AsymmetricQuantizer)):
@@ -139,12 +142,29 @@ def replace_quantizer_to_compressed_weight_with_decompressor(model: TModel) -> T
             decompressor, q_weight = asym_fq_to_decompressor(hook_module, weight_param)
         else:
             decompressor, q_weight = sym_fq_to_decompressor(hook_module, weight_param)  # type: ignore[assignment]
-        packed_tensor = decompressor.pack_weight(q_weight)
 
+        packed_tensor = decompressor.pack_weight(q_weight)
         weight_param.requires_grad = False
         weight_param.data = packed_tensor
+        if hook_module._qspec.num_bits == 8:
+            params_with_8_bit[weight_param] = decompressor
 
-        hook_storage.set_submodule(hook_name, decompressor)
+        nn.utils.parametrize.register_parametrization(module, "weight", decompressor, unsafe=True)
+
+        # hook_storage.set_submodule(hook_name, decompressor)
+        print(hook_name)
+        hooks_to_delete.append(hook_name)
+
+    if hasattr(model, "lm_head"):
+        for weight_param, decompressor in params_with_8_bit.items():
+            if weight_param is model.lm_head.weight:
+                nn.utils.parametrize.register_parametrization(
+                    get_module_by_name("lm_head", model), "weight", decompressor, unsafe=True
+                )
+
+    for hook_name in hooks_to_delete:
+        hook_storage.delete_hook(hook_name)
+    del hook_storage
     return model
 
 

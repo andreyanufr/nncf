@@ -763,6 +763,7 @@ def main(argv) -> float:
     output_dir = Path(args.output_dir)
     tensorboard_dir = output_dir / "tb" / datetime.now().strftime("%Y-%m-%d__%H-%M-%S")
     last_dir = output_dir / f"last_bits_{args.bits}"
+
     if not args.resume:
         shutil.rmtree(last_dir, ignore_errors=True)
     for path in [output_dir, tensorboard_dir, last_dir]:
