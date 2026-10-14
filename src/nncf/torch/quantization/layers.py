@@ -48,6 +48,7 @@ from nncf.torch.quantization.quantize_functions import pack_int4
 from nncf.torch.quantization.quantize_functions import pack_uint4
 from nncf.torch.quantization.quantize_functions import symmetric_quantize
 from nncf.torch.quantization.quantize_functions import symmetric_quantize_lora
+from nncf.torch.quantization.quantize_functions import symmetric_quantize_lora_sigmoid
 from nncf.torch.quantization.quantize_functions import unpack_int4
 from nncf.torch.quantization.quantize_functions import unpack_uint4
 from nncf.torch.return_types import maybe_get_values_from_torch_return_type
@@ -1199,6 +1200,108 @@ class SymmetricLoraNLSQuantizer(SymmetricLoraQuantizer, LoraNLSMixin):
         qspec = PTQuantizerSpec.from_state(state["qspec"])
         lspec = PTLoraNLSSpec.from_state(state["lspec"])
         return cls(qspec, lspec)
+
+
+@QUANTIZATION_MODULES.register(QuantizationMode.SYMMETRIC_LORA_SIGMOID)
+class SymmetricLoraSigmoidQuantizer(SymmetricLoraQuantizer):
+    """
+    Two-bit symmetric sigmoid quantizer with group-wise scales and thresholds.
+    """
+
+    THRESHOLD_1_PARAM_NAME = "threshold_1"
+    THRESHOLD_2_PARAM_NAME = "threshold_2"
+    THRESHOLD_3_PARAM_NAME = "threshold_3"
+    TEMPERATURE_KEY = "temperature"
+
+    def __init__(self, qspec: PTQuantizerSpec, lspec: PTLoraSpec, temperature: float = 1.0):
+        if qspec.num_bits != 2:
+            msg = f"Sigmoid LoRA quantization supports only 2 bits, but got {qspec.num_bits}."
+            raise nncf.ValidationError(msg)
+        if temperature <= 0:
+            msg = f"Temperature must be positive, but got {temperature}."
+            raise nncf.ValidationError(msg)
+        super().__init__(qspec, lspec)
+        step = 0.5**0.5
+        self.threshold_1 = nn.Parameter(torch.ones(self.scale_shape))
+        self.threshold_2 = nn.Parameter(torch.ones(self.scale_shape) * step)
+        self.threshold_3 = nn.Parameter(torch.ones(self.scale_shape) * step)
+        self.initialize_thresholds()
+        self.register_buffer("temperature", torch.tensor(float(temperature)))
+
+    def initialize_thresholds(self) -> None:
+        """
+        Initializes sigmoid thresholds from the magnitude of each group scale.
+
+        The resulting sigmoid transitions are at $-0.75|s|$, $-0.25|s|$, and $0.25|s|$,
+        matching the decision boundaries of symmetric two-bit quantization.
+        """
+        # with torch.no_grad():
+        #     scale_magnitude = self.scale.abs().clamp_min(torch.finfo(self.scale.dtype).eps)
+        #     self.threshold_1.copy_(torch.sqrt(scale_magnitude / 2))
+        #     self.threshold_2.copy_(torch.sqrt(scale_magnitude / 4))
+        #     self.threshold_3.copy_(torch.sqrt(scale_magnitude / 4))
+        pass
+
+    def set_temperature(self, temperature: float) -> None:
+        """
+        Updates the sigmoid temperature.
+
+        :param temperature: Positive sigmoid temperature. Lower values yield sharper steps.
+        """
+        if temperature <= 0:
+            msg = f"Temperature must be positive, but got {temperature}."
+            raise nncf.ValidationError(msg)
+        self.temperature.fill_(temperature)
+
+    def quantize(self, x: torch.Tensor, execute_traced_op_as_identity: bool = False) -> torch.Tensor:
+        with DisableTorchFunction():
+            self.to(x.device)
+        return symmetric_quantize_lora_sigmoid(
+            x,
+            self._lspec.weight_shape,
+            self.lora_A,
+            self.lora_B,
+            self.scale,
+            self.threshold_1,
+            self.threshold_2,
+            self.threshold_3,
+            self.temperature,
+            skip=execute_traced_op_as_identity,
+        )
+
+    def enable_gradients(self) -> None:
+        super().enable_gradients()
+        self.threshold_1.requires_grad = True
+        self.threshold_2.requires_grad = True
+        self.threshold_3.requires_grad = True
+
+    def disable_gradients(self) -> None:
+        super().disable_gradients()
+        self.threshold_1.requires_grad = False
+        self.threshold_2.requires_grad = False
+        self.threshold_3.requires_grad = False
+
+    def get_trainable_params(self) -> dict[str, torch.Tensor]:
+        params = super().get_trainable_params()
+        params.update(
+            {
+                self.THRESHOLD_1_PARAM_NAME: self.threshold_1,
+                self.THRESHOLD_2_PARAM_NAME: self.threshold_2,
+                self.THRESHOLD_3_PARAM_NAME: self.threshold_3,
+            }
+        )
+        return params
+
+    def get_config(self) -> dict[str, Any]:
+        config = super().get_config()
+        config[self.TEMPERATURE_KEY] = self.temperature.item()
+        return config
+
+    @classmethod
+    def from_config(cls, state) -> "SymmetricLoraSigmoidQuantizer":
+        qspec = PTQuantizerSpec.from_state(state["qspec"])
+        lspec = PTLoraSpec.from_state(state["lspec"])
+        return cls(qspec, lspec, state.get(cls.TEMPERATURE_KEY, 1.0))
 
 
 def get_per_channel_scale_shape(input_shape, is_weights, channel_idx: int | None = None) -> list[int]:

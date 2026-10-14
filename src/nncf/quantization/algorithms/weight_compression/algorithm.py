@@ -263,8 +263,9 @@ def check_user_compression_configuration(
         CompressionFormat.FQ,
         CompressionFormat.FQ_LORA,
         CompressionFormat.FQ_LORA_NLS,
+        CompressionFormat.FQ_LORA_SIGMOID,
     ]:
-        msg = "LoRA Correction algorithm is not compatible with FQ, FQ_LORA and FQ_LORA_NLS compression formats."
+        msg = "LoRA Correction algorithm is not compatible with FQ, FQ_LORA, FQ_LORA_NLS and FQ_LORA_SIGMOID formats."
         raise nncf.ValidationError(msg)
 
     if mode == CompressWeightsMode.CODEBOOK and (advanced_parameters is None or advanced_parameters.codebook is None):

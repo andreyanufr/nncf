@@ -45,6 +45,8 @@ class QuantizationScheme(StrEnum):
         the multiplication of low-rank adapters.
     :param ASYMMETRIC_LORA_NLS: Asymmetric quantization with Low-Rank Adapters (LoRA) and Neural Low-Rank Adapter Search
         (NLS), involving the sum of weights and the multiplication of low-rank adapters.
+    :param SYMMETRIC_LORA_SIGMOID: Two-bit symmetric quantization represented by sigmoid steps with Low-Rank Adapters
+        (LoRA).
     """
 
     SYMMETRIC = "symmetric"
@@ -53,6 +55,7 @@ class QuantizationScheme(StrEnum):
     SYMMETRIC_LORA_NLS = "symmetric_lora_nls"
     ASYMMETRIC_LORA = "asymmetric_lora"
     ASYMMETRIC_LORA_NLS = "asymmetric_lora_nls"
+    SYMMETRIC_LORA_SIGMOID = "symmetric_lora_sigmoid"
 
 
 class QuantizerConfig:

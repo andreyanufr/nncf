@@ -130,12 +130,15 @@ class CompressionFormat(StrEnum):
     :param FQ_LORA_NLS: Represents the 'fake_quantize_with_lora_nls' format, which extends FQ_LORA with elastic
         absorbable low-rank adapters (LoRA). Quantization is applied similarly to FQ_LORA, and utilizing NLS often
         results in better performance for downstream task fine-tuning.
+    :param FQ_LORA_SIGMOID: Represents the 'fake_quantize_with_lora_sigmoid' format for two-bit symmetric
+        quantization represented by trainable sigmoid steps and absorbable LoRA adapters.
     """
 
     DQ = "dequantize"
     FQ = "fake_quantize"
     FQ_LORA = "fake_quantize_with_lora"
     FQ_LORA_NLS = "fake_quantize_with_lora_nls"
+    FQ_LORA_SIGMOID = "fake_quantize_with_lora_sigmoid"
 
 
 @api(canonical_alias="nncf.StripFormat")

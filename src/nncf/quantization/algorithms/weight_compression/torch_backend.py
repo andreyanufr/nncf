@@ -282,6 +282,12 @@ class PTWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
             if is_all_8bit:
                 mode_vs_schema_map[CompressWeightsMode.INT8_ASYM] = QuantizationScheme.ASYMMETRIC_LORA_NLS
                 mode_vs_schema_map[CompressWeightsMode.INT8_SYM] = QuantizationScheme.SYMMETRIC_LORA_NLS
+        if compression_format == CompressionFormat.FQ_LORA_SIGMOID:
+            if not compression_config.mode in [CompressWeightsMode.INT2_SYM, CompressWeightsMode.INT8_SYM,
+                                               CompressWeightsMode.INT8_ASYM]:
+                msg = "FQ_LORA_SIGMOID compression format supports only INT2_SYM mode."
+                raise nncf.ValidationError(msg)
+            mode_vs_schema_map[CompressWeightsMode.INT2_SYM] = QuantizationScheme.SYMMETRIC_LORA_SIGMOID
 
         schema = mode_vs_schema_map[compression_config.mode]
 
@@ -306,6 +312,7 @@ class PTWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
             QuantizationScheme.ASYMMETRIC_LORA_NLS,
             QuantizationScheme.SYMMETRIC_LORA,
             QuantizationScheme.SYMMETRIC_LORA_NLS,
+            QuantizationScheme.SYMMETRIC_LORA_SIGMOID,
         ]:
             if schema in [QuantizationScheme.ASYMMETRIC_LORA, QuantizationScheme.SYMMETRIC_LORA]:
                 lora_spec = PTLoraSpec(
@@ -351,6 +358,8 @@ class PTWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         else:
             scale = scale.type(quantizer.scale.dtype)
             quantizer.scale = torch.nn.Parameter(scale * levels / 2)
+            if schema == QuantizationScheme.SYMMETRIC_LORA_SIGMOID:
+                quantizer.initialize_thresholds()
 
         target_node_name = wc_params.weight_name
         target_point = PTTargetPoint(TargetType.OPERATOR_POST_HOOK, target_node_name=target_node_name)

@@ -346,6 +346,68 @@ def symmetric_quantize_lora(input_, input_shape, A, B, scale, level_low, level_h
     )
 
 
+def symmetric_quantize_lora_sigmoid(
+    input_: torch.Tensor,
+    input_shape: list[int],
+    A: torch.Tensor,
+    B: torch.Tensor,
+    scale: torch.Tensor,
+    threshold_1: torch.Tensor,
+    threshold_2: torch.Tensor,
+    threshold_3: torch.Tensor,
+    temperature: torch.Tensor,
+    skip: bool = False,
+) -> torch.Tensor:
+    """
+    Applies two-bit sigmoid quantization with a LoRA update.
+
+    :param input_: Weight tensor before group-wise reshaping.
+    :param input_shape: Group-wise shape of the weight tensor.
+    :param A: First LoRA adapter matrix.
+    :param B: Second LoRA adapter matrix.
+    :param scale: Trainable group-wise output scale.
+    :param threshold_1: First trainable group-wise threshold parameter.
+    :param threshold_2: Second trainable group-wise threshold parameter.
+    :param threshold_3: Third trainable group-wise threshold parameter.
+    :param temperature: Positive sigmoid temperature.
+    :param skip: Whether to skip quantization while tracing.
+    :return: Quantized weight tensor.
+    """
+    if has_torch_function_unary(input_):
+        return handle_torch_function(
+            symmetric_quantize_lora_sigmoid,
+            (input_,),
+            input_,
+            input_shape,
+            A,
+            B,
+            scale,
+            threshold_1,
+            threshold_2,
+            threshold_3,
+            temperature,
+            skip,
+        )
+    if skip:
+        return input_
+    weight = input_.reshape(input_shape)
+    with torch.no_grad():
+        weight = weight / (scale + 1e-8) * 2
+    # normalization by abs max by last dimension and scaling to [-2, 1]
+    
+    #weight = weight / (weight.abs().amax(dim=-1, keepdim=True) + 1e-8) * 2
+    weight = weight + (B @ A).type(input_.dtype).reshape(input_shape)
+    #weight = torch.where(scale < 0, -weight, weight)
+    temperature = temperature.to(dtype=weight.dtype, device=weight.device).clamp_min(torch.finfo(weight.dtype).eps)
+    output_ = (
+        torch.sigmoid((weight + threshold_1.square() + threshold_2.square()) / temperature) - 1.0
+        + torch.sigmoid((weight + threshold_2.square()) / temperature) - 1.0
+        + torch.sigmoid((weight - threshold_3.square()) / temperature)
+    )
+    output = output_ * scale / 2
+    return output.reshape_as(input_)
+
+
 class TuneRange(torch.autograd.Function):
     """
     Makes sure that the zero-point quantum in the quantized domain points exactly to floating point zero,
