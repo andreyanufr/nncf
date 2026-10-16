@@ -283,8 +283,11 @@ class PTWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
                 mode_vs_schema_map[CompressWeightsMode.INT8_ASYM] = QuantizationScheme.ASYMMETRIC_LORA_NLS
                 mode_vs_schema_map[CompressWeightsMode.INT8_SYM] = QuantizationScheme.SYMMETRIC_LORA_NLS
         if compression_format == CompressionFormat.FQ_LORA_SIGMOID:
-            if not compression_config.mode in [CompressWeightsMode.INT2_SYM, CompressWeightsMode.INT8_SYM,
-                                               CompressWeightsMode.INT8_ASYM]:
+            if compression_config.mode not in [
+                CompressWeightsMode.INT2_SYM,
+                CompressWeightsMode.INT8_SYM,
+                CompressWeightsMode.INT8_ASYM,
+            ]:
                 msg = "FQ_LORA_SIGMOID compression format supports only INT2_SYM mode."
                 raise nncf.ValidationError(msg)
             mode_vs_schema_map[CompressWeightsMode.INT2_SYM] = QuantizationScheme.SYMMETRIC_LORA_SIGMOID

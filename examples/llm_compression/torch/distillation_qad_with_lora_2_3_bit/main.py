@@ -21,6 +21,7 @@ import torch
 import torch.nn.functional as F
 import transformers
 from datasets import load_dataset
+from lion_pytorch import Lion
 from optimum.exporters.openvino.convert import export_from_model
 from optimum.intel.openvino import OVModelForCausalLM
 from torch import Tensor
@@ -815,7 +816,11 @@ def main(argv) -> float:
     fq_lr = args.lr / 10
     weight_decay = args.lr
     param_to_train = set_trainable(model, lora_lr=args.lr, fq_lr=fq_lr)
-    opt = torch.optim.AdamW(param_to_train, weight_decay=weight_decay)
+
+    # opt = torch.optim.AdamW(param_to_train, weight_decay=weight_decay)
+
+    lion_betas = [0.9, 0.95]
+    opt = Lion(param_to_train, lr=args.lr, betas=lion_betas)
 
     # Run tuning with distillation loss and validation after each epoch.
     grad_accumulation_steps = args.batch_size // args.microbatch_size

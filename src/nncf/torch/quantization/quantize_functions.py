@@ -391,17 +391,19 @@ def symmetric_quantize_lora_sigmoid(
     if skip:
         return input_
     weight = input_.reshape(input_shape)
-    with torch.no_grad():
-        weight = weight / (scale + 1e-8) * 2
+    # with torch.no_grad():
+    #     weight = weight / (scale + 1e-8) * 2
     # normalization by abs max by last dimension and scaling to [-2, 1]
-    
-    #weight = weight / (weight.abs().amax(dim=-1, keepdim=True) + 1e-8) * 2
+    weight = weight / (weight.abs().amax(dim=-1, keepdim=True) + 1e-8) * 2
+    weight = torch.where(scale < 0, -weight, weight)
     weight = weight + (B @ A).type(input_.dtype).reshape(input_shape)
-    #weight = torch.where(scale < 0, -weight, weight)
+
     temperature = temperature.to(dtype=weight.dtype, device=weight.device).clamp_min(torch.finfo(weight.dtype).eps)
     output_ = (
-        torch.sigmoid((weight + threshold_1.square() + threshold_2.square()) / temperature) - 1.0
-        + torch.sigmoid((weight + threshold_2.square()) / temperature) - 1.0
+        torch.sigmoid((weight + threshold_1.square() + threshold_2.square()) / temperature)
+        - 1.0
+        + torch.sigmoid((weight + threshold_2.square()) / temperature)
+        - 1.0
         + torch.sigmoid((weight - threshold_3.square()) / temperature)
     )
     output = output_ * scale / 2
