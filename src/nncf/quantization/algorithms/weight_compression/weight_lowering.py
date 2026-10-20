@@ -542,15 +542,13 @@ def _do_dc_int4_symmetric_quantization(
     primary_scale = precomputed_scale
     if primary_scale is None:
         primary_scale = _calculate_signed_scale(grouped_weight, reduction_axis, num_bits=8)
-        primary_scale = primary_scale * 128 / 120
     int8_config = WeightCompressionConfig(mode=CompressWeightsMode.INT8_SYM, group_size=-1)
-    int8_weight = _calculate_integer_quantized_weight(grouped_weight, int8_config, primary_scale)
-    int8_weight = fns.clip(int8_weight, 0, 120)
+    int8_weight = _calculate_integer_quantized_weight(grouped_weight, int8_config, primary_scale).astype(TensorDataType.int32)
     subscale_shape = list(int8_weight.shape)
     subscale_shape[reduction_axis : reduction_axis + 1] = (4, 32)
     int8_weight = int8_weight.reshape(subscale_shape)
     subscale = fns.ceil(fns.max(fns.abs(int8_weight), axis=reduction_axis + 1, keepdims=True) / 8.0)
-    subscale = fns.clip(subscale, 1, 15).astype(TensorDataType.uint8)
+    subscale = fns.clip(subscale, 1, 16).astype(TensorDataType.uint8)
 
     int4_weight = fns.round(int8_weight / subscale.astype(TensorDataType.float32))
     int4_weight = fns.clip(int4_weight, -8, 7).astype(TensorDataType.int8)
