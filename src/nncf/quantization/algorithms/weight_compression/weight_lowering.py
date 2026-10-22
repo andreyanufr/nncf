@@ -446,9 +446,10 @@ def do_integer_dequantization(compressed_weights: CompressedWeight, reduction_ax
     scale = compressed_weights.scale
 
     decompressed_weight = tensor.astype(TensorDataType.int32) - zero_point if zero_point is not None else tensor
-    decompressed_weight = decompressed_weight.astype(scale.dtype) * scale
     if compressed_weights.subscale is not None:
-        decompressed_weight = decompressed_weight * compressed_weights.subscale.astype(scale.dtype)
+        decompressed_weight = decompressed_weight * compressed_weights.subscale.astype(TensorDataType.int32)
+
+    decompressed_weight = decompressed_weight.astype(scale.dtype) * scale
 
     if reduction_axis > -1:
         decompressed_weight = ungroup_weights(decompressed_weight, reduction_axis)
@@ -538,12 +539,16 @@ def _do_dc_int4_symmetric_quantization(
         grouped_weight = weight
         reduction_axis = grouped_weight.ndim - 1
     else:
-        grouped_weight, reduction_axis = reshape_weight_for_grouped_quantization(weight, reduction_axes, config.group_size)
+        grouped_weight, reduction_axis = reshape_weight_for_grouped_quantization(
+            weight, reduction_axes, config.group_size
+        )
     primary_scale = precomputed_scale
     if primary_scale is None:
         primary_scale = _calculate_signed_scale(grouped_weight, reduction_axis, num_bits=8)
     int8_config = WeightCompressionConfig(mode=CompressWeightsMode.INT8_SYM, group_size=-1)
-    int8_weight = _calculate_integer_quantized_weight(grouped_weight, int8_config, primary_scale).astype(TensorDataType.int32)
+    int8_weight = _calculate_integer_quantized_weight(grouped_weight, int8_config, primary_scale).astype(
+        TensorDataType.int32
+    )
     subscale_shape = list(int8_weight.shape)
     subscale_shape[reduction_axis : reduction_axis + 1] = (4, 32)
     int8_weight = int8_weight.reshape(subscale_shape)

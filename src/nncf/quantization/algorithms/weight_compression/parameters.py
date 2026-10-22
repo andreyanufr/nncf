@@ -48,4 +48,8 @@ class CompressedWeight:
             # Then converting the array back to the backend tensor
             codebook = fns.from_numpy(self.codebook.as_numpy_tensor().data, backend=self.tensor.backend)
             return codebook[self.tensor]
+
+        if self.tensor is not None and self.subscale is not None:
+            return self.tensor * self.subscale
+
         return self.tensor

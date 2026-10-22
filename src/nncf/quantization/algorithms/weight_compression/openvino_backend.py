@@ -261,11 +261,13 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
                 compressed_weight.subscale - 1, ov.Type.u4, name=f"{const_node_name}/subscale"
             )
             subscale_const = opset.convert(subscale_const, ov.Type.f16)
+
+            one_const = opset.constant(1.0, dtype=ov.Type.f16, name=f"{const_node_name}/one")
+            subscale_const = opset.add(subscale_const, one_const, name=f"{const_node_name}/subscale_add_one")
+
             converted_const = opset.multiply(
                 converted_const, subscale_const, name=f"{const_node_name}/dequantized_subscale_{weight_port_id}"
             )
-            one_const = opset.constant(1.0, dtype=ov.Type.f16, name=f"{const_node_name}/one")
-            converted_const = opset.add(converted_const, one_const, name=f"{const_node_name}/dequantized_subscale_add")
         elif compression_config.is_codebook:
             converted_const = create_ov_codebook_subgraph(
                 codebook=compressed_weight.codebook
