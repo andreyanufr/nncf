@@ -41,7 +41,7 @@ def benchmark(model: GenerationMixin, tokenizer: PreTrainedTokenizer, example_in
     """
     torch.manual_seed(0)
 
-    print("")
+    print()
     print("Generation:")
     output = model.generate(example_input, max_new_tokens=30)
     answer = tokenizer.decode(output[0])
@@ -82,7 +82,7 @@ def main() -> str:
         model,
         dataset=nncf.Dataset([example_input]),
         mode=nncf.CompressWeightsMode.INT8_ASYM,
-        ignored_scope=nncf.IgnoredScope(
+        ignored_scope=nncf.Scope(
             patterns=[
                 "embed_tokens/.*",
                 "embed_positions/.*",

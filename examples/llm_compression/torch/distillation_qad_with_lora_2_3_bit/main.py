@@ -196,7 +196,7 @@ def set_trainable(model: nn.Module, lora_lr: float, fq_lr: float, scales_only: b
     adapters_to_train = []
     hook_storage = get_hook_storage(model)
     for _, module in hook_storage.named_hooks():
-        if isinstance(module, (AsymmetricLoraQuantizer, SymmetricLoraQuantizer)) and (module.num_bits < 4):
+        if isinstance(module, (AsymmetricLoraQuantizer, SymmetricLoraQuantizer)) and (module.num_bits <= 4):
             module.enable_gradients()
             params = module.get_trainable_params()
             adapters = module.get_adapters()
@@ -282,7 +282,7 @@ def load_checkpoint(model: nn.Module, ckpt_file: Path) -> nn.Module:
 
 
 @torch.no_grad()
-def export_to_openvino(pretrained: str, ckpt_file: Path, ir_dir: Path, tokenizer: AutoTokenizer):
+def export_to_openvino(pretrained: str, ckpt_file: Path, ir_dir: Path, tokenizer: AutoTokenizer, bits: int):
     """
     Export the quantized model to OpenVINO IR format.
 
@@ -298,11 +298,12 @@ def export_to_openvino(pretrained: str, ckpt_file: Path, ir_dir: Path, tokenizer
     print(f"The OpenVINO model has been exported and saved to: {ir_dir}")
     tokenizer.save_pretrained(ir_dir)
 
-    model_to_eval = OVModelForCausalLM.from_pretrained(ir_dir)
-    model_to_eval.model = nncf.repack_weights(model_to_eval.model)
-    model_to_eval.save_pretrained(ir_dir / "repacked")
-    tokenizer.save_pretrained(ir_dir / "repacked")
-    print(f"The OpenVINO model has been repacked and saved to: {ir_dir / 'repacked'}")
+    if bits < 4:
+        model_to_eval = OVModelForCausalLM.from_pretrained(ir_dir)
+        model_to_eval.model = nncf.repack_weights(model_to_eval.model)
+        model_to_eval.save_pretrained(ir_dir / "repacked")
+        tokenizer.save_pretrained(ir_dir / "repacked")
+        print(f"The OpenVINO model has been repacked and saved to: {ir_dir / 'repacked'}")
 
 
 @torch.no_grad()
@@ -337,8 +338,8 @@ def get_argument_parser() -> argparse.ArgumentParser:
         "--bits",
         type=int,
         default=3,
-        choices=[2, 3],
-        help="Number of bits for weight compression (2 or 3).",
+        choices=[2, 3, 4],
+        help="Number of bits for weight compression (2, 3, or 4).",
     )
     parser.add_argument(
         "--output_dir",
@@ -353,11 +354,9 @@ def get_argument_parser() -> argparse.ArgumentParser:
         "start from scratch by post-training weight compression initialization.",
     )
     parser.add_argument("--lora_rank", type=int, default=256, help="Rank of lora adapters")
+    parser.add_argument("--group_size", type=int, default=128, help="Group size for weight quantization.")
     parser.add_argument(
-        "--basic_init",
-        action="store_true",
         help="Whether to initialize quantization with basic min-max round-to-nearest schema. By default, advanced "
-        "data-aware post-training methods are used: AWQ + Scale Estimation. These methods typically provide better "
         "accuracy, but require a calibration dataset and additional initialization time "
         "(~20 sec for 1B and ~80 sec for 8B models).",
     )
@@ -732,10 +731,7 @@ def check_args(args):
 
 
 def main(argv) -> float:
-    """
-    Fine-tunes the specified model and returns the difference between initial and best validation perplexity in Torch,
-    and the test perplexity for best model exported to OpenVINO.
-    """
+    """Fine-tune the specified model and export the compressed model."""
     parser = get_argument_parser()
     args = parser.parse_args(argv)
     check_args(args)
@@ -747,9 +743,10 @@ def main(argv) -> float:
         transformers.set_seed(42)
     device = "cuda"
     torch_dtype = torch.bfloat16
+    modes = {2: CompressWeightsMode.INT2_SYM, 3: CompressWeightsMode.INT3_SYM, 4: CompressWeightsMode.INT4_SYM}
     compression_config = dict(
-        mode=CompressWeightsMode.INT3_SYM if args.bits == 3 else CompressWeightsMode.INT2_SYM,
-        group_size=64,
+        mode=modes[args.bits],
+        group_size=args.group_size,
         awq=not (args.basic_init or args.equalize_mlp),
         scale_estimation=not args.basic_init,
         compression_format=CompressionFormat.FQ_LORA,
@@ -763,7 +760,6 @@ def main(argv) -> float:
     output_dir = Path(args.output_dir)
     tensorboard_dir = output_dir / "tb" / datetime.now().strftime("%Y-%m-%d__%H-%M-%S")
     last_dir = output_dir / f"last_bits_{args.bits}"
-
     if not args.resume:
         shutil.rmtree(last_dir, ignore_errors=True)
     for path in [output_dir, tensorboard_dir, last_dir]:
@@ -802,6 +798,7 @@ def main(argv) -> float:
         # Pre-compute hiddens of teacher model for distillation loss.
         orig_hiddens = calc_hiddens(model, train_loader)
 
+    save_model_state = not args.basic_init or args.equalize_mlp
     # Create or load model to tune with Fake Quantizers and absorbable LoRA adapters.
     if args.resume and ckpt_file.exists():
         model = load_checkpoint(model, ckpt_file)
@@ -812,7 +809,7 @@ def main(argv) -> float:
             n_eq = equalize_up_gate_with_layernorm(model, use_align_scale=True)
             print(f"Equalized {n_eq} up_proj/gate_proj layers with preceding LayerNorm.")
         model = compress_weights(model, dataset=dataset, **compression_config)
-        save_checkpoint(model, ckpt_file, model_state=not args.basic_init)
+        save_checkpoint(model, ckpt_file, model_state=save_model_state)
     fq_lr = args.lr / 10
     weight_decay = args.lr
     param_to_train = set_trainable(model, lora_lr=args.lr, fq_lr=fq_lr)
@@ -822,9 +819,13 @@ def main(argv) -> float:
     grad_accumulation_steps = args.batch_size // args.microbatch_size
     num_samples = len(train_loader)
     epoch_samples = num_samples - num_samples % args.microbatch_size
+
+    if not is_ptq and epoch_samples == 0:
+        msg = f"Training requires at least batch_size={args.batch_size} samples, but only {num_samples} were loaded."
+        raise ValueError(msg)
+
     microbatches_per_epoch = epoch_samples // args.microbatch_size
 
-    save_model_state = not args.basic_init or args.equalize_mlp
     total_steps = run_training(
         model=model,
         train_loader=train_loader,
@@ -887,7 +888,7 @@ def main(argv) -> float:
         print(f"The finetuned model has been exported to torch and saved to: {ckpt_file.parent / 'dequantized'}\n")
 
     # Export the best tuned model to OpenVINO.
-    export_to_openvino(args.pretrained, ckpt_file, ckpt_file.parent, tokenizer)
+    export_to_openvino(args.pretrained, ckpt_file, ckpt_file.parent, tokenizer, args.bits)
 
 
 if __name__ == "__main__":

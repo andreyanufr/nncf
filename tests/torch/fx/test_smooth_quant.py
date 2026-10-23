@@ -16,7 +16,7 @@ import openvino as ov
 import pytest
 import torch
 
-from nncf import IgnoredScope
+from nncf import Scope
 from nncf.parameters import ModelType
 from nncf.quantization.advanced_parameters import AdvancedQuantizationParameters
 from nncf.quantization.advanced_parameters import AdvancedSmoothQuantParameters
@@ -60,16 +60,16 @@ class TestTorchSQAlgorithm(TemplateTestSQAlgorithm):
         raise NotImplementedError
 
     @staticmethod
-    def get_ignored_scope(model_cls: Any) -> IgnoredScope:
+    def get_ignored_scope(model_cls: Any) -> Scope:
         if model_cls is LinearMultiShapeModel:
             # Ignore matmul nodes before the min/max nodes as
             # min/max operatons could  not be quantized
             # due to nncf propagation algo  restrictions.
-            return IgnoredScope(names=["matmul_5", "matmul_6"])
-        return IgnoredScope()
+            return Scope(names=["matmul_5", "matmul_6"])
+        return Scope()
 
     @staticmethod
-    def get_quantization_algorithm(ignored_scope: IgnoredScope):
+    def get_quantization_algorithm(ignored_scope: Scope):
         return PostTrainingQuantization(
             subset_size=1,
             model_type=ModelType.TRANSFORMER,
@@ -102,7 +102,7 @@ class TestTorchSQAlgorithm(TemplateTestSQAlgorithm):
         names_map = PT_LINEAR_MODEL_MM_MAP if model_cls is LinearMultiShapeModel else PT_CONV_MODEL_MM_MAP
         ops_list = {node.name: node for node in model.graph.nodes}
         for ref_names, ref_value in reference_values.items():
-            if not all(name.startswith("Linear") or name.startswith("Conv") for name in ref_names):
+            if not all(name.startswith(("Linear", "Conv")) for name in ref_names):
                 # Pytorch SQ algorithm supports only linear and conv modules by far,
                 # so other multiplies are skipped
                 continue

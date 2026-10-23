@@ -42,7 +42,9 @@ from nncf.onnx.graph.onnx_helper import get_tensor_value
 from nncf.onnx.graph.transformations.commands import ONNXOutputInsertionCommand
 from nncf.onnx.graph.transformations.commands import ONNXTargetPoint
 from nncf.quantization import compress_weights
-from nncf.scopes import IgnoredScope
+from nncf.quantization.algorithms.weight_compression.onnx_backend import ONNXWeightCompressionAlgoBackend
+from nncf.quantization.algorithms.weight_compression.parameters import CompressedWeight
+from nncf.scopes import Scope
 from nncf.tensor import Tensor
 from nncf.tensor import TensorDataType
 from tests.cross_fw.test_templates.template_test_weights_compression import TemplateWeightCompression
@@ -50,6 +52,7 @@ from tests.onnx.common import ModelBuilder
 from tests.onnx.conftest import ONNX_TEST_ROOT
 
 REFERENCE_SCALES_DIR = ONNX_TEST_ROOT / "data" / "reference_scales"
+SCOPED_CONFIGS_REFERENCES_DIR = ONNX_TEST_ROOT / "data" / "references_scoped_configs"
 
 UNSUPPORTED_MODES = (
     CompressWeightsMode.NF4,
@@ -636,7 +639,7 @@ class TestONNXTemplateWeightCompression(TemplateWeightCompression):
             raise NotImplementedError(msg)
         """
         Builds a model to be used in the following tests:
-            - TemplateWeightCompression.test_awq_with_ignored_scope()
+            - TemplateWeightCompression.test_awq_with_excluded_node()
             - TemplateWeightCompression.test_awq_scale_reference()
             - TemplateWeightCompression.test_error_message_for_invalid_group_size()
         tests.
@@ -727,6 +730,44 @@ class TestONNXTemplateWeightCompression(TemplateWeightCompression):
         return REFERENCE_SCALES_DIR / "awq_scale_ref.json"
 
     @staticmethod
+    def get_shared_weight_model() -> onnx.ModelProto:
+        """
+        Builds a model with two MatMul nodes that share the same weight.
+        """
+        weight = np.arange(0, 16).reshape(4, 4).astype(np.float32)
+        initializer = onnx.numpy_helper.from_array(weight, name="shared_weight")
+        nodes = [
+            onnx.helper.make_node("MatMul", ["input", "shared_weight"], ["MatMul_0_output"], name="MatMul_0"),
+            onnx.helper.make_node("MatMul", ["MatMul_0_output", "shared_weight"], ["output"], name="MatMul_1"),
+        ]
+        graph = onnx.helper.make_graph(
+            nodes,
+            "shared-weight-graph",
+            inputs=[onnx.helper.make_tensor_value_info("input", onnx.TensorProto.FLOAT, (1, 4, 4))],
+            outputs=[onnx.helper.make_tensor_value_info("output", onnx.TensorProto.FLOAT, (1, 4, 4))],
+            initializer=[initializer],
+        )
+        model = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_operatorsetid("", 21)])
+        onnx.checker.check_model(model)
+        return model
+
+    @staticmethod
+    def get_shared_weight_node_name() -> str:
+        return "MatMul_1"
+
+    @staticmethod
+    def get_node_with_shared_weight_name() -> str:
+        return "MatMul_0"
+
+    @staticmethod
+    def get_mode_not_supported_by_backend() -> CompressWeightsMode | None:
+        return CompressWeightsMode.NF4
+
+    @staticmethod
+    def get_scoped_configs_ref_path(ref_name: str) -> Path:
+        return SCOPED_CONFIGS_REFERENCES_DIR / f"{ref_name}.json"
+
+    @staticmethod
     def get_transform_func() -> Callable[..., Any] | None:
         def transform_func(x):
             return {"input": x}
@@ -771,7 +812,7 @@ def get_model_for_ignored_scope_test(tmp_path_factory) -> onnx.ModelProto:
 @dataclass
 class ParamIgnoredScope:
     name: str
-    ignored_scope: IgnoredScope
+    ignored_scope: Scope
     ref: set[str]
 
     def __str__(self) -> str:
@@ -781,17 +822,17 @@ class ParamIgnoredScope:
 @pytest.mark.parametrize(
     "param",
     (
-        ParamIgnoredScope("empty", IgnoredScope(), {"linear.weight_quantized"}),
+        ParamIgnoredScope("empty", Scope(), {"linear.weight_quantized"}),
         pytest.param(
-            ParamIgnoredScope("name_const", IgnoredScope(names=["linear.weight"]), set()),
+            ParamIgnoredScope("name_const", Scope(names=["linear.weight"]), set()),
             marks=pytest.mark.xfail(reason="See ticket 186262"),
         ),
-        ParamIgnoredScope("name_op", IgnoredScope(names=["node_linear"]), set()),
+        ParamIgnoredScope("name_op", Scope(names=["node_linear"]), set()),
         pytest.param(
-            ParamIgnoredScope("pattern_const", IgnoredScope(patterns=[".*weight"]), set()),
+            ParamIgnoredScope("pattern_const", Scope(patterns=[".*weight"]), set()),
             marks=pytest.mark.xfail(reason="See ticket 186262"),
         ),
-        ParamIgnoredScope("pattern_op", IgnoredScope(patterns=["node_li.*"]), set()),
+        ParamIgnoredScope("pattern_op", Scope(patterns=["node_li.*"]), set()),
     ),
     ids=str,
 )
@@ -808,3 +849,39 @@ def test_weight_compress_with_ignored_scope(param: ParamIgnoredScope, model_for_
 
     names = {i.name for i in compressed_model.graph.initializer if i.data_type == onnx.TensorProto.INT4}
     assert names == param.ref
+
+
+@pytest.mark.parametrize(
+    "in_args,expected_output",
+    [
+        (
+            (
+                CompressedWeight(
+                    np.zeros((8, 3, 2, 2), dtype=np.float32),
+                    np.zeros((8, 1, 1, 1), dtype=np.float32),
+                ),
+                (8, 3, 2, 2),
+                (1, 2, 3),
+                0,
+                False,
+            ),
+            (np.zeros((8, 3, 2, 2), dtype=np.float32), np.zeros((8,), dtype=np.float32), None),
+        ),
+    ],
+    ids=[
+        "Conv",
+    ],
+)
+def test_preprocess_compressed_weight(in_args, expected_output):
+    expected_cw, expected_s, expected_zp = expected_output
+    actual_cw, actual_s, actual_zp = ONNXWeightCompressionAlgoBackend.preprocess_compressed_weight(*in_args)
+
+    assert actual_cw.shape == expected_cw.shape
+    assert np.allclose(actual_cw, expected_cw, rtol=1e-5, atol=1e-6)
+
+    assert actual_s.shape == expected_s.shape
+    assert np.allclose(actual_s, expected_s, rtol=1e-5, atol=1e-6)
+
+    if expected_zp:
+        assert actual_zp.shape == expected_zp.shape
+        assert np.allclose(actual_zp, expected_zp, rtol=1e-5, atol=1e-6)

@@ -18,7 +18,7 @@ import openvino as ov
 import pytest
 
 from nncf import Dataset
-from nncf import IgnoredScope
+from nncf import Scope
 from nncf.common.quantization.structs import QuantizationPreset
 from nncf.openvino.graph.nncf_graph_builder import GraphConverter
 from nncf.openvino.quantization.quantize_model import quantize_impl
@@ -67,7 +67,7 @@ def test_parallel_edges_output_port_id():
         {
             "preset": QuantizationPreset.PERFORMANCE,
             "inplace_statistics": True,
-            "ignored_scope": IgnoredScope(types=["Split"]),
+            "ignored_scope": Scope(types=["Split"]),
         },
     )
 
@@ -170,7 +170,7 @@ def smooth_quant_model(ov_model: ov.Model, q_params: dict, quantize=True):
     "linear_before_reset", [True, False], ids=["linear_before_reset_True", "linear_before_reset_False"]
 )
 def test_ignore_nodes_by_attribues(linear_before_reset):
-    model = GRUSequenceModel(**{"linear_before_reset": linear_before_reset}).ov_model
+    model = GRUSequenceModel(linear_before_reset=linear_before_reset).ov_model
     quantized_model = quantize_model(model, {})
     postfix = "T" if linear_before_reset else "F"
     path_ref_graph = get_actual_reference_for_current_openvino(
@@ -228,7 +228,7 @@ def test_if_model_fq_placement_ignored_scope():
     ov_model = if_model.ov_model
     dataset = get_dataset_for_if_model(ov_model)
     quantized_model = quantize_impl(
-        ov_model, dataset, subset_size=2, fast_bias_correction=True, ignored_scope=IgnoredScope(names=["MatMul"])
+        ov_model, dataset, subset_size=2, fast_bias_correction=True, ignored_scope=Scope(names=["MatMul"])
     )
     if_ops = [op for op in quantized_model.get_ops() if op.get_type_name() == "If"]
     assert len(if_ops) == 1
