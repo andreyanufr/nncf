@@ -68,6 +68,7 @@ from nncf.torch.quantization.ignored_patterns import create_sam_pe
 from nncf.torch.quantization.layers import QUANTIZATION_MODULES
 from nncf.torch.quantization.layers import INT4AsymmetricWeightsDecompressor
 from nncf.torch.quantization.layers import INT4SymmetricWeightsDecompressor
+from nncf.torch.quantization.layers import DCINT4SymmetricWeightsDecompressor
 from nncf.torch.quantization.layers import INT8AsymmetricWeightsDecompressor
 from nncf.torch.quantization.layers import INT8SymmetricWeightsDecompressor
 from nncf.torch.quantization.layers import PTLoraNLSSpec
@@ -399,6 +400,14 @@ class PTWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
                 result_shape=weight_shape,
                 result_dtype=weight_dtype,
             )
+        elif compression_config.mode == CompressWeightsMode.DC_INT4_SYM:
+            decompressor = DCINT4SymmetricWeightsDecompressor(
+                scale=compressed_weight.scale.data,
+                subscale=compressed_weight.subscale.data,
+                compressed_weight_shape=compressed_weight.tensor.shape,
+                result_shape=weight_shape,
+                result_dtype=weight_dtype,
+            )
 
         # pack tensor
         packed_tensor = decompressor.pack_weight(compressed_weight.tensor.data)
@@ -438,7 +447,11 @@ class PTWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         model = model.model
 
         transformation_layout = TransformationLayout()
-        is_all_8bit = all(wc_params.compression_config.num_bits == 8 for wc_params in weight_compression_parameters)
+        is_all_8bit = all(
+            wc_params.compression_config.num_bits == 8
+            for wc_params in getattr(weight_compression_parameters, "sequence", weight_compression_parameters)
+        )
+
         for wc_params in weight_compression_parameters:
             compression_config = wc_params.compression_config
             if compression_config.mode in [

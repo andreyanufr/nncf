@@ -560,7 +560,7 @@ def _do_dc_int4_symmetric_quantization(
     primary_scale = fns.unsqueeze(primary_scale, reduction_axis)
     return CompressedWeight(
         int4_weight,
-        primary_scale.astype(TensorDataType.float16),
+        primary_scale.astype(TensorDataType.float32),
         subscale=subscale,
     )
 

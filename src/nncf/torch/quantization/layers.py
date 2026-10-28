@@ -43,6 +43,7 @@ from nncf.torch.quantization.quantize_functions import asymmetric_quantize
 from nncf.torch.quantization.quantize_functions import asymmetric_quantize_lora
 from nncf.torch.quantization.quantize_functions import decompress_asymmetric
 from nncf.torch.quantization.quantize_functions import decompress_symmetric
+from nncf.torch.quantization.quantize_functions import decompress_double_symmetric
 from nncf.torch.quantization.quantize_functions import get_scale_zp_from_input_low_input_high
 from nncf.torch.quantization.quantize_functions import pack_int4
 from nncf.torch.quantization.quantize_functions import pack_uint4
@@ -1420,6 +1421,51 @@ class INT4SymmetricWeightsDecompressor(BaseWeightsDecompressor):
         result = result.type(dtype=self.result_dtype) if self.result_dtype is not None else result
         return result
 
+class DCINT4SymmetricWeightsDecompressor(BaseWeightsDecompressor):
+    def __init__(
+        self,
+        scale: torch.Tensor,
+        subscale: torch.Tensor,
+        compressed_weight_shape: tuple[int, ...],
+        result_shape: tuple[int, ...] | None = None,
+        result_dtype: torch.dtype | None = None,
+    ):
+        """
+        :param scale: A scale in quantization scheme
+        :param subscale: (Optional) A subscale in quantization scheme
+        :param compressed_weight_shape: A compressed weight shape
+        :param result_shape: (Optional) A shape that result should be reshaped
+        :param result_dtype: (Optional) A data type that result should be cast to
+        """
+        super().__init__()
+        self.register_buffer("_scale", scale.type(dtype=torch.float16))
+        self.register_buffer("_subscale", subscale.type(dtype=torch.float16))
+
+        self.compressed_weight_shape = compressed_weight_shape
+        self.result_shape = result_shape
+        self.result_dtype = result_dtype
+
+    @property
+    def quantization_mode(self) -> QuantizationMode:
+        return QuantizationMode.SYMMETRIC
+
+    def pack_weight(self, weight: torch.Tensor) -> torch.Tensor:
+        if torch.is_floating_point(weight):
+            msg = f"Invalid weight dtype {weight.type}. Integer types are supported."
+            raise ValueError(msg)
+        if torch.any((weight < -8) | (weight > 7)):
+            msg = "Tensor values are not in [-8, 7]."
+            raise ValueError(msg)
+        return pack_int4(weight.type(dtype=torch.int8))
+
+    def forward(self, x):
+        x = unpack_int4(x)
+        x = x.reshape(self.compressed_weight_shape)
+
+        result = decompress_double_symmetric(x, self._scale, self._subscale)
+        result = result.reshape(self.result_shape) if self.result_shape is not None else result
+        result = result.type(dtype=self.result_dtype) if self.result_dtype is not None else result
+        return result
 
 class SQMultiply(torch.nn.Module, StatefulModuleInterface):
     SCALE_SHAPE_KEY = "scale_shape"

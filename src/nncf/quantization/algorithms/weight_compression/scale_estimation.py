@@ -141,7 +141,7 @@ class ScaleEstimation:
 
             weight = self._backend_entity.get_weight(wp.node_with_weight, weight_port_id, model, graph)
             act_ch_axis, _ = self._backend_entity.get_activation_channel_axis_and_shape(graph, wp.node_with_weight)
-
+            print("Layer: ", wp.weight_name)
             scale, zero_point = self.calculate_quantization_params(
                 stats,
                 weight,
@@ -264,6 +264,8 @@ class ScaleEstimation:
         X, _ = reshape_weight_for_grouped_quantization(X, -2, group_size)
         fp_outs = fns.matmul(fns.moveaxis(weight, -2, -3), X)
         q_outs = fns.matmul(fns.moveaxis(q_weights, -2, -3), X)
+
+        print("Diff before :", fns.mean((fp_outs - q_outs) ** 2))
 
         # metric for minimization with shape [C_OUT, N_GROUPS], N_GROUPS = C_IN / GROUP_SIZE
         # For 3D weights, it is [Batch Size, C_OUT, N_GROUPS]
@@ -388,6 +390,20 @@ class ScaleEstimation:
             result_scale = fns.squeeze(result_scale, axis=-2)
         if zp is not None and config.group_size == -1:
             zp = fns.squeeze(zp, axis=-2)
+
+
+        if not config.is_integer:
+            q_weights_ = float_quantize_dequantize_weight(weight, config, precomputed_scale=result_scale)
+        else:
+            q_weights_ = integer_quantize_dequantize_weight(
+                weight,
+                config,
+                precomputed_scale=result_scale,
+                precomputed_zero_point=zp,
+            )
+
+        q_outs = fns.matmul(fns.moveaxis(q_weights_, -2, -3), X)
+        print("Diff after :", fns.mean((fp_outs - q_outs) ** 2))
 
         if was_transposed:
             if config.group_size == -1:

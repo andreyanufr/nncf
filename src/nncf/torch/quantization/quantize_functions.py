@@ -413,6 +413,23 @@ def decompress_symmetric(input: torch.Tensor, scale: torch.Tensor) -> torch.Tens
     decompressed_input = input * scale
     return decompressed_input
 
+def decompress_double_symmetric(input: torch.Tensor, scale: torch.Tensor, subscale: torch.Tensor) -> torch.Tensor:
+    """
+    Decompress the double symmetrically quantized input tensor.
+
+    :param input: An input tensor
+    :param scale: A scale tensor
+    :param subscale: A subscale tensor
+    :return: The decompressed tensor
+    """
+    input = input.type(dtype=scale.dtype)
+    subscale = subscale.type(dtype=scale.dtype)
+    
+    decompressed_input = input * subscale
+    #decompressed_input = decompressed_input.reshape(input.shape[0], input.shape[1], -1)
+    decompressed_input = decompressed_input * scale
+    return decompressed_input
+
 
 def pack_uint4(tensor: torch.Tensor) -> torch.Tensor:
     """
