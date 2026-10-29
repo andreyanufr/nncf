@@ -1439,6 +1439,10 @@ class DCINT4SymmetricWeightsDecompressor(BaseWeightsDecompressor):
         """
         super().__init__()
         self.register_buffer("_scale", scale.type(dtype=torch.float16))
+        if torch.any((subscale < 1) | (subscale > 16)):
+            msg = "Subscale values are not in [1, 16]."
+            raise ValueError(msg)
+        subscale.round_()
         self.register_buffer("_subscale", subscale.type(dtype=torch.float16))
 
         self.compressed_weight_shape = compressed_weight_shape

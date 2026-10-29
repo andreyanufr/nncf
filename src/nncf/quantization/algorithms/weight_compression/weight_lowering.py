@@ -392,7 +392,7 @@ def compress_weight(
     :param weight: The weight to compress.
     :param reduction_axes: Axes, along which to reduce (collect) different statistics (e.g. min, max).
     :param config: Compression configuration.
-    :param precomputed_compressed_weight: Contains precomputed scale and zero point.
+    :param precomputed_compressed_weight: Contains precomputed scale and zero point, or fully compressed weights.
     :return: The compressed weight and decompression parameters as instance of CompressedWeight
     """
     precomputed_scale, precomputed_zero_point = (
@@ -400,6 +400,14 @@ def compress_weight(
         if precomputed_compressed_weight
         else (None, None)
     )
+
+    if (
+        config.mode == CompressWeightsMode.DC_INT4_SYM
+        and precomputed_compressed_weight is not None
+        and precomputed_compressed_weight.tensor is not None
+        and precomputed_compressed_weight.subscale is not None
+    ):
+        return precomputed_compressed_weight
 
     if not config.is_integer:
         if (

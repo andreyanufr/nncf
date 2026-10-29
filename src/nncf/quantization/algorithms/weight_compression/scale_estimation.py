@@ -108,15 +108,16 @@ class ScaleEstimation:
         MatMul with compressed weights.
         The algorithm computes weighted scale for the group of weights in MatMul, which
         shared the same scale.
+        For DC_INT4_SYM, a final subscale search keeps the estimated primary scale fixed
+        and refines the integer subscales and corresponding INT4 weights.
 
         :param model: Model for applying algorithm.
         :param graph: Model graph.
         :param all_weight_params: List of all weight parameters.
         :param statistics: Input activation statistics for each node.
-        :param statistic_points: Statistic points with collected statistics values.
-        :param dataset: A representative dataset for the calibration process.
         :param backend_entity: Weight compression algorithm backend.
-        :return: Two dictionaries for estimated scales and zero points for each weight name.
+        :return: Estimated compression parameters keyed by weight name. DC_INT4_SYM entries
+            also contain the refined compressed tensor and subscales.
         """
         self._backend_entity = backend_entity
         if self._backend_entity is None:
@@ -141,6 +142,7 @@ class ScaleEstimation:
 
             weight = self._backend_entity.get_weight(wp.node_with_weight, weight_port_id, model, graph)
             act_ch_axis, _ = self._backend_entity.get_activation_channel_axis_and_shape(graph, wp.node_with_weight)
+    
             print("Layer: ", wp.weight_name)
             scale, zero_point = self.calculate_quantization_params(
                 stats,
@@ -153,9 +155,115 @@ class ScaleEstimation:
                 self._scale_steps,
                 self._weight_penalty,
             )
-            res[weight_name] = CompressedWeight(None, scale, zero_point, None)
+            if config.mode == nncf.CompressWeightsMode.DC_INT4_SYM:
+                res[weight_name] = self._refine_dc_subscales(
+                    stats, weight, wp.reduction_axes, config, scale, act_ch_axis
+                )
+            else:
+                res[weight_name] = CompressedWeight(None, scale, zero_point, None)
 
         return res
+
+    def _refine_dc_subscales(
+        self,
+        statistics: WCTensorStatistic,
+        weight: Tensor,
+        reduction_axes: tuple[int, ...],
+        config: WeightCompressionConfig,
+        scale: Tensor,
+        act_ch_axis: int = -1,
+    ) -> CompressedWeight:
+        """
+        Refines DC_INT4_SYM subscales without changing the estimated primary scale.
+
+        Searches all legal subscales in [1, 16], one subgroup at a time. Candidates
+        minimize the full 128-weight group's matmul error, including the configured
+        weight penalty. Strict improvements only are accepted.
+
+        :param statistics: Collected activation statistics.
+        :param weight: Original weight tensor.
+        :param reduction_axes: Weight reduction axis.
+        :param config: DC_INT4_SYM compression configuration.
+        :param scale: Primary scale selected by the two scale-estimation stages.
+        :param act_ch_axis: Activation channel axis.
+        :return: Compressed weights with refined subscales and unchanged primary scale.
+        """
+        compressed = do_integer_quantization(weight, config, reduction_axes, precomputed_scale=scale)
+        weight = weight.astype(TensorDataType.float32)
+        _, activations = process_stats(statistics, self._subset_size, act_ch_axis)
+        activations = activations.astype(TensorDataType.float32)
+
+        # Work with [..., output channels, groups, subgroups, subgroup size].
+        transposed = reduction_axes[0] % weight.ndim == weight.ndim - 2
+        tensor, subscale, primary_scale = compressed.tensor, compressed.subscale, compressed.scale
+        if tensor is None or subscale is None or primary_scale is None:
+            msg = "DC_INT4_SYM quantization must provide a compressed tensor, primary scale, and subscales."
+            raise nncf.InternalError(msg)
+        if transposed:
+            weight = fns.moveaxis(weight, -1, -2)
+            tensor = fns.moveaxis(tensor, -1, -4)
+            subscale = fns.moveaxis(subscale, -1, -4)
+            primary_scale = fns.moveaxis(primary_scale, -1, -4)
+
+        grouped_weight, _ = reshape_weight_for_grouped_quantization(weight, weight.ndim - 1, 128)
+        weight = grouped_weight.reshape(tensor.shape)
+        activations, _ = reshape_weight_for_grouped_quantization(activations, activations.ndim - 2, 128)
+        subgroup_activations = activations.reshape((*activations.shape[:-2], 4, 32, activations.shape[-1]))
+        int8_weight = fns.clip(fns.round(weight / primary_scale), -128, 127)
+        dequantized = tensor.astype(TensorDataType.float32) * subscale * primary_scale
+        residual = fns.matmul(
+            fns.moveaxis(grouped_weight - dequantized.reshape(grouped_weight.shape), -2, -3), activations
+        )
+        diff_before = fns.mean(residual**2)
+        penalty = fns.mean((dequantized.reshape(grouped_weight.shape) - grouped_weight) ** 2, axis=-1)
+        best_diffs = fns.moveaxis(fns.mean(residual**2, axis=-1), -1, -2)
+        if self._weight_penalty > 0:
+            best_diffs += self._weight_penalty * penalty
+
+        for subgroup in range(4):
+            subgroup_weight = weight[..., subgroup, :]
+            subgroup_input = subgroup_activations[..., subgroup, :, :]
+            original_weight = dequantized[..., subgroup, :].clone()
+            original_out = fns.matmul(fns.moveaxis(original_weight, -2, -3), subgroup_input)
+            original_penalty = fns.mean((original_weight - subgroup_weight) ** 2, axis=-1) / 4
+            base_residual = residual + original_out
+            base_penalty = penalty - original_penalty
+            best_residual, best_penalty = residual, penalty
+
+            for candidate in range(1, 17):
+                candidate_tensor = fns.clip(fns.round(int8_weight[..., subgroup, :] / candidate), -8, 7)
+                candidate_weight = candidate_tensor * candidate * primary_scale[..., 0, :]
+                candidate_out = fns.matmul(fns.moveaxis(candidate_weight, -2, -3), subgroup_input)
+                candidate_residual = base_residual - candidate_out
+                candidate_penalty = base_penalty + fns.mean((candidate_weight - subgroup_weight) ** 2, axis=-1) / 4
+                diffs = fns.moveaxis(fns.mean(candidate_residual**2, axis=-1), -1, -2)
+                if self._weight_penalty > 0:
+                    diffs += self._weight_penalty * candidate_penalty
+                improved = diffs < best_diffs
+                best_diffs = fns.where(improved, diffs, best_diffs)
+                best_penalty = fns.where(improved, candidate_penalty, best_penalty)
+                best_residual = fns.where(
+                    fns.unsqueeze(fns.moveaxis(improved, -1, -2), -1), candidate_residual, best_residual
+                )
+                mask = fns.unsqueeze(improved, -1)
+                tensor[..., subgroup, :] = fns.where(mask, candidate_tensor, tensor[..., subgroup, :]).astype(
+                    tensor.dtype
+                )
+                subscale[..., subgroup, :] = fns.where(mask, candidate, subscale[..., subgroup, :]).astype(
+                    subscale.dtype
+                )
+            residual, penalty = best_residual, best_penalty
+
+        dequantized = tensor.astype(TensorDataType.float32) * subscale * primary_scale
+        fp_outs = fns.matmul(fns.moveaxis(grouped_weight, -2, -3), activations)
+        q_outs = fns.matmul(fns.moveaxis(dequantized.reshape(grouped_weight.shape), -2, -3), activations)
+        print("Diff before :", diff_before)
+        print("Diff after :", fns.mean((fp_outs - q_outs) ** 2))
+
+        if transposed:
+            tensor = fns.moveaxis(tensor, -4, -1)
+            subscale = fns.moveaxis(subscale, -4, -1)
+        return CompressedWeight(tensor=tensor, scale=compressed.scale, subscale=subscale)
 
     @staticmethod
     def calculate_quantization_params(
@@ -264,7 +372,6 @@ class ScaleEstimation:
         X, _ = reshape_weight_for_grouped_quantization(X, -2, group_size)
         fp_outs = fns.matmul(fns.moveaxis(weight, -2, -3), X)
         q_outs = fns.matmul(fns.moveaxis(q_weights, -2, -3), X)
-
         print("Diff before :", fns.mean((fp_outs - q_outs) ** 2))
 
         # metric for minimization with shape [C_OUT, N_GROUPS], N_GROUPS = C_IN / GROUP_SIZE
@@ -287,6 +394,7 @@ class ScaleEstimation:
         for i in range(initial_steps):
             near_to_ideal_scale = estimate_scales(weight, target, zero_mask, importance)
             near_to_ideal_scale = near_to_ideal_scale * scale_sign
+            near_to_ideal_scale = fns.where(fns.abs(near_to_ideal_scale) < eps, result_scale, near_to_ideal_scale)
 
             if not config.is_integer:
                 q_weights_ = float_quantize_dequantize_weight(
@@ -361,6 +469,7 @@ class ScaleEstimation:
             zero_mask = zero_scale * zero_mask.astype(weight.dtype)
             near_to_ideal_scale = estimate_scales(weight, target, zero_mask, importance)
             near_to_ideal_scale = near_to_ideal_scale * scale_sign
+            near_to_ideal_scale = fns.where(fns.abs(near_to_ideal_scale) < eps, result_scale, near_to_ideal_scale)
 
             if not config.is_integer:
                 q_weights_ = float_quantize_dequantize_weight(weight, config, precomputed_scale=near_to_ideal_scale)
@@ -386,12 +495,6 @@ class ScaleEstimation:
 
             result_scale = mask * result_scale + (1.0 - mask) * near_to_ideal_scale
 
-        if config.group_size == -1:
-            result_scale = fns.squeeze(result_scale, axis=-2)
-        if zp is not None and config.group_size == -1:
-            zp = fns.squeeze(zp, axis=-2)
-
-
         if not config.is_integer:
             q_weights_ = float_quantize_dequantize_weight(weight, config, precomputed_scale=result_scale)
         else:
@@ -401,10 +504,13 @@ class ScaleEstimation:
                 precomputed_scale=result_scale,
                 precomputed_zero_point=zp,
             )
-
         q_outs = fns.matmul(fns.moveaxis(q_weights_, -2, -3), X)
         print("Diff after :", fns.mean((fp_outs - q_outs) ** 2))
 
+        if config.group_size == -1:
+            result_scale = fns.squeeze(result_scale, axis=-2)
+        if zp is not None and config.group_size == -1:
+            zp = fns.squeeze(zp, axis=-2)
         if was_transposed:
             if config.group_size == -1:
                 result_scale = fns.moveaxis(result_scale, -1, -2)

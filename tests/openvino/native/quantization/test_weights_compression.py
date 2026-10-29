@@ -23,6 +23,7 @@ import openvino as ov
 import pandas as pd
 import pytest
 from openvino import opset13 as opset
+from pytest_mock import MockerFixture
 
 import nncf
 import nncf.openvino.optimized_functions as opt_fns
@@ -50,6 +51,7 @@ from nncf.quantization.algorithms.weight_compression.config import WeightCompres
 from nncf.quantization.algorithms.weight_compression.config import WeightCompressionParameters
 from nncf.quantization.algorithms.weight_compression.mixed_precision import MIXED_PRECISION_CRITERIA
 from nncf.quantization.algorithms.weight_compression.openvino_backend import OVWeightCompressionAlgoBackend
+from nncf.quantization.algorithms.weight_compression.scale_estimation import ScaleEstimation
 from nncf.quantization.algorithms.weight_compression.weight_lowering import MIN_INPUT_SIZE_FOR_OPTIMIZED_COMPRESSION
 from nncf.quantization.algorithms.weight_compression.weight_lowering import _calculate_float_quantized_weight
 from nncf.quantization.algorithms.weight_compression.weight_lowering import _calculate_normalized_weight
@@ -1251,6 +1253,52 @@ def test_call_max_var_criterion_with_dataset_by_default_scale_estimation(mode, c
 
     assert se_spy.call_count == 1
     assert tzm_spy.call_args_list[0][0][0].dtype == compressed_weight_dtype
+
+
+@pytest.mark.parametrize("transpose_b", [False, True])
+def test_dc_scale_estimation_preserved_after_serialization(
+    transpose_b: bool, mocker: MockerFixture, tmp_path: Path
+) -> None:
+    rng = np.random.default_rng(42)
+    weight = rng.normal(size=(4, 256)).astype(np.float32)
+    if not transpose_b:
+        weight = weight.T
+    inputs = rng.normal(size=(1, 8, 256)).astype(np.float32)
+    parameter = opset.parameter(inputs.shape, dtype=np.float32)
+    constant = opset.constant(weight, name="weight")
+    matmul = opset.matmul(parameter, constant, False, transpose_b)
+    model = ov.Model([matmul], [parameter])
+    refine_spy = mocker.spy(ScaleEstimation, "_refine_dc_subscales")
+    scale_spy = mocker.spy(ScaleEstimation, "calculate_quantization_params")
+    compressed_model = compress_weights(
+        model,
+        mode=CompressWeightsMode.DC_INT4_SYM,
+        group_size=128,
+        ratio=1.0,
+        all_layers=True,
+        scale_estimation=True,
+        dataset=Dataset([inputs]),
+    )
+    assert refine_spy.call_count == 1
+    refined = refine_spy.spy_return
+    primary_scale = np.expand_dims(scale_spy.spy_return[0].data, 2 if transpose_b else 1)
+    np.testing.assert_array_equal(refined.scale.data, primary_scale)
+
+    model_path = tmp_path / "compressed.xml"
+    ov.serialize(compressed_model, model_path)
+    restored = ov.Core().read_model(model_path)
+    constants = {node.get_friendly_name(): node for node in restored.get_ops() if node.get_type_name() == "Constant"}
+    converted_constants = ov.Model(
+        [opset.convert(constants["weight"], ov.Type.i8), opset.convert(constants["weight/subscale"], ov.Type.u8)], []
+    )
+    values = list(ov.compile_model(converted_constants, "CPU")().values())
+    np.testing.assert_array_equal(values[0], refined.tensor.data)
+    np.testing.assert_array_equal(values[1] + 1, refined.subscale.data)
+    np.testing.assert_array_equal(constants["weight/scale"].data, refined.scale.data.astype(np.float16))
+
+    expected = ov.compile_model(compressed_model, "CPU", {"INFERENCE_PRECISION_HINT": ov.Type.f32})(inputs)[0]
+    actual = ov.compile_model(restored, "CPU", {"INFERENCE_PRECISION_HINT": ov.Type.f32})(inputs)[0]
+    np.testing.assert_array_equal(actual, expected)
 
 
 @pytest.mark.parametrize("mode", INT4_NF4_MODES + INT2_3_MODES)
