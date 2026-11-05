@@ -67,6 +67,7 @@ class WeightCompressionConfig:
             CompressWeightsMode.INT4_SYM: 4,
             CompressWeightsMode.INT4_ASYM: 4,
             CompressWeightsMode.DC_INT4_SYM: 4,
+            CompressWeightsMode.DC_INT4_ASYM: 4,
             CompressWeightsMode.NF4: 4,
             CompressWeightsMode.FP4: 4,
             CompressWeightsMode.MXFP4: 4,
@@ -85,7 +86,11 @@ class WeightCompressionConfig:
 
     @property
     def is_asym_mode(self) -> bool:
-        return self.mode in [CompressWeightsMode.INT4_ASYM, CompressWeightsMode.INT8_ASYM]
+        return self.mode in [
+            CompressWeightsMode.INT4_ASYM,
+            CompressWeightsMode.INT8_ASYM,
+            CompressWeightsMode.DC_INT4_ASYM,
+        ]
 
     @property
     def is_integer(self) -> bool:
@@ -136,6 +141,7 @@ class WeightCompressionConfig:
             CompressWeightsMode.INT4_SYM: TensorDataType.int4,
             CompressWeightsMode.INT4_ASYM: TensorDataType.uint4,
             CompressWeightsMode.DC_INT4_SYM: TensorDataType.int4,
+            CompressWeightsMode.DC_INT4_ASYM: TensorDataType.uint4,
             CompressWeightsMode.INT8_ASYM: TensorDataType.uint8,
             CompressWeightsMode.INT8_SYM: TensorDataType.int8,
             CompressWeightsMode.NF4: TensorDataType.nf4,

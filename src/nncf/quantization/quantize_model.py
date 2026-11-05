@@ -504,6 +504,7 @@ def compress_weights(
         from nncf.torch.model_creation import is_wrapped_model
 
         not_supported_modes = [
+            CompressWeightsMode.DC_INT4_ASYM,
             CompressWeightsMode.NF4,
             CompressWeightsMode.MXFP4,
             CompressWeightsMode.MXFP8_E4M3,
@@ -555,6 +556,7 @@ def compress_weights(
 
         not_supported_modes = [
             CompressWeightsMode.DC_INT4_SYM,
+            CompressWeightsMode.DC_INT4_ASYM,
             CompressWeightsMode.NF4,
             CompressWeightsMode.MXFP4,
             CompressWeightsMode.MXFP8_E4M3,
@@ -628,6 +630,7 @@ def compress_weights(
 
         not_supported_modes = [
             CompressWeightsMode.DC_INT4_SYM,
+            CompressWeightsMode.DC_INT4_ASYM,
             CompressWeightsMode.NF4,
             CompressWeightsMode.MXFP4,
             CompressWeightsMode.MXFP8_E4M3,

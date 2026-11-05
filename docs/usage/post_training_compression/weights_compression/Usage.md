@@ -48,6 +48,7 @@ NNCF can automatically distribute precision assignments based on quantization se
 |------------------|--------------|------------|--------------------------|----------------------------------|-------------|
 | INT4_SYM         | INT4         | FP16       | Per-channel / Group-wise | OpenVINO, PyTorch, ONNX, TorchFX | [Symmetric quantization](/docs/usage/Quantization.md#symmetric-quantization) |
 | INT4_ASYM        | INT4         | FP16       | Per-channel / Group-wise | OpenVINO, PyTorch, ONNX, TorchFX | [Asymmetric quantization](/docs/usage/Quantization.md#asymmetric-quantization) |
+| DC_INT4_ASYM     | UINT4        | FP16 / UINT6 | Group-wise (256)       | OpenVINO                         | Q4_K-style hierarchical asymmetric quantization |
 | NF4              | FP32         | FP16       | Per-channel / Group-wise | OpenVINO                         | [NormalFloat-4](https://arxiv.org/pdf/2305.14314v1.pdf) lookup table with 16 FP32 values |
 | CODEBOOK         | Any          | FP16       | Per-channel / Group-wise | OpenVINO                         | Arbitrary lookup table (codebook) |
 | CB4              | E4M3         | FP16       | Per-channel / Group-wise | OpenVINO                         | A fixed lookup table with 16 E4M3 values based on NF4 values |
@@ -58,6 +59,26 @@ NNCF can automatically distribute precision assignments based on quantization se
 | NVFP4            | E2M1         | E4M3 per group / FP32 per weight | Group-wise (16)          | OpenVINO              | [NVFP4](https://arxiv.org/abs/2509.25149) |
 
 **Note**: Granularity refers to the scope of elements sharing quantization parameters. "Per-channel" applies different parameters for each output channel, while "Group-wise" divides weights into groups (e.g., group_size=128) that share the same parameters.
+
+`DC_INT4_ASYM` uses the Q4_K block structure: each 256-weight group contains eight 32-weight subgroups.
+Dequantization is `d * s * q - d_min * m`, where `q` is UINT4, `s` and `m` are packed UINT6,
+and `d` and `d_min` are FP16 scales shared by the group. Storage is 4.5 bits per weight including scales.
+This mode requires OpenVINO with `ov.Type.u6` support and `group_size=256` (the default for this mode).
+It supports AWQ and scale estimation; scale estimation optimizes both primary scales while requantizing subgroup parameters.
+GPTQ, LoRA correction, and group-size adjustment are not supported.
+Mixed precision follows NNCF's existing `ratio`, `backup_mode`, and `all_layers` controls, not llama.cpp's
+layer-aware Q4_K_M assignment of Q6_K tensors. The quantization procedure and exported OpenVINO graph are not
+GGUF serialization or bit-exact llama.cpp quantization.
+
+```python
+compressed_model = nncf.compress_weights(
+    model,
+    mode=nncf.CompressWeightsMode.DC_INT4_ASYM,
+    dataset=nncf.Dataset(calibration_data),
+    awq=True,
+    scale_estimation=True,
+)
+```
 
 **Note**: ExMy is a notation for floating point formats with one sign bit, x exponent bits, and y mantissa bits. For example, E4M3 refers to an FP8 format with one sign bit, four exponent bits, and three mantissa bits. Formats like E8M0 don't include the mantissa bits.
 

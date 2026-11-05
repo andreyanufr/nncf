@@ -80,6 +80,9 @@ class CompressWeightsMode(StrEnum):
         https://github.com/openvinotoolkit/nncf/blob/develop/docs/usage/training_time_compression/other_algorithms/LegacyQuantization.md#asymmetric-quantization
     :param DC_INT4_SYM: Double-compressed symmetric INT4 format. Each group of 128 weights has one FP16 primary
         scale and four UINT4 subscales, one per 32 INT4 weights.
+    :param DC_INT4_ASYM: Q4_K-style asymmetric UINT4 format. Each group of 256 weights has two FP16 primary
+        scales and eight pairs of UINT6 subscales and minima, one pair per 32 weights.
+        Uses NNCF mixed-precision selection, not llama.cpp's layer-aware Q4_K_M policy.
     :param INT3_SYM: Stands for a mixed-precision weights quantization with 3-bit integer as a primary precision.
         Weights are quantized to a primary precision symmetrically without zero point.
     :param INT2_SYM: Stands for a mixed-precision weights quantization with 2-bit integer as a primary precision.
@@ -101,6 +104,7 @@ class CompressWeightsMode(StrEnum):
     INT4_SYM = "int4_sym"
     INT4_ASYM = "int4_asym"
     DC_INT4_SYM = "dc_int4_sym"
+    DC_INT4_ASYM = "dc_int4_asym"
     INT3_SYM = "int3_sym"
     INT2_SYM = "int2_sym"
     NF4 = "nf4"

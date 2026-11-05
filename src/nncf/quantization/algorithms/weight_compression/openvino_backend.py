@@ -28,6 +28,7 @@ from nncf.common.tensor_statistics.statistics import MeanMagnitudeTensorStatisti
 from nncf.common.tensor_statistics.statistics import MeanVarianceTensorStatistic
 from nncf.common.tensor_statistics.statistics import WCTensorStatistic
 from nncf.common.utils.caching import disable_results_caching
+from nncf.errors import ParameterNotSupportedError
 from nncf.openvino.graph.metatypes import openvino_metatypes as om
 from nncf.openvino.graph.metatypes.groups import ATOMIC_ACTIVATIONS_OPERATIONS
 from nncf.openvino.graph.model_transformer import OVModelTransformer
@@ -252,7 +253,19 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
         elif compression_config.mode == CompressWeightsMode.NVFP4:
             scale_dtype = ov.Type.f8e4m3
 
-        if compression_config.mode == CompressWeightsMode.DC_INT4_SYM:
+        if compression_config.mode == CompressWeightsMode.DC_INT4_ASYM:
+            if not hasattr(ov.Type, "u6"):
+                msg = "DC_INT4_ASYM requires an OpenVINO version with UINT6 (ov.Type.u6) support."
+                raise ParameterNotSupportedError(msg)
+            compressed_const = create_ov_const_from_tensor(
+                compressed_weight.tensor, compression_dtype, name=const_node_name
+            )
+            converted_const = opset.convert(compressed_const, ov.Type.f16)
+            subscale_const = create_ov_const_from_tensor(
+                compressed_weight.subscale, ov.Type.u6, name=f"{const_node_name}/subscale"
+            )
+            converted_const = opset.multiply(converted_const, opset.convert(subscale_const, ov.Type.f16))
+        elif compression_config.mode == CompressWeightsMode.DC_INT4_SYM:
             compressed_const = create_ov_const_from_tensor(
                 compressed_weight.tensor, compression_dtype, name=const_node_name
             )
@@ -325,6 +338,16 @@ class OVWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
             scale_const,
             name=f"{const_node_name}/fq_weights_{weight_port_id}",
         )
+
+        if compression_config.mode == CompressWeightsMode.DC_INT4_ASYM:
+            submin_const = create_ov_const_from_tensor(
+                compressed_weight.submin, ov.Type.u6, name=f"{const_node_name}/submin"
+            )
+            min_scale_const = create_ov_const_from_tensor(
+                compressed_weight.min_scale, ov.Type.f16, name=f"{const_node_name}/min_scale"
+            )
+            minimum = opset.multiply(opset.convert(submin_const, ov.Type.f16), min_scale_const)
+            mul = opset.subtract(mul, minimum, name=f"{const_node_name}/dequantized_minimum_{weight_port_id}")
 
         if compression_config.group_size != -1:
             mul = opset.reshape(mul, output_shape=original_shape, special_zero=False)

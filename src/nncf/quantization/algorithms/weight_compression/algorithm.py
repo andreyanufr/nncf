@@ -98,6 +98,8 @@ def get_weight_compression_configuration(
             group_size = 16
         elif mode == CompressWeightsMode.DC_INT4_SYM:
             group_size = 128
+        elif mode == CompressWeightsMode.DC_INT4_ASYM:
+            group_size = 256
         elif mode in [
             CompressWeightsMode.CODEBOOK,
             CompressWeightsMode.CB4,
@@ -273,6 +275,10 @@ def check_user_compression_configuration(
         msg = "Codebook compression mode requires codebook parameters to be specified in advanced_parameters."
         raise nncf.ValidationError(msg)
 
+    if mode == CompressWeightsMode.DC_INT4_ASYM and (gptq or lora_correction):
+        msg = "DC_INT4_ASYM does not support GPTQ or LoRA Correction. Use AWQ and/or scale estimation."
+        raise nncf.ParameterNotSupportedError(msg)
+
     if advanced_parameters and not isinstance(advanced_parameters.group_size_fallback_mode, GroupSizeFallbackMode):
         msg = (
             f"Unsupported group size fallback mode: {advanced_parameters.group_size_fallback_mode.value}. "
@@ -284,6 +290,7 @@ def check_user_compression_configuration(
         CompressWeightsMode.MXFP8_E4M3,
         CompressWeightsMode.NVFP4,
         CompressWeightsMode.DC_INT4_SYM,
+        CompressWeightsMode.DC_INT4_ASYM,
     ]:
         if mode in [CompressWeightsMode.MXFP4, CompressWeightsMode.MXFP8_E4M3] and group_size not in [None, 32]:
             msg = f"MXFP4 and MXFP8_E4M3 types only support group size of 32, group size of {group_size} is given"
@@ -297,9 +304,13 @@ def check_user_compression_configuration(
             msg = f"DC_INT4_SYM type only supports group size of 128, group size of {group_size} is given"
             raise nncf.ValidationError(msg)
 
+        if mode == CompressWeightsMode.DC_INT4_ASYM and group_size not in [None, 256]:
+            msg = f"DC_INT4_ASYM type only supports group size of 256, group size of {group_size} is given"
+            raise nncf.ValidationError(msg)
+
         if advanced_parameters and advanced_parameters.group_size_fallback_mode is GroupSizeFallbackMode.ADJUST:
             msg = (
-                "MXFP4, MXFP8_E4M3, NVFP4 and DC_INT4_SYM types do not support the group size"
+                "MXFP4, MXFP8_E4M3, NVFP4, DC_INT4_SYM and DC_INT4_ASYM types do not support the group size"
                 f" fallback mode {advanced_parameters.group_size_fallback_mode.value}."
                 " Please use other group size fallback mode."
             )

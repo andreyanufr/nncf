@@ -11,7 +11,9 @@
 
 from dataclasses import dataclass
 
+from nncf.errors import InternalError
 from nncf.tensor import Tensor
+from nncf.tensor import TensorDataType
 from nncf.tensor import functions as fns
 
 
@@ -27,6 +29,9 @@ class CompressedWeight:
     :param codebook: The codebook (LUT) for the weight compression. Applicable for vector quantization
     :param global_scale: The tensor-wide (global) scaling factor used in two-level scaling schemes such as NVFP4.
     :param subscale: Per-subgroup scaling factor used by compound integer compression schemes.
+    :param min_scale: Primary FP16 scale for subgroup minima in DC_INT4_ASYM.
+    :param submin: Unsigned per-subgroup minimum magnitude in DC_INT4_ASYM. Dequantization subtracts
+        min_scale * submin after applying scale * subscale to the quantized weights.
     """
 
     tensor: Tensor | None = None
@@ -35,6 +40,8 @@ class CompressedWeight:
     codebook: Tensor | None = None
     global_scale: Tensor | None = None
     subscale: Tensor | None = None
+    min_scale: Tensor | None = None
+    submin: Tensor | None = None
 
     def get_unscaled_tensor(self) -> Tensor | None:
         """
@@ -50,6 +57,13 @@ class CompressedWeight:
             return codebook[self.tensor]
 
         if self.tensor is not None and self.subscale is not None:
+            if self.submin is not None:
+                if self.min_scale is None or self.scale is None:
+                    msg = "Hierarchical asymmetric weights require both primary scales."
+                    raise InternalError(msg)
+                return self.tensor.astype(TensorDataType.float32) * self.subscale - self.submin * (
+                    self.min_scale / self.scale
+                )
             return self.tensor * self.subscale
 
         return self.tensor

@@ -69,6 +69,7 @@ def reshape_weight_for_grouped_quantization(
     """
     assert group_size != -1
     channel_size, reduction_axes = get_reduction_channel_size(weight.shape, reduction_axes)
+    reduction_axes %= len(weight.shape)
     if channel_size % group_size != 0:
         msg = f"Channel size {channel_size} should be divisible by size of group {group_size}."
         raise InvalidGroupSizeError(msg)
@@ -402,10 +403,16 @@ def compress_weight(
     )
 
     if (
-        config.mode == CompressWeightsMode.DC_INT4_SYM
+        config.mode in [CompressWeightsMode.DC_INT4_SYM, CompressWeightsMode.DC_INT4_ASYM]
         and precomputed_compressed_weight is not None
         and precomputed_compressed_weight.tensor is not None
         and precomputed_compressed_weight.subscale is not None
+        and (
+            config.mode != CompressWeightsMode.DC_INT4_ASYM
+            or (
+                precomputed_compressed_weight.min_scale is not None and precomputed_compressed_weight.submin is not None
+            )
+        )
     ):
         return precomputed_compressed_weight
 
@@ -458,6 +465,11 @@ def do_integer_dequantization(compressed_weights: CompressedWeight, reduction_ax
         decompressed_weight = decompressed_weight * compressed_weights.subscale.astype(TensorDataType.int32)
 
     decompressed_weight = decompressed_weight.astype(scale.dtype) * scale
+    if compressed_weights.submin is not None:
+        if compressed_weights.min_scale is None:
+            msg = "Hierarchical asymmetric weights require a primary minimum scale."
+            raise nncf.InternalError(msg)
+        decompressed_weight = decompressed_weight - compressed_weights.submin * compressed_weights.min_scale
 
     if reduction_axis > -1:
         decompressed_weight = ungroup_weights(decompressed_weight, reduction_axis)
@@ -486,6 +498,11 @@ def do_integer_quantization(
     if not config.is_integer:
         msg = "The function supports integer quantization only"
         raise nncf.InternalError(msg)
+    if config.mode == CompressWeightsMode.DC_INT4_ASYM:
+        if precomputed_zero_point is not None:
+            msg = "DC_INT4_ASYM uses scaled subgroup minima, not integer zero points."
+            raise nncf.ValidationError(msg)
+        return do_dc_int4_asymmetric_quantization(weight, config, reduction_axes, precomputed_scale)
     if config.is_asym_mode and (precomputed_scale is None) != (precomputed_zero_point is None):
         msg = (
             "If precomputed quantization parameters are provided, both scale and zero point are required "
@@ -526,6 +543,75 @@ def do_integer_quantization(
 
     compressed_weights = _calculate_integer_quantized_weight(weight, config, scale, zero_point)
     return CompressedWeight(compressed_weights, scale, zero_point)
+
+
+def do_dc_int4_asymmetric_quantization(
+    weight: Tensor,
+    config: WeightCompressionConfig,
+    reduction_axes: ReductionAxes | None,
+    precomputed_scale: Tensor | None = None,
+    precomputed_min_scale: Tensor | None = None,
+) -> CompressedWeight:
+    """
+    Quantizes 256-weight blocks with eight asymmetric 32-weight subgroups.
+
+    Dequantization is scale * subscale * tensor - min_scale * submin. Primary
+    scales are rounded to FP16 before quantization; subscale and submin are UINT6.
+
+    :param weight: Original weights, or grouped weights when reduction_axes is None.
+    :param config: DC_INT4_ASYM configuration with group size 256.
+    :param reduction_axes: Reduction axis, or None for already grouped weights.
+    :param precomputed_scale: Optional primary scale, with a singleton group reduction axis.
+    :param precomputed_min_scale: Optional primary minimum scale with the same shape.
+    :return: UINT4 weights and their hierarchical dequantization parameters.
+    """
+    if config.mode != CompressWeightsMode.DC_INT4_ASYM or config.group_size != 256:
+        msg = "DC_INT4_ASYM quantization requires DC_INT4_ASYM mode and group_size=256."
+        raise nncf.ValidationError(msg)
+    if weight.backend == TensorBackend.ov:
+        weight = weight.as_numpy_tensor()
+    weight = weight.astype(TensorDataType.float32)
+    if reduction_axes is None:
+        reduction_axis = weight.ndim - 1
+        if weight.shape[reduction_axis] != 256:
+            msg = "Already grouped DC_INT4_ASYM weights must have a final dimension of 256."
+            raise InvalidGroupSizeError(msg)
+    else:
+        weight, reduction_axis = reshape_weight_for_grouped_quantization(weight, reduction_axes, 256)
+
+    shape = list(weight.shape)
+    shape[reduction_axis : reduction_axis + 1] = (8, 32)
+    weight = weight.reshape(shape)
+    minimum = fns.minimum(fns.min(weight, axis=reduction_axis + 1, keepdims=True), 0.0)
+    maximum = fns.maximum(fns.max(weight, axis=reduction_axis + 1, keepdims=True), 0.0)
+    subgroup_scale = (maximum - minimum) / 15.0
+    subgroup_min = -minimum
+
+    def primary_scale(values: Tensor, precomputed: Tensor | None) -> Tensor:
+        scale = fns.max(values, axis=reduction_axis, keepdims=True) / 63.0
+        if precomputed is not None:
+            scale = fns.unsqueeze(precomputed, reduction_axis)
+        # A nonzero FP16 scale avoids division by zero for constant/empty-range subgroups.
+        scale = fns.maximum(scale, 2.0**-24)
+        if not fns.all((scale >= 0.0) & (scale <= 65504.0)):
+            msg = "DC_INT4_ASYM requires finite scales representable in FP16."
+            raise nncf.ValidationError(msg)
+        return scale.astype(TensorDataType.float16).astype(TensorDataType.float32)
+
+    scale = primary_scale(subgroup_scale, precomputed_scale)
+    min_scale = primary_scale(subgroup_min, precomputed_min_scale)
+    subscale = fns.clip(fns.round(subgroup_scale / scale), 0, 63).astype(TensorDataType.uint8)
+    submin = fns.clip(fns.round(subgroup_min / min_scale), 0, 63).astype(TensorDataType.uint8)
+    effective_scale = scale * subscale
+    safe_scale = fns.where(effective_scale == 0, 1.0, effective_scale)
+    quantized = fns.clip(fns.round((weight + min_scale * submin) / safe_scale), 0, 15)
+    return CompressedWeight(
+        tensor=quantized.astype(TensorDataType.uint8),
+        scale=scale,
+        subscale=subscale,
+        min_scale=min_scale,
+        submin=submin,
+    )
 
 
 def _do_dc_int4_symmetric_quantization(
@@ -594,14 +680,20 @@ def integer_quantize_dequantize_weight(
     :return: Dequantized weight tensor, or a tuple of the dequantized weight tensor and CompressedWeight instance
         if return_compressed_weight is True.
     """
-    if config.mode == CompressWeightsMode.DC_INT4_SYM:
+    if config.mode in [CompressWeightsMode.DC_INT4_SYM, CompressWeightsMode.DC_INT4_ASYM]:
         compressed_weight = do_integer_quantization(
             weight, config, reduction_axes, precomputed_scale, precomputed_zero_point
         )
         decompressed_weight = do_integer_dequantization(compressed_weight)
+        if config.mode == CompressWeightsMode.DC_INT4_ASYM and reduction_axes is not None:
+            _, reduction_axis = get_reduction_channel_size(weight.shape, reduction_axes)
+            reduction_axis %= weight.ndim
+            reduction_axis += 1
+        else:
+            reduction_axis = decompressed_weight.ndim - 2
         dequantized_shape = list(decompressed_weight.shape)
-        dequantized_shape[-2] *= dequantized_shape[-1]
-        del dequantized_shape[-1]
+        dequantized_shape[reduction_axis] *= dequantized_shape[reduction_axis + 1]
+        del dequantized_shape[reduction_axis + 1]
         decompressed_weight = decompressed_weight.reshape(dequantized_shape)
         if return_compressed_weight:
             return decompressed_weight, compressed_weight

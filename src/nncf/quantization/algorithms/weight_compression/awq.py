@@ -324,7 +324,8 @@ class AWQ(Algorithm):
         scale = fns.ones_like(shape_vector)
 
         awq_config = deepcopy(config)
-        awq_config.group_size = -1
+        if config.mode != nncf.CompressWeightsMode.DC_INT4_ASYM:
+            awq_config.group_size = -1
 
         for batch_idx, gi in groups_to_correct:
             offset = gi * group_size
@@ -371,6 +372,8 @@ class AWQ(Algorithm):
                     g_decompressed_weighs = float_quantize_dequantize_weight(weights_to_fake_quantize, awq_config, -1)
                 else:
                     g_decompressed_weighs = integer_quantize_dequantize_weight(weights_to_fake_quantize, awq_config, -1)
+                    if config.mode == nncf.CompressWeightsMode.DC_INT4_ASYM:
+                        g_decompressed_weighs = g_decompressed_weighs.reshape(weights_to_fake_quantize.shape)
                 sacts = gacts / fns.unsqueeze(cur_scale, 1)
 
                 cur_out = fns.matmul(g_decompressed_weighs, sacts)
