@@ -307,7 +307,8 @@ class ScaleEstimation:
         """
         Refines DC_INT4_SYM subscales without changing the estimated primary scale.
 
-        Searches all legal subscales in [1, 16], one subgroup at a time. Candidates
+        Tests the initial subscale plus or minus one, one subgroup at a time,
+        rejecting candidates outside [1, 16]. Candidates
         minimize the full 128-weight group's matmul error, including the configured
         weight penalty. Strict improvements only are accepted.
 
@@ -359,17 +360,19 @@ class ScaleEstimation:
         best_error = initial_error = objective(residual, penalty)
         initial_weight_error = fns.mean((dequantized - weight) ** 2)
 
-        def consider(subgroup: int, candidate: int, base_residual: Tensor, base_penalty: Tensor) -> None:
+        def consider(subgroup: int, candidate: Tensor, base_residual: Tensor, base_penalty: Tensor) -> None:
             nonlocal best_error, residual, penalty
-            candidate_tensor = fns.clip(fns.round(int8_weight[..., subgroup, :] / candidate), -8, 7)
-            candidate_weight = candidate_tensor * candidate * primary_scale[..., 0, :]
+            valid_candidate = (candidate >= 1) & (candidate <= 16)
+            safe_candidate = fns.clip(candidate, 1, 16)
+            candidate_tensor = fns.clip(fns.round(int8_weight[..., subgroup, :] / safe_candidate), -8, 7)
+            candidate_weight = candidate_tensor * safe_candidate * primary_scale[..., 0, :]
             candidate_out = fns.matmul(
                 fns.moveaxis(candidate_weight, -2, -3), subgroup_activations[..., subgroup, :, :]
             )
             candidate_residual = base_residual - candidate_out
             candidate_penalty = base_penalty + fns.mean((candidate_weight - weight[..., subgroup, :]) ** 2, axis=-1) / 4
             error = objective(candidate_residual, candidate_penalty)
-            improved = error < best_error
+            improved = (error < best_error) & fns.squeeze(valid_candidate, -1)
             best_error = fns.where(improved, error, best_error)
             penalty = fns.where(improved, candidate_penalty, penalty)
             residual = fns.where(fns.unsqueeze(fns.moveaxis(improved, -1, -2), -1), candidate_residual, residual)
@@ -383,8 +386,9 @@ class ScaleEstimation:
             initial_out = fns.matmul(fns.moveaxis(initial_weight, -2, -3), subgroup_activations[..., subgroup, :, :])
             base_residual = residual + initial_out
             base_penalty = penalty - fns.mean((initial_weight - weight[..., subgroup, :]) ** 2, axis=-1) / 4
-            for candidate in range(1, 17):
-                consider(subgroup, candidate, base_residual, base_penalty)
+            initial_subscale = subscale[..., subgroup, :].astype(TensorDataType.int32).clone()
+            for offset in (1, -1):
+                consider(subgroup, initial_subscale + offset, base_residual, base_penalty)
 
         final_weight_error = fns.mean((tensor.astype(TensorDataType.float32) * subscale * primary_scale - weight) ** 2)
         _dump_objective(
@@ -560,7 +564,7 @@ class ScaleEstimation:
                 initial_error,
                 best_error,
                 fns.mean((q_weights - weight) ** 2),
-                fns.sum((quantize_dequantize(result_scale) - weight) ** 2),
+                fns.mean((quantize_dequantize(result_scale) - weight) ** 2),
             )
 
         if config.group_size == -1:
