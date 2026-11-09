@@ -413,6 +413,7 @@ def decompress_symmetric(input: torch.Tensor, scale: torch.Tensor) -> torch.Tens
     decompressed_input = input * scale
     return decompressed_input
 
+
 def decompress_double_symmetric(input: torch.Tensor, scale: torch.Tensor, subscale: torch.Tensor) -> torch.Tensor:
     """
     Decompress the double symmetrically quantized input tensor.
@@ -426,9 +427,34 @@ def decompress_double_symmetric(input: torch.Tensor, scale: torch.Tensor, subsca
     subscale = subscale.type(dtype=scale.dtype)
     
     decompressed_input = input * subscale
-    #decompressed_input = decompressed_input.reshape(input.shape[0], input.shape[1], -1)
+    # decompressed_input = decompressed_input.reshape(input.shape[0], input.shape[1], -1)
     decompressed_input = decompressed_input * scale
     return decompressed_input
+
+
+def decompress_double_asymmetric(
+    input: torch.Tensor,
+    scale: torch.Tensor,
+    subscale: torch.Tensor,
+    min_scale: torch.Tensor,
+    submin: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Decompress the double asymmetrically quantized input tensor.
+
+    :param input: An input tensor
+    :param scale: The primary scale for subgroup scales
+    :param subscale: The per-subgroup scale multiplier
+    :param min_scale: The primary scale for subgroup minima
+    :param submin: The per-subgroup minimum multiplier
+    :return: The decompressed tensor
+    """
+    input = input.type(dtype=scale.dtype)
+    subscale = subscale.type(dtype=scale.dtype)
+    min_scale = min_scale.type(dtype=scale.dtype)
+    submin = submin.type(dtype=scale.dtype)
+
+    return input * subscale * scale - submin * min_scale
 
 
 def pack_uint4(tensor: torch.Tensor) -> torch.Tensor:

@@ -42,8 +42,9 @@ from nncf.torch.quantization.quantize_functions import TuneRange
 from nncf.torch.quantization.quantize_functions import asymmetric_quantize
 from nncf.torch.quantization.quantize_functions import asymmetric_quantize_lora
 from nncf.torch.quantization.quantize_functions import decompress_asymmetric
-from nncf.torch.quantization.quantize_functions import decompress_symmetric
+from nncf.torch.quantization.quantize_functions import decompress_double_asymmetric
 from nncf.torch.quantization.quantize_functions import decompress_double_symmetric
+from nncf.torch.quantization.quantize_functions import decompress_symmetric
 from nncf.torch.quantization.quantize_functions import get_scale_zp_from_input_low_input_high
 from nncf.torch.quantization.quantize_functions import pack_int4
 from nncf.torch.quantization.quantize_functions import pack_uint4
@@ -1421,6 +1422,7 @@ class INT4SymmetricWeightsDecompressor(BaseWeightsDecompressor):
         result = result.type(dtype=self.result_dtype) if self.result_dtype is not None else result
         return result
 
+
 class DCINT4SymmetricWeightsDecompressor(BaseWeightsDecompressor):
     def __init__(
         self,
@@ -1470,6 +1472,63 @@ class DCINT4SymmetricWeightsDecompressor(BaseWeightsDecompressor):
         result = result.reshape(self.result_shape) if self.result_shape is not None else result
         result = result.type(dtype=self.result_dtype) if self.result_dtype is not None else result
         return result
+
+
+class DCINT4AsymmetricWeightsDecompressor(BaseWeightsDecompressor):
+    def __init__(
+        self,
+        scale: torch.Tensor,
+        subscale: torch.Tensor,
+        min_scale: torch.Tensor,
+        submin: torch.Tensor,
+        compressed_weight_shape: tuple[int, ...],
+        result_shape: tuple[int, ...] | None = None,
+        result_dtype: torch.dtype | None = None,
+    ):
+        """
+        :param scale: The primary scale for subgroup scales
+        :param subscale: The per-subgroup scale multiplier
+        :param min_scale: The primary scale for subgroup minima
+        :param submin: The per-subgroup minimum multiplier
+        :param compressed_weight_shape: A compressed weight shape
+        :param result_shape: (Optional) A shape that result should be reshaped
+        :param result_dtype: (Optional) A data type that result should be cast to
+        """
+        super().__init__()
+        self.register_buffer("_scale", scale.type(dtype=torch.float16))
+        if torch.any((subscale < 0) | (subscale > 63)):
+            msg = "Subscale values are not in [0, 63]."
+            raise ValueError(msg)
+        self.register_buffer("_subscale", subscale.type(dtype=torch.float16))
+        self.register_buffer("_min_scale", min_scale.type(dtype=torch.float16))
+        if torch.any((submin < 0) | (submin > 63)):
+            msg = "Submin values are not in [0, 63]."
+            raise ValueError(msg)
+        self.register_buffer("_submin", submin.type(dtype=torch.float16))
+
+        self.compressed_weight_shape = compressed_weight_shape
+        self.result_shape = result_shape
+        self.result_dtype = result_dtype
+
+    @property
+    def quantization_mode(self) -> QuantizationMode:
+        return QuantizationMode.ASYMMETRIC
+
+    def pack_weight(self, weight: torch.Tensor) -> torch.Tensor:
+        if torch.any((weight < 0) | (weight > 15)):
+            msg = "Tensor values are not in [0, 15]."
+            raise ValueError(msg)
+        return pack_uint4(weight.type(dtype=torch.uint8))
+
+    def forward(self, x):
+        x = unpack_uint4(x)
+        x = x.reshape(self.compressed_weight_shape)
+
+        result = decompress_double_asymmetric(x, self._scale, self._subscale, self._min_scale, self._submin)
+        result = result.reshape(self.result_shape) if self.result_shape is not None else result
+        result = result.type(dtype=self.result_dtype) if self.result_dtype is not None else result
+        return result
+
 
 class SQMultiply(torch.nn.Module, StatefulModuleInterface):
     SCALE_SHAPE_KEY = "scale_shape"

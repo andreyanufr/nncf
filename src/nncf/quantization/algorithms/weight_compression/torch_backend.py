@@ -66,9 +66,10 @@ from nncf.torch.node_utils import get_activation_channel_axis as get_activation_
 from nncf.torch.quantization.ignored_patterns import create_rope
 from nncf.torch.quantization.ignored_patterns import create_sam_pe
 from nncf.torch.quantization.layers import QUANTIZATION_MODULES
+from nncf.torch.quantization.layers import DCINT4AsymmetricWeightsDecompressor
+from nncf.torch.quantization.layers import DCINT4SymmetricWeightsDecompressor
 from nncf.torch.quantization.layers import INT4AsymmetricWeightsDecompressor
 from nncf.torch.quantization.layers import INT4SymmetricWeightsDecompressor
-from nncf.torch.quantization.layers import DCINT4SymmetricWeightsDecompressor
 from nncf.torch.quantization.layers import INT8AsymmetricWeightsDecompressor
 from nncf.torch.quantization.layers import INT8SymmetricWeightsDecompressor
 from nncf.torch.quantization.layers import PTLoraNLSSpec
@@ -404,6 +405,16 @@ class PTWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
             decompressor = DCINT4SymmetricWeightsDecompressor(
                 scale=compressed_weight.scale.data,
                 subscale=compressed_weight.subscale.data,
+                compressed_weight_shape=compressed_weight.tensor.shape,
+                result_shape=weight_shape,
+                result_dtype=weight_dtype,
+            )
+        elif compression_config.mode == CompressWeightsMode.DC_INT4_ASYM:
+            decompressor = DCINT4AsymmetricWeightsDecompressor(
+                scale=compressed_weight.scale.data,
+                subscale=compressed_weight.subscale.data,
+                min_scale=compressed_weight.min_scale.data,
+                submin=compressed_weight.submin.data,
                 compressed_weight_shape=compressed_weight.tensor.shape,
                 result_shape=weight_shape,
                 result_dtype=weight_dtype,

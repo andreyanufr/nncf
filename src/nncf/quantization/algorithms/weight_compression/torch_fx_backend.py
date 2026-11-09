@@ -57,6 +57,7 @@ from nncf.torch.model_graph_manager import get_weight_tensor_port_ids
 from nncf.torch.node_utils import get_activation_channel_axis as get_activation_channel_axis_fn
 from nncf.torch.quantization.ignored_patterns import create_rope
 from nncf.torch.quantization.ignored_patterns import create_sam_pe
+from nncf.torch.quantization.layers import DCINT4AsymmetricWeightsDecompressor
 from nncf.torch.quantization.layers import INT4AsymmetricWeightsDecompressor
 from nncf.torch.quantization.layers import INT4SymmetricWeightsDecompressor
 from nncf.torch.quantization.layers import INT8AsymmetricWeightsDecompressor
@@ -241,6 +242,16 @@ class FXWeightCompressionAlgoBackend(WeightCompressionAlgoBackend):
                 decompressor = INT4AsymmetricWeightsDecompressor(
                     scale=compressed_weight.scale.data,
                     zero_point=compressed_weight.zero_point.data,
+                    compressed_weight_shape=compressed_weight.tensor.shape,
+                    result_shape=weight.shape,
+                    result_dtype=weight.data.dtype,
+                )
+            elif compression_config.mode == CompressWeightsMode.DC_INT4_ASYM:
+                decompressor = DCINT4AsymmetricWeightsDecompressor(
+                    scale=compressed_weight.scale.data,
+                    subscale=compressed_weight.subscale.data,
+                    min_scale=compressed_weight.min_scale.data,
+                    submin=compressed_weight.submin.data,
                     compressed_weight_shape=compressed_weight.tensor.shape,
                     result_shape=weight.shape,
                     result_dtype=weight.data.dtype,

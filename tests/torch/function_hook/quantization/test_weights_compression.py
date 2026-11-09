@@ -36,6 +36,7 @@ from nncf.torch.function_hook import get_hook_storage
 from nncf.torch.function_hook import wrap_model
 from nncf.torch.function_hook.nncf_graph.nncf_graph_builder import GraphModelWrapper
 from nncf.torch.quantization.layers import BaseWeightsDecompressor
+from nncf.torch.quantization.layers import DCINT4AsymmetricWeightsDecompressor
 from nncf.torch.quantization.layers import INT4AsymmetricWeightsDecompressor
 from nncf.torch.quantization.layers import INT4SymmetricWeightsDecompressor
 from nncf.torch.quantization.layers import INT8AsymmetricWeightsDecompressor
@@ -391,6 +392,38 @@ def test_compress_weights_functional_model(mode):
         if isinstance(layer, decompressor_type):
             n_compressed_weights += 1
     assert n_compressed_weights == 4
+
+
+def test_dc_int4_asymmetric_weights_decompressor():
+    compressed_weight = torch.arange(16, dtype=torch.uint8).reshape(1, 1, 1, 16).expand(1, 1, 8, 16)
+    scale = torch.tensor([[[[0.5]]]], dtype=torch.float16)
+    subscale = torch.arange(8, dtype=torch.float16).reshape(1, 1, 8, 1)
+    min_scale = torch.tensor([[[[0.25]]]], dtype=torch.float16)
+    submin = torch.arange(8, dtype=torch.float16).reshape(1, 1, 8, 1)
+    decompressor = DCINT4AsymmetricWeightsDecompressor(
+        scale=scale,
+        subscale=subscale,
+        min_scale=min_scale,
+        submin=submin,
+        compressed_weight_shape=compressed_weight.shape,
+    )
+
+    result = decompressor(decompressor.pack_weight(compressed_weight))
+    expected = compressed_weight.to(torch.float16) * subscale * scale - submin * min_scale
+
+    torch.testing.assert_close(result, expected)
+
+
+def test_compress_weights_dc_int4_asymmetric():
+    model = wrap_model(MatMulModel())
+    wrapped_model = GraphModelWrapper(model, example_input=torch.randn(1, 256))
+
+    compressed_model = compress_weights(wrapped_model, mode=CompressWeightsMode.DC_INT4_ASYM, all_layers=True)
+
+    assert any(
+        isinstance(module, DCINT4AsymmetricWeightsDecompressor)
+        for module in get_hook_storage(compressed_model).modules()
+    )
 
 
 def test_compress_weights_conv():
