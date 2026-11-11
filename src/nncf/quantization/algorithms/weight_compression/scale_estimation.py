@@ -567,6 +567,101 @@ class ScaleEstimation:
                 fns.mean((quantize_dequantize(result_scale) - weight) ** 2),
             )
 
+        # nncf.CompressWeightsMode.INT3_SYM
+        if config.mode in (nncf.CompressWeightsMode.INT4_SYM, nncf.CompressWeightsMode.INT4_ASYM) and weight.backend in (
+            TensorBackend.torch,
+            TensorBackend.ov,
+            TensorBackend.numpy,
+        ):
+            def project_groups(values: Tensor) -> Tensor:
+                projected = fns.matmul(
+                    fns.unsqueeze(values.astype(TensorDataType.float32), -2), fns.unsqueeze(X, -4)
+                )
+                return fns.squeeze(projected, -2)
+
+            weight_projection = project_groups(weight)
+            fp_output = fns.sum(weight_projection, axis=-2)
+            result_scale = fns.squeeze(result_scale, axis=-1)
+            scale_sign = fns.where(result_scale < 0, -1.0, 1.0).astype(result_scale.dtype)
+            result_scale = fns.abs(result_scale)
+            best_code = get_target(fns.unsqueeze(scale_sign * result_scale, -1))[0]
+            best_code = best_code.astype(TensorDataType.float32) * fns.unsqueeze(scale_sign, -1)
+            best_code_projection = project_groups(best_code)
+
+            def mrso_objective(code: Tensor, code_projection: Tensor, candidate_scale: Tensor) -> Tensor:
+                output = fns.sum(code_projection * fns.unsqueeze(candidate_scale, -1), axis=-2)
+                error = fns.sum((fp_output - output) ** 2, axis=-1)
+                if weight_penalty > 0.0:
+                    weight_error = code * fns.unsqueeze(candidate_scale, -1) - weight
+                    error = error + weight_penalty * fns.sum(weight_error**2, axis=(-1, -2))
+                return error
+
+            best_mrso_error = initial_mrso_error = mrso_objective(best_code, best_code_projection, result_scale)
+            identity = fns.eye(
+                result_scale.shape[-1], backend=weight.backend, dtype=weight.dtype, device=weight.device
+            )
+            for _ in range(4):
+                # The activation sample outer products form H; project H into the scale basis
+                # as (qX)(qX)^T instead of materializing a hidden-size-squared matrix.
+                matrix = fns.matmul(best_code_projection, fns.moveaxis(best_code_projection, -1, -2))
+                rhs = fns.squeeze(
+                    fns.matmul(best_code_projection, fns.unsqueeze(fp_output, -1)), -1
+                )
+                if weight_penalty > 0.0:
+                    matrix = matrix + weight_penalty * fns.matmul(
+                        best_code,
+                        fns.moveaxis(best_code, -1, -2),
+                    )
+                    rhs = rhs + weight_penalty * fns.sum(
+                        best_code * weight, axis=-1
+                    )
+
+                diagonal = fns.sum(matrix * identity, axis=-1)
+                ridge = 1e-8 * fns.mean(diagonal, axis=-1, keepdims=True)
+                matrix = matrix + fns.unsqueeze(ridge, -1) * identity
+                diagonal = fns.maximum(fns.sum(matrix * identity, axis=-1), eps)
+                inverse_diagonal = 1.0 / diagonal
+                inverse_sqrt_diagonal = diagonal**-0.5
+                preconditioned = (
+                    fns.unsqueeze(inverse_sqrt_diagonal, -1)
+                    * matrix
+                    * fns.unsqueeze(inverse_sqrt_diagonal, -2)
+                )
+                spectral_bound = fns.max(fns.sum(fns.abs(preconditioned), axis=-1), axis=-1, keepdims=True)
+                relaxation = 1.0 / fns.maximum(spectral_bound, eps)
+
+                candidate_scale = result_scale
+                for _ in range(16):
+                    residual = rhs - fns.squeeze(fns.matmul(matrix, fns.unsqueeze(candidate_scale, -1)), -1)
+                    candidate_scale = candidate_scale + relaxation * inverse_diagonal * residual
+                    candidate_scale = fns.maximum(candidate_scale, eps)
+
+                candidate_code, _ = get_target(fns.unsqueeze(scale_sign * candidate_scale, -1))
+                candidate_code = candidate_code.astype(TensorDataType.float32) * fns.unsqueeze(scale_sign, -1)
+                candidate_projection = project_groups(candidate_code)
+                candidate_error = mrso_objective(candidate_code, candidate_projection, candidate_scale)
+                improved = candidate_error < best_mrso_error
+                mask = fns.unsqueeze(fns.unsqueeze(improved, -1), -1)
+                result_scale = fns.where(mask, fns.unsqueeze(candidate_scale, -1), fns.unsqueeze(result_scale, -1))
+                result_scale = fns.squeeze(result_scale, -1)
+                best_mrso_error = fns.where(improved, candidate_error, best_mrso_error)
+                best_code = fns.where(fns.unsqueeze(fns.unsqueeze(improved, -1), -1), candidate_code, best_code)
+                best_code_projection = fns.where(
+                    fns.unsqueeze(fns.unsqueeze(improved, -1), -1), candidate_projection, best_code_projection
+                )
+
+            if layer_name is not None:
+                _dump_objective(
+                    layer_name,
+                    config,
+                    "mrso",
+                    initial_mrso_error,
+                    best_mrso_error,
+                    fns.mean((q_weights - weight) ** 2),
+                    fns.mean((best_code * fns.unsqueeze(result_scale, -1) - weight) ** 2),
+                )
+            result_scale = fns.unsqueeze(scale_sign * result_scale, -1)
+
         if config.group_size == -1:
             result_scale = fns.squeeze(result_scale, axis=-2)
         if zp is not None and config.group_size == -1:
